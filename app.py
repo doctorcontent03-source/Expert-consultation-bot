@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v7-dialog-history"
+APP_VERSION = "v7.1-dialog-history"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Цель: установить контакт, бережно выявить потребность, ответить на вопросы и при уместности предложить консультацию.
@@ -37,7 +37,7 @@ HOME_HTML = HOME_HTML.replace(
 )
 HOME_HTML = HOME_HTML.replace(
     "</script></body>",
-    "fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content,x.role==='user'?'user':'bot'))}});</script></body>"
+    ";fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content,x.role==='user'?'user':'bot'))}});</script></body>"
 )
 BOOKING_HTML = BOOKING_HTML.replace(
     "body:JSON.stringify(Object.fromEntries(new FormData(f)))",
