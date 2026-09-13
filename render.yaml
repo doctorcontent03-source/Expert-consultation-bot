@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: expert-consultation-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    healthCheckPath: /health
+    envVars:
+      - key: GIGACHAT_AUTH_KEY
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: FLASK_SECRET
+        generateValue: true
+      - key: GIGACHAT_SCOPE
+        value: GIGACHAT_API_PERS
+      - key: GIGACHAT_MODEL
+        value: GigaChat
+      - key: YANDEX_CALENDAR_LOGIN
+        sync: false
+      - key: YANDEX_CALENDAR_APP_PASSWORD
+        sync: false
+      - key: BOOKING_TIMEZONE
+        value: Europe/Moscow
+      - key: BOOKING_TITLE
+        value: Consultation
+      - key: BOOKING_DURATION_MINUTES
+        value: "60"
+      - key: CALENDAR_MODE
+        value: demo
