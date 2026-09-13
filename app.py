@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8-booking-state"
+APP_VERSION = "v8.1-booking-state"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Цель: установить контакт, бережно выявить потребность, ответить на вопросы и только при уместности один раз предложить консультацию.
@@ -132,6 +132,9 @@ def extract(file):
     raise ValueError("Поддерживаются PDF, DOCX, TXT, MD, CSV и JSON")
 
 def relevant(query, documents, limit=12000):
+    full = "\n\n".join(f"[{doc['name']}]\n{doc['text']}" for doc in documents)
+    if len(full) <= limit:
+        return full
     words = set(re.findall(r"[а-яёa-z0-9]{3,}", query.lower()))
     chunks = []
     for doc in documents:
