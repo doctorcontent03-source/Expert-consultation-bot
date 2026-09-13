@@ -1,10 +1,7 @@
 import io, json, os, re, sqlite3, time, uuid
-from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, request, session, render_template_string
+from flask import Flask, jsonify, request, session
 import requests
-import caldav
 from docx import Document
 from pypdf import PdfReader
 
@@ -19,7 +16,8 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 Задавайте преимущественно один вопрос за раз. До понимания потребности консультацию не предлагайте.
 Используйте факты только из предоставленной базы знаний и фактов текущего разговора. Если сведений нет, прямо скажите, что не можете точно ответить, и не додумывайте.
 Не ставьте диагнозов, не обещайте результат и не давите. При признаках непосредственной опасности задайте прямой вопрос о безопасности и посоветуйте срочно обратиться в местную экстренную службу или к близкому человеку.
-Если клиент готов записаться, предложите открыть страницу записи /booking. Название и длительность встречи указаны ниже в настройках записи. На странице клиент укажет желаемые дату и время, имя, телефон и email; система проверит подключённый календарь и подтвердит запись. Не подтверждайте запись внутри чата до сообщения об успешном создании события.
+Календарь не подключён: никогда не называйте свободные слоты, не подтверждайте и не обещайте запись. Если человек называет время, объясните, что оно не забронировано. В конце разговора не говорите «до встречи», если запись не подтверждена.
+Если клиент готов записаться, сообщите: «Запись через бота пока недоступна: календарь не подключён, поэтому я не вижу свободное время и не могу забронировать встречу».
 Отвечайте кратко и естественно, без служебных комментариев о правилах."""
 
 STYLE = """<style>:root{--g:#285c45;--o:#d97932;--bg:#faf8f1;--soft:#e7f0eb;--ink:#22312a;--line:#d8e1dc}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}.shell{width:min(760px,100%);min-height:100vh;margin:auto;background:#fff;padding:28px clamp(16px,4vw,38px)}header{display:flex;justify-content:space-between;gap:20px;align-items:start}h1{margin:2px 0;font-size:clamp(25px,4vw,36px)}.eyebrow{margin:0;color:var(--o);font-weight:800;text-transform:uppercase;font-size:12px;letter-spacing:.08em}a{color:var(--g)}.chat{height:65vh;min-height:420px;overflow:auto;padding:25px 0;display:flex;flex-direction:column;gap:12px}.bubble{max-width:84%;padding:12px 15px;border-radius:18px;white-space:pre-wrap}.bot{align-self:flex-start;background:var(--soft)}.user{align-self:flex-end;background:var(--g);color:#fff}form{display:flex;gap:10px}input{width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;font:inherit}button{padding:12px 16px;border:0;border-radius:12px;background:var(--g);color:#fff;font-weight:750;cursor:pointer}.secondary{background:#fff;color:var(--g);border:1px solid var(--g);margin-top:12px}.card{border:1px solid var(--line);border-radius:16px;padding:16px;margin:18px 0}.card label{display:block;font-weight:700;margin:12px 0}.card input{display:block;margin-top:6px}.row{display:flex;justify-content:space-between;align-items:center}</style>"""
@@ -28,53 +26,6 @@ HOME_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta 
 
 ADMIN_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>База знаний</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Настройки</p><h1>База знаний эксперта</h1></div><a href='/'>К диалогу</a></header><section class='card'><label>Пароль администратора<input id='password' type='password' placeholder='admin123'></label><label>Файлы PDF, DOCX, TXT, MD, CSV или JSON<input id='files' type='file' multiple></label><button id='upload'>Загрузить</button><p id='status'></p></section><h2>Загруженные материалы</h2><div id='docs'><p>Введите пароль, чтобы увидеть файлы.</p></div></main><script>const p=document.querySelector('#password'),d=document.querySelector('#docs'),s=document.querySelector('#status');async function load(){const r=await fetch('/api/admin',{headers:{'X-Admin-Password':p.value}}),v=await r.json();if(!r.ok){d.textContent=v.error;return}d.innerHTML=v.documents.length?'':'<p>Файлов пока нет.</p>';v.documents.forEach(x=>{const e=document.createElement('div');e.className='card row';e.innerHTML='<span><strong>'+x.name+'</strong><br><small>'+x.characters+' знаков</small></span><button>Удалить</button>';e.querySelector('button').onclick=async()=>{await fetch('/api/admin/document/'+x.id,{method:'DELETE',headers:{'X-Admin-Password':p.value}});load()};d.append(e)})}p.onchange=load;document.querySelector('#upload').onclick=async()=>{const fs=document.querySelector('#files').files;if(!fs.length)return;s.textContent='Загрузка…';const f=new FormData();[...fs].forEach(x=>f.append('files',x));const r=await fetch('/api/admin/upload',{method:'POST',headers:{'X-Admin-Password':p.value},body:f}),v=await r.json();s.textContent=r.ok?'Материалы загружены':v.error;if(r.ok)load()};</script></body></html>""".replace("__STYLE__", STYLE)
 
-BOOKING_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Запись</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Запись</p><h1>{{ title }}</h1><p>Продолжительность — {{ duration }} минут. Выберите желаемое время: система проверит его в календаре перед подтверждением.</p></div><a href='/'>К диалогу</a></header><form id='booking' class='card' style='display:block'><label>Дата и время<input name='start' type='datetime-local' required></label><label>Ваше имя<input name='name' required maxlength='120'></label><label>Телефон<input name='phone' type='tel' required maxlength='60'></label><label>Email<input name='email' type='email' required maxlength='160'></label><button>Проверить и записаться</button><p id='result'></p></form></main><script>const f=document.querySelector('#booking'),o=document.querySelector('#result'),b=f.querySelector('button');const now=new Date(Date.now()+30*60000);now.setSeconds(0,0);f.start.min=new Date(now-now.getTimezoneOffset()*60000).toISOString().slice(0,16);f.onsubmit=async e=>{e.preventDefault();b.disabled=true;o.textContent='Проверяем календарь…';try{const r=await fetch('/api/booking',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))}),v=await r.json();o.textContent=v.message||v.error;if(r.ok){f.querySelectorAll('input').forEach(x=>x.disabled=true);b.hidden=true}}catch{o.textContent='Не удалось связаться с календарём. Попробуйте ещё раз.'}b.disabled=false}</script></body></html>""".replace("__STYLE__", STYLE)
-
-def booking_config():
-    title = os.getenv("BOOKING_TITLE", "Консультация").strip() or "Консультация"
-    try: duration = max(5, min(480, int(os.getenv("BOOKING_DURATION_MINUTES", "60"))))
-    except ValueError: duration = 60
-    return title, duration
-
-def yandex_calendar():
-    if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
-        return DemoCalendar()
-    login = os.getenv("YANDEX_CALENDAR_LOGIN", "").strip()
-    password = os.getenv("YANDEX_CALENDAR_APP_PASSWORD", "").strip()
-    if not login or not password:
-        raise RuntimeError("Яндекс Календарь пока не настроен")
-    client = caldav.DAVClient(url=os.getenv("YANDEX_CALDAV_URL", "https://caldav.yandex.ru").strip(), username=login, password=password)
-    calendars = client.principal().calendars()
-    wanted = os.getenv("YANDEX_CALENDAR_NAME", "").strip()
-    if wanted:
-        calendars = [x for x in calendars if x.name == wanted]
-    if not calendars:
-        raise RuntimeError("Не найден календарь для записи")
-    return calendars[0]
-
-class DemoCalendar:
-    def search(self, start, end, event=True, expand=True):
-        con = db()
-        return con.execute(
-            "select 1 from calendar_events where start_at < ? and end_at > ? limit 1",
-            (end.isoformat(), start.isoformat())
-        ).fetchall()
-
-    def save_event(self, event):
-        start_match = re.search(r"DTSTART[^:]*:(\d{8}T\d{6})", event)
-        end_match = re.search(r"DTEND[^:]*:(\d{8}T\d{6})", event)
-        if not start_match or not end_match:
-            raise RuntimeError("Не удалось сохранить тестовую запись")
-        timezone = ZoneInfo(os.getenv("BOOKING_TIMEZONE", "Europe/Moscow"))
-        start = datetime.strptime(start_match.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone)
-        end = datetime.strptime(end_match.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone)
-        con = db()
-        con.execute("insert into calendar_events values(?,?,?)", (str(uuid.uuid4()), start.isoformat(), end.isoformat()))
-        con.commit()
-
-def ical_escape(value):
-    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
-
 def db():
     DB.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
@@ -82,9 +33,12 @@ def db():
     create table if not exists settings(key text primary key,value text not null);
     create table if not exists documents(id text primary key,name text not null,text text not null,created_at integer not null);
     create table if not exists messages(session_id text,role text,content text,created_at integer);
-    create table if not exists calendar_events(id text primary key,start_at text not null,end_at text not null);
     """)
     con.execute("insert or ignore into settings values('expert_name','Эксперт')")
+    if not con.execute("select 1 from documents limit 1").fetchone():
+        demo = ROOT / "demo-base-kirill.txt"
+        if demo.exists():
+            con.execute("insert into documents values(?,?,?,?)",(str(uuid.uuid4()),demo.name,demo.read_text(encoding='utf-8'),int(time.time())))
     con.commit(); return con
 
 def extract(file):
@@ -135,52 +89,6 @@ def home(): return HOME_HTML
 def health(): return jsonify(status="ok")
 @app.get("/admin")
 def admin(): return ADMIN_HTML
-@app.get("/booking")
-def booking_page():
-    title, duration = booking_config()
-    return render_template_string(BOOKING_HTML, title=title, duration=duration)
-
-@app.post("/api/booking")
-def create_booking():
-    data = request.json or {}
-    name = str(data.get("name", "")).strip()
-    phone = str(data.get("phone", "")).strip()
-    email = str(data.get("email", "")).strip()
-    raw_start = str(data.get("start", "")).strip()
-    if not all((name, phone, email, raw_start)):
-        return jsonify(error="Заполните дату, время, имя, телефон и email"), 400
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        return jsonify(error="Проверьте адрес электронной почты"), 400
-    try:
-        timezone = ZoneInfo(os.getenv("BOOKING_TIMEZONE", "Europe/Moscow"))
-        start = datetime.fromisoformat(raw_start).replace(tzinfo=timezone)
-    except (ValueError, TypeError):
-        return jsonify(error="Не удалось распознать дату и время"), 400
-    if start < datetime.now(timezone) + timedelta(minutes=30):
-        return jsonify(error="Выберите время не раньше чем через 30 минут"), 400
-    title, duration = booking_config()
-    end = start + timedelta(minutes=duration)
-    try:
-        calendar = yandex_calendar()
-        if calendar.search(start=start, end=end, event=True, expand=True):
-            return jsonify(error="Это время уже занято. Выберите другое свободное время."), 409
-        stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
-        start_ics = start.strftime("%Y%m%dT%H%M%S")
-        end_ics = end.strftime("%Y%m%dT%H%M%S")
-        tzid = os.getenv("BOOKING_TIMEZONE", "Europe/Moscow")
-        event = "\r\n".join([
-            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Expert Consultation Bot//RU",
-            "BEGIN:VEVENT", f"UID:{uuid.uuid4()}@expert-consultation-bot", f"DTSTAMP:{stamp}",
-            f"DTSTART;TZID={tzid}:{start_ics}", f"DTEND;TZID={tzid}:{end_ics}",
-            "SUMMARY:" + ical_escape(title + " — " + name),
-            "DESCRIPTION:" + ical_escape(f"Имя: {name}\nТелефон: {phone}\nEmail: {email}\nФормат: онлайн"),
-            "END:VEVENT", "END:VCALENDAR", ""
-        ])
-        calendar.save_event(event)
-    except Exception as exc:
-        app.logger.exception("Calendar booking failed")
-        return jsonify(error=f"Не удалось проверить календарь: {exc}"), 502
-    return jsonify(message=f"Запись подтверждена: {start.strftime('%d.%m.%Y в %H:%M')}. Продолжительность — {duration} минут."), 201
 @app.post("/api/chat")
 def chat():
     text=str((request.json or {}).get("message", "")).strip()[:3000]
@@ -191,9 +99,7 @@ def chat():
     history=con.execute("select role,content from messages where session_id=? order by created_at desc limit 12",(sid,)).fetchall()[::-1]
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
     context=relevant(text,docs)
-    booking_title, booking_duration = booking_config()
-    booking_rules = f"\n\nНАСТРОЙКИ ЗАПИСИ:\nТип встречи: {booking_title}. Продолжительность: {booking_duration} минут."
-    messages=[{"role":"system","content":SYSTEM_RULES+booking_rules+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
+    messages=[{"role":"system","content":SYSTEM_RULES+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
     try: answer=gigachat.reply(messages)
     except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
