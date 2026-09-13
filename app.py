@@ -13,14 +13,14 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v7.1-dialog-history"
+APP_VERSION = "v8-booking-state"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
-Цель: установить контакт, бережно выявить потребность, ответить на вопросы и при уместности предложить консультацию.
-Задавайте преимущественно один вопрос за раз. До понимания потребности консультацию не предлагайте.
+Цель: установить контакт, бережно выявить потребность, ответить на вопросы и только при уместности один раз предложить консультацию.
+Задавайте преимущественно один вопрос за раз. До понимания потребности консультацию не предлагайте. После первого предложения не повторяйте его, пока клиент сам явно не согласится записаться. Если клиент просит не торопить его, хочет сначала получить информацию, сомневается или задаёт вопрос об условиях, отвечайте только на вопрос и не завершайте ответ новым предложением консультации.
 Используйте факты только из предоставленной базы знаний и фактов текущего разговора. Если сведений нет, прямо скажите, что не можете точно ответить, и не додумывайте.
 Не ставьте диагнозов, не обещайте результат и не давите. При признаках непосредственной опасности задайте прямой вопрос о безопасности и посоветуйте срочно обратиться в местную экстренную службу или к близкому человеку.
-Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Если клиент впервые интересуется работой или соглашается на ознакомительную консультацию, предложите бесплатную консультацию и добавьте маркер [[BOOK_FREE]]. Если клиент хочет записаться на обычную или повторную встречу, добавьте маркер [[BOOK_REGULAR]]. Если тип встречи неясен или клиент просит показать варианты записи, кратко предложите выбрать и добавьте оба маркера. Не упоминайте «наш сайт», раздел сайта, форму или технические адреса. После нажатия кнопки клиент укажет желаемые дату и время, имя, телефон и email; система проверит подключённый календарь и подтвердит запись. Не подтверждайте запись внутри чата до сообщения об успешном создании события.
+Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Вопросы «зачем бесплатная встреча», «нужно ли потом сразу записываться», «как часто встречаться» и подобные являются информационными: отвечайте на них без кнопок и без призыва записаться. Кнопку показывайте только после явного согласия клиента записаться или прямого вопроса о доступном времени. Если клиент впервые согласился на ознакомительную консультацию, добавьте маркер [[BOOK_FREE]]. Если клиент явно хочет обычную или повторную встречу, добавьте маркер [[BOOK_REGULAR]]. Если клиент просит показать оба варианта, добавьте оба маркера. После подтверждённой записи поздравьте клиента с записью и больше не показывайте кнопки, если он не просит изменить или создать ещё одну встречу. Не упоминайте «наш сайт», раздел сайта, форму или технические адреса.
 Отвечайте кратко и естественно, без служебных комментариев о правилах."""
 
 STYLE = """<style>:root{--g:#285c45;--o:#d97932;--bg:#faf8f1;--soft:#e7f0eb;--ink:#22312a;--line:#d8e1dc}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}.shell{width:min(760px,100%);min-height:100vh;margin:auto;background:#fff;padding:28px clamp(16px,4vw,38px)}header{display:flex;justify-content:space-between;gap:20px;align-items:start}h1{margin:2px 0;font-size:clamp(25px,4vw,36px)}.eyebrow{margin:0;color:var(--o);font-weight:800;text-transform:uppercase;font-size:12px;letter-spacing:.08em}a{color:var(--g)}.chat{height:65vh;min-height:420px;overflow:auto;padding:25px 0;display:flex;flex-direction:column;gap:12px}.bubble{max-width:84%;padding:12px 15px;border-radius:18px;white-space:pre-wrap}.bot{align-self:flex-start;background:var(--soft)}.user{align-self:flex-end;background:var(--g);color:#fff}form{display:flex;gap:10px}input{width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;font:inherit}button{padding:12px 16px;border:0;border-radius:12px;background:var(--g);color:#fff;font-weight:750;cursor:pointer}.secondary{background:#fff;color:var(--g);border:1px solid var(--g);margin-top:12px}.card{border:1px solid var(--line);border-radius:16px;padding:16px;margin:18px 0}.card label{display:block;font-weight:700;margin:12px 0}.card input{display:block;margin-top:6px}.row{display:flex;justify-content:space-between;align-items:center}</style>"""
@@ -37,7 +37,7 @@ HOME_HTML = HOME_HTML.replace(
 )
 HOME_HTML = HOME_HTML.replace(
     "</script></body>",
-    ";fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content,x.role==='user'?'user':'bot'))}});</script></body>"
+    ";fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim(),x.role==='user'?'user':'bot'))}});</script></body>"
 )
 BOOKING_HTML = BOOKING_HTML.replace(
     "body:JSON.stringify(Object.fromEntries(new FormData(f)))",
@@ -56,7 +56,14 @@ def booking_config(booking_type):
 
 def direct_booking_answer(text):
     low = text.lower()
-    asks_time = bool(re.search(r"(когда.{0,35}(свобод|можно|запис|принима)|свободн|запис|брон|подобрать.{0,20}(время|дат)|какие.{0,20}(дни|даты|время|окна))", low))
+    if re.search(r"(я\s+)?(уже\s+)?записал(ась|ся)|запись\s+(готова|подтверждена|получилась)", low):
+        last = session.get("last_booking")
+        if last:
+            return f"Да, вижу вашу запись: {last}. Если до встречи появятся вопросы, можете задать их здесь."
+        return "Спасибо, запись оформлена. Если до встречи появятся вопросы, можете задать их здесь."
+    if re.search(r"(нужно|надо|обязательно|сразу|потом).{0,30}запис", low):
+        return None
+    asks_time = bool(re.search(r"(когда.{0,35}(свобод|можно|запис|принима)|свободн.{0,20}(дни|даты|время|окна)|подобрать.{0,20}(время|дат)|какие.{0,20}(дни|даты|время|окна)|(хочу|готов|давайте|можно).{0,25}запис|запишите)", low))
     if not asks_time:
         return None
     if re.search(r"(бесплат|ознакомитель|перв(ая|ую).{0,15}консультац)", low):
@@ -223,6 +230,13 @@ def create_booking():
     except Exception as exc:
         app.logger.exception("Calendar booking failed")
         return jsonify(error=f"Не удалось проверить календарь: {exc}"), 502
+    confirmation = f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, {duration} минут"
+    session["last_booking"] = confirmation
+    sid = session.get("sid")
+    if sid:
+        con = db()
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",f"Запись подтверждена: {confirmation}.",int(time.time()*1000)))
+        con.commit()
     return jsonify(message=f"Запись подтверждена: {start.strftime('%d.%m.%Y в %H:%M')}. Продолжительность — {duration} минут."), 201
 @app.post("/api/chat")
 def chat():
