@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8.5-dialog-boundary"
+APP_VERSION = "v8.6-completed-dialog"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -36,11 +36,11 @@ BOOKING_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><me
 
 HOME_HTML = HOME_HTML.replace(
     "w.textContent=v.answer||v.error",
-    "const a=v.answer||v.error||'';const free=a.includes('[[BOOK_FREE]]'),regular=a.includes('[[BOOK_REGULAR]]');w.textContent=a.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim();const addLink=(href,label)=>{const l=document.createElement('a');l.href=href;l.textContent=label;l.style.cssText='display:block;width:max-content;margin:10px 0 0;padding:10px 14px;border-radius:12px;background:#285c45;color:white;text-decoration:none;font-weight:700';w.append(document.createElement('br'),l)};if(free)addLink('/booking?type=free','Записаться на бесплатную консультацию');if(regular)addLink('/booking?type=regular','Записаться на регулярную встречу')"
+    "const a=v.answer||v.error||'';const free=a.includes('[[BOOK_FREE]]'),regular=a.includes('[[BOOK_REGULAR]]');w.textContent=a.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim();const addLink=(href,label)=>{const l=document.createElement('a');l.href=href;l.textContent=label;l.style.cssText='display:block;width:max-content;margin:10px 0 0;padding:10px 14px;border-radius:12px;background:#285c45;color:white;text-decoration:none;font-weight:700';w.append(document.createElement('br'),l)};if(free)addLink('/booking?type=free','Записаться на бесплатную консультацию');if(regular)addLink('/booking?type=regular','Записаться на регулярную встречу');if(v.closed){form.hidden=true;if(!a)w.remove()}"
 )
 HOME_HTML = HOME_HTML.replace(
     "</script></body>",
-    ";fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim(),x.role==='user'?'user':'bot'))}});</script></body>"
+    ";fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim(),x.role==='user'?'user':'bot'))}if(v.closed)form.hidden=true});</script></body>"
 )
 BOOKING_HTML = BOOKING_HTML.replace(
     "body:JSON.stringify(Object.fromEntries(new FormData(f)))",
@@ -62,8 +62,8 @@ def direct_booking_answer(text):
     if re.search(r"(я\s+)?(уже\s+)?записал(ась|ся)|запись\s+(готова|подтверждена|получилась)", low):
         last = session.get("last_booking")
         if last:
-            return f"Да, вижу вашу запись: {last}. Если до встречи появятся вопросы, можете задать их здесь."
-        return "Спасибо, запись оформлена. Если до встречи появятся вопросы, можете задать их здесь."
+            return f"Да, вижу вашу запись: {last}."
+        return "Спасибо, запись оформлена."
     if re.search(r"(нужно|надо|обязательно|сразу|потом).{0,30}запис", low):
         return None
     asks_time = bool(re.search(r"(когда.{0,35}(свобод|можно|запис|принима)|свободн.{0,20}(дни|даты|время|окна)|подобрать.{0,20}(время|дат)|какие.{0,20}(дни|даты|время|окна)|(хочу|готов|давайте|можно).{0,25}запис|запишите)", low))
@@ -74,6 +74,19 @@ def direct_booking_answer(text):
     if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
         return "Да. Выберите, пожалуйста, удобные дату и время для регулярной встречи по кнопке ниже.\n[[BOOK_REGULAR]]"
     return "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
+
+def completed_dialog_answer(text):
+    if not session.get("last_booking") or session.get("dialog_closed"):
+        return None
+    low = text.lower().strip()
+    asks_new_booking = bool(re.search(r"(перенес|отмен|измен|друг(ая|ое|ую).{0,15}(дат|врем)|ещ[её].{0,20}(запис|встреч)|повторн.{0,15}(запис|встреч))", low))
+    if asks_new_booking:
+        return None
+    closing = bool(re.search(r"(^|\s)(до встречи|до завтра|спасибо|благодарю|хорошо|понятно|ладно|записал(ась|ся))([.!\s]|$)", low))
+    if closing:
+        session["dialog_closed"] = True
+        return "До встречи! Хорошего дня."
+    return None
 
 def consultation_stage_answer(text, history):
     assistant_messages = [x["content"].lower() for x in history if x["role"] == "assistant"]
@@ -208,7 +221,7 @@ def chat_history():
         "select role,content from messages where session_id=? order by created_at",
         (sid,)
     ).fetchall()
-    return jsonify(messages=[{"role":x["role"], "content":x["content"]} for x in rows])
+    return jsonify(messages=[{"role":x["role"], "content":x["content"]} for x in rows], closed=bool(session.get("dialog_closed")))
 
 @app.post("/api/booking")
 def create_booking():
@@ -253,6 +266,7 @@ def create_booking():
         return jsonify(error=f"Не удалось проверить календарь: {exc}"), 502
     confirmation = f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, {duration} минут"
     session["last_booking"] = confirmation
+    session["dialog_closed"] = False
     sid = session.get("sid")
     if sid:
         con = db()
@@ -268,7 +282,13 @@ def chat():
     if not docs: return jsonify(error="Сначала загрузите базу знаний в разделе «Настройки»"),409
     history=con.execute("select role,content from messages where session_id=? order by created_at desc limit 12",(sid,)).fetchall()[::-1]
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
+    if session.get("dialog_closed"):
+        return jsonify(answer="", closed=True)
     context=relevant(text,docs)
+    completed_answer = completed_dialog_answer(text)
+    if completed_answer:
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",completed_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=completed_answer, closed=True)
     direct_answer = direct_booking_answer(text)
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
@@ -313,6 +333,8 @@ def delete_document(ident):
     con=db(); con.execute("delete from documents where id=?",(ident,)); con.commit(); return jsonify(ok=True)
 @app.post("/api/reset")
 def reset():
-    sid=session.get("sid"); con=db(); con.execute("delete from messages where session_id=?",(sid,)); con.commit(); return jsonify(ok=True)
+    sid=session.get("sid"); con=db(); con.execute("delete from messages where session_id=?",(sid,)); con.commit()
+    session.clear()
+    return jsonify(ok=True)
 
 if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.getenv("PORT","3000")))
