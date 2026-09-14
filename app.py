@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8.6-completed-dialog"
+APP_VERSION = "v8.7-consultation-state"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -91,14 +91,17 @@ def completed_dialog_answer(text):
 def consultation_stage_answer(text, history):
     assistant_messages = [x["content"].lower() for x in history if x["role"] == "assistant"]
     last_assistant = assistant_messages[-1] if assistant_messages else ""
-    offered = any("консультац" in x and re.search(r"(предлаг|запис|встрет|обсудить подробнее)", x) for x in assistant_messages)
+    offered = bool(session.get("consultation_offered")) or any(
+        "консультац" in x and re.search(r"(предлаг|предлож|запис|встреч|обсудить подробнее)", x)
+        for x in assistant_messages
+    )
     affirmative = bool(re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", text.lower()))
     if affirmative and "консультац" in last_assistant:
         return "Хорошо. Выберите, пожалуйста, удобные дату и время для бесплатной консультации.\n[[BOOK_FREE]]"
     if affirmative and re.search(r"(обсудить.{0,20}подробнее|поговорить.{0,20}подробнее|готовы.{0,30}(обсудить|поговорить))", last_assistant):
         return "Тогда предлагаю продолжить на короткой бесплатной консультации. На ней я смогу подробнее познакомиться с вашей ситуацией, а вы — понять, подходит ли вам мой подход. Хотите записаться?"
     user_turns = 1 + sum(1 for x in history if x["role"] == "user")
-    informational = bool(re.search(r"(сколько|сто(ит|имость)|как проходит|онлайн|очно|формат|дл(ится|ительность)|часто|конфиденц|опыт|образован|метод)", text.lower()))
+    informational = bool(re.search(r"(сколько|сто(ит|имость)|как проходит|онлайн|очно|формат|дл(ится|ительность)|часто|конфиденц|опыт|образован|метод|платн|после бесплатн|сразу после|можно подумать)", text.lower()))
     if user_turns >= 3 and not offered and not informational:
         return "Спасибо, теперь я в целом понимаю, с чем вы столкнулись. В чате я не буду пытаться разбирать это глубже — такую работу лучше проводить на встрече. Могу предложить короткую бесплатную консультацию, чтобы познакомиться и понять, подходим ли мы друг другу."
     return None
@@ -295,6 +298,8 @@ def chat():
         return jsonify(answer=direct_answer)
     stage_answer = consultation_stage_answer(text, history)
     if stage_answer:
+        if "консультац" in stage_answer.lower():
+            session["consultation_offered"] = True
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",stage_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=stage_answer)
     free_title, free_duration = booking_config("free")
@@ -308,6 +313,8 @@ def chat():
     unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
     if unavailable:
         answer = "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
+    if "консультац" in answer.lower() and re.search(r"(предлаг|предлож|запис|встреч|хотите)", answer.lower()):
+        session["consultation_offered"] = True
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
     return jsonify(answer=answer)
 
