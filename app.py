@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.2-marketer-context-gate"
+APP_VERSION = "v9.1.4-shared-human-style"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -185,34 +185,6 @@ def consultation_stage_answer(text, history):
     if user_turns >= 3 and not offered and not informational:
         return f"Спасибо, теперь я в целом понимаю вашу задачу. Подробно разбирать её лучше на встрече. Могу предложить формат «{profile['lead_title']}» продолжительностью {profile['lead_duration_text']}."
     return None
-
-def marketer_context_answer(text, history):
-    expert_slug, _ = current_profile()
-    if expert_slug != "marketer":
-        return None
-    user_texts = [x["content"] for x in history if x["role"] == "user"] + [text]
-    combined = " ".join(user_texts).lower()
-    occupation_known = bool(re.search(r"(я\s+(психолог|репетитор|учител|коуч|маркетолог|дизайнер|юрист|врач|владел|предпринимател|эксперт|мастер|тренер|нутрициолог|астролог)|я\s+работаю|занимаюсь|моя\s+(работа|практика|профессия|компания|студия)|у меня\s+(бизнес|школа|студия|салон|агентство|магазин|центр))", combined))
-    channel_known = bool(re.search(r"(канал|блог|соцсет|телеграм|telegram|макс|\bmax\b|вконтакте|\bvk\b|инстаграм|instagram|дзен|сайт|рассылк)", combined))
-    audience_known = bool(re.search(r"(для\s+(дет|взросл|женщин|мужчин|эксперт|предпринимател|бизнес|клиент|ученик|родител|подрост)|работаю\s+с|моя\s+аудитори|мои\s+(клиент|ученик|читател|подписчик))", combined))
-    process_known = bool(re.search(r"(сама?\s+(пиш|готов|дел)|как\s+(пиш|готов|созда)|созда(ю|ние)\s+контент|готов(лю|ить)\s+(пост|публикац|контент)|трачу.{0,35}(пост|контент|публикац)|дума(ю|ть).{0,35}(напис|пост|контент)|контент[- ]план)", combined))
-    missing = []
-    if not occupation_known: missing.append("чем вы занимаетесь")
-    if not channel_known: missing.append("где ведёте контент")
-    if not audience_known: missing.append("для кого пишете")
-    if not process_known: missing.append("как сейчас готовите публикации")
-    if not missing:
-        session["marketer_context_complete"] = True
-        return None
-    if len(missing) == 1:
-        question = missing[0]
-    else:
-        question = ", ".join(missing[:-1]) + " и " + missing[-1]
-    if re.search(r"(много врем|целый день|долго|так ничего|не успева|выматы|устал)", text.lower()):
-        opening = "Да, такой процесс легко выматывает: время уходит, а готового материала всё ещё нет."
-    else:
-        opening = "Сначала хочу лучше понять ваш рабочий контекст, чтобы не советовать абстрактные инструменты."
-    return f"{opening} Расскажите, пожалуйста, {question}?"
 
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
@@ -423,10 +395,6 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
-    context_answer = marketer_context_answer(text, history)
-    if context_answer:
-        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",context_answer,int(time.time()*1000))); con.commit()
-        return jsonify(answer=context_answer)
     stage_answer = consultation_stage_answer(text, history)
     if stage_answer:
         if "консультац" in stage_answer.lower():
@@ -440,8 +408,7 @@ def chat():
     else:
         booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nДоступен один тип записи: {free_title}, {profile['lead_duration_text']}; календарь резервирует {free_duration} минут. Не предлагайте регулярную встречу и не добавляйте [[BOOK_REGULAR]]."
     user_turns = 1 + sum(1 for x in history if x["role"] == "user")
-    discovery_incomplete = user_turns < profile["minimum_turns"] or (expert_slug == "marketer" and not session.get("marketer_context_complete"))
-    stage_rule = "\nНа текущем этапе запрещено предлагать встречу или запись: обязательные этапы выявления потребности ещё не пройдены." if discovery_incomplete else ""
+    stage_rule = "\nНа текущем этапе запрещено предлагать встречу или запись: обязательные этапы выявления потребности ещё не пройдены." if user_turns < profile["minimum_turns"] else ""
     style_rules = profile.get("style_rules", "")
     messages=[{"role":"system","content":SYSTEM_RULES+"\n\n"+BASE_STYLE_RULES+"\n\n"+profile["strategy_rules"]+"\n\n"+style_rules+booking_rules+stage_rule+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
     try: answer=gigachat.reply(messages)
