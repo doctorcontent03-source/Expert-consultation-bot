@@ -82,6 +82,17 @@ class TestBot(unittest.TestCase):
         )
         self.assertEqual(answer, "Как сейчас у вас устроена эта работа?")
 
+    def test_discovery_guard_removes_assumed_cooperation(self):
+        state = {key: False for key in target.DISCOVERY_KEYS}
+        state["identity"] = True
+        answer = target.guard_discovery_answer(
+            "Какой результат вы хотите получить, работая со мной?",
+            state,
+            "Какую задачу вы хотели бы решить?",
+            "Я репетитор английского языка",
+        )
+        self.assertEqual(answer, "Какую задачу вы хотели бы решить?")
+
     def test_discovery_guard_requires_solution_interest(self):
         state = {key: True for key in target.DISCOVERY_KEYS}
         state.update(solution_explained=True, solution_interest=False)
