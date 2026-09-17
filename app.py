@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8.7-consultation-state"
+APP_VERSION = "v9.0-expert-profiles"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -26,11 +26,46 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Вопросы «зачем бесплатная встреча», «нужно ли потом сразу записываться», «как часто встречаться» и подобные являются информационными: отвечайте на них без кнопок и без призыва записаться. Кнопку показывайте только после явного согласия клиента записаться или прямого вопроса о доступном времени. Если клиент впервые согласился на ознакомительную консультацию, добавьте маркер [[BOOK_FREE]]. Если клиент явно хочет обычную или повторную встречу, добавьте маркер [[BOOK_REGULAR]]. Если клиент просит показать оба варианта, добавьте оба маркера. После подтверждённой записи поздравьте клиента с записью и больше не показывайте кнопки, если он не просит изменить или создать ещё одну встречу. Не упоминайте «наш сайт», раздел сайта, форму или технические адреса.
 Отвечайте кратко и естественно, без служебных комментариев о правилах."""
 
+EXPERT_PROFILES = {
+    "psychologist": {
+        "name": "Психолог",
+        "eyebrow": "Консультация",
+        "intro": "Здравствуйте! Расскажите, пожалуйста, что вас сейчас беспокоит и с чем вы хотели бы разобраться?",
+        "lead_title": "Бесплатная консультация",
+        "lead_duration": 20,
+        "lead_duration_text": "15–20 минут",
+        "regular_enabled": True,
+        "profile_context": "",
+    },
+    "marketer": {
+        "name": "Екатерина — маркетолог и специалист по нейросетям",
+        "eyebrow": "Консультация по ИИ-решениям",
+        "intro": "Здравствуйте! Расскажите, пожалуйста, какую задачу вы хотели бы решить с помощью нейросетей и чем уже пользуетесь сейчас?",
+        "lead_title": "Бесплатная консультация по ИИ-решениям",
+        "lead_duration": 60,
+        "lead_duration_text": "30–60 минут",
+        "regular_enabled": False,
+        "profile_context": """Эксперт — Екатерина Алексеева, контент-маркетолог и специалист по нейросетям. Она создаёт ИИ-решения для экспертов и бизнеса: готовые решения и решения под заказ. Бесплатная онлайн-консультация занимает от 30 до 60 минут и проходит через Телемост. На встрече: знакомство, выявление опыта использования нейросетей, диагностика текущей потребности, демонстрация подходящего продукта и предложение готового ИИ-решения или разработки под заказ. Для календаря резервируется 60 минут.""",
+    },
+}
+
+def current_profile():
+    slug = session.get("expert_slug", "psychologist")
+    return slug, EXPERT_PROFILES.get(slug, EXPERT_PROFILES["psychologist"])
+
+def switch_profile(slug):
+    if slug not in EXPERT_PROFILES:
+        return False
+    if session.get("expert_slug") != slug:
+        session.clear()
+        session["expert_slug"] = slug
+    return True
+
 STYLE = """<style>:root{--g:#285c45;--o:#d97932;--bg:#faf8f1;--soft:#e7f0eb;--ink:#22312a;--line:#d8e1dc}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}.shell{width:min(760px,100%);min-height:100vh;margin:auto;background:#fff;padding:28px clamp(16px,4vw,38px)}header{display:flex;justify-content:space-between;gap:20px;align-items:start}h1{margin:2px 0;font-size:clamp(25px,4vw,36px)}.eyebrow{margin:0;color:var(--o);font-weight:800;text-transform:uppercase;font-size:12px;letter-spacing:.08em}a{color:var(--g)}.chat{height:65vh;min-height:420px;overflow:auto;padding:25px 0;display:flex;flex-direction:column;gap:12px}.bubble{max-width:84%;padding:12px 15px;border-radius:18px;white-space:pre-wrap}.bot{align-self:flex-start;background:var(--soft)}.user{align-self:flex-end;background:var(--g);color:#fff}form{display:flex;gap:10px}input{width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;font:inherit}button{padding:12px 16px;border:0;border-radius:12px;background:var(--g);color:#fff;font-weight:750;cursor:pointer}.secondary{background:#fff;color:var(--g);border:1px solid var(--g);margin-top:12px}.card{border:1px solid var(--line);border-radius:16px;padding:16px;margin:18px 0}.card label{display:block;font-weight:700;margin:12px 0}.card input{display:block;margin-top:6px}.row{display:flex;justify-content:space-between;align-items:center}</style>"""
 
-HOME_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Консультация</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Консультация</p><h1>Диалог с экспертом</h1><p>Расскажите о своей ситуации или задайте вопрос.</p></div><a href='/admin'>База знаний</a></header><section id='chat' class='chat'><div class='bubble bot'>Здравствуйте! Расскажите, пожалуйста, что вас сейчас беспокоит и с чем вы хотели бы разобраться?</div></section><form id='form'><input id='message' autocomplete='off' placeholder='Напишите сообщение…'><button>Отправить</button></form><button id='reset' class='secondary'>Начать заново</button></main><script>const chat=document.querySelector('#chat'),form=document.querySelector('#form'),input=document.querySelector('#message');function add(t,c){const d=document.createElement('div');d.className='bubble '+c;d.textContent=t;chat.append(d);chat.scrollTop=chat.scrollHeight}form.onsubmit=async e=>{e.preventDefault_QUESTION_MARK_;const m=input.value.trim();if(!m)return;add(m,'user');input.value='';input.disabled=true;const w=document.createElement('div');w.className='bubble bot';w.textContent='…';chat.append(w);try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});const v=await r.json();w.textContent=v.answer||v.error}catch{w.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}input.disabled=false;input.focus()};document.querySelector('#reset').onclick=async()=>{await fetch('/api/reset',{method:'POST'});location.reload()}</script></body></html>""".replace("__STYLE__", STYLE).replace("preventDefault_QUESTION_MARK_", "preventDefault()")
+HOME_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{{ eyebrow }}</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>{{ eyebrow }}</p><h1>Диалог с экспертом</h1><p>Расскажите о своей ситуации или задайте вопрос.</p></div><a href='/admin'>База знаний</a></header><section id='chat' class='chat'><div class='bubble bot'>{{ intro }}</div></section><form id='form'><input id='message' autocomplete='off' placeholder='Напишите сообщение…'><button>Отправить</button></form><button id='reset' class='secondary'>Начать заново</button></main><script>const chat=document.querySelector('#chat'),form=document.querySelector('#form'),input=document.querySelector('#message');function add(t,c){const d=document.createElement('div');d.className='bubble '+c;d.textContent=t;chat.append(d);chat.scrollTop=chat.scrollHeight}form.onsubmit=async e=>{e.preventDefault_QUESTION_MARK_;const m=input.value.trim();if(!m)return;add(m,'user');input.value='';input.disabled=true;const w=document.createElement('div');w.className='bubble bot';w.textContent='…';chat.append(w);try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});const v=await r.json();w.textContent=v.answer||v.error}catch{w.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}input.disabled=false;input.focus()};document.querySelector('#reset').onclick=async()=>{await fetch('/api/reset',{method:'POST'});location.reload()}</script></body></html>""".replace("__STYLE__", STYLE).replace("preventDefault_QUESTION_MARK_", "preventDefault()")
 
-ADMIN_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>База знаний</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Настройки</p><h1>База знаний эксперта</h1></div><a href='/'>К диалогу</a></header><section class='card'><label>Пароль администратора<input id='password' type='password' placeholder='admin123'></label><label>Файлы PDF, DOCX, TXT, MD, CSV или JSON<input id='files' type='file' multiple></label><button id='upload'>Загрузить</button><p id='status'></p></section><h2>Загруженные материалы</h2><div id='docs'><p>Введите пароль, чтобы увидеть файлы.</p></div></main><script>const p=document.querySelector('#password'),d=document.querySelector('#docs'),s=document.querySelector('#status');async function load(){const r=await fetch('/api/admin',{headers:{'X-Admin-Password':p.value}}),v=await r.json();if(!r.ok){d.textContent=v.error;return}d.innerHTML=v.documents.length?'':'<p>Файлов пока нет.</p>';v.documents.forEach(x=>{const e=document.createElement('div');e.className='card row';e.innerHTML='<span><strong>'+x.name+'</strong><br><small>'+x.characters+' знаков</small></span><button>Удалить</button>';e.querySelector('button').onclick=async()=>{await fetch('/api/admin/document/'+x.id,{method:'DELETE',headers:{'X-Admin-Password':p.value}});load()};d.append(e)})}p.onchange=load;document.querySelector('#upload').onclick=async()=>{const fs=document.querySelector('#files').files;if(!fs.length)return;s.textContent='Загрузка…';const f=new FormData();[...fs].forEach(x=>f.append('files',x));const r=await fetch('/api/admin/upload',{method:'POST',headers:{'X-Admin-Password':p.value},body:f}),v=await r.json();s.textContent=r.ok?'Материалы загружены':v.error;if(r.ok)load()};</script></body></html>""".replace("__STYLE__", STYLE)
+ADMIN_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>База знаний</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Настройки</p><h1>База знаний: {{ expert_name }}</h1><p><a href='/admin?expert=psychologist'>Психолог</a> · <a href='/admin?expert=marketer'>Маркетолог</a></p></div><a href='/'>К диалогу</a></header><section class='card'><label>Пароль администратора<input id='password' type='password' placeholder='admin123'></label><label>Файлы PDF, DOCX, TXT, MD, CSV или JSON<input id='files' type='file' multiple></label><button id='upload'>Загрузить</button><p id='status'></p></section><h2>Загруженные материалы</h2><div id='docs'><p>Введите пароль, чтобы увидеть файлы.</p></div></main><script>const p=document.querySelector('#password'),d=document.querySelector('#docs'),s=document.querySelector('#status');async function load(){const r=await fetch('/api/admin',{headers:{'X-Admin-Password':p.value}}),v=await r.json();if(!r.ok){d.textContent=v.error;return}d.innerHTML=v.documents.length?'':'<p>Файлов пока нет.</p>';v.documents.forEach(x=>{const e=document.createElement('div');e.className='card row';e.innerHTML='<span><strong>'+x.name+'</strong><br><small>'+x.characters+' знаков</small></span><button>Удалить</button>';e.querySelector('button').onclick=async()=>{await fetch('/api/admin/document/'+x.id,{method:'DELETE',headers:{'X-Admin-Password':p.value}});load()};d.append(e)})}p.onchange=load;document.querySelector('#upload').onclick=async()=>{const fs=document.querySelector('#files').files;if(!fs.length)return;s.textContent='Загрузка…';const f=new FormData();[...fs].forEach(x=>f.append('files',x));const r=await fetch('/api/admin/upload',{method:'POST',headers:{'X-Admin-Password':p.value},body:f}),v=await r.json();s.textContent=r.ok?'Материалы загружены':v.error;if(r.ok)load()};</script></body></html>""".replace("__STYLE__", STYLE)
 
 BOOKING_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Запись</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Запись</p><h1>{{ title }}</h1><p>Продолжительность — {{ duration }} минут. Выберите желаемое время: система проверит его в календаре перед подтверждением.</p></div><a href='/'>К диалогу</a></header><form id='booking' class='card' style='display:block'><label>Дата и время<input name='start' type='datetime-local' required></label><label>Ваше имя<input name='name' required maxlength='120'></label><label>Телефон<input name='phone' type='tel' required maxlength='60'></label><label>Email<input name='email' type='email' required maxlength='160'></label><button>Проверить и записаться</button><p id='result'></p></form></main><script>const f=document.querySelector('#booking'),o=document.querySelector('#result'),b=f.querySelector('button');const now=new Date(Date.now()+30*60000);now.setSeconds(0,0);f.start.min=new Date(now-now.getTimezoneOffset()*60000).toISOString().slice(0,16);f.onsubmit=async e=>{e.preventDefault();b.disabled=true;o.textContent='Проверяем календарь…';try{const r=await fetch('/api/booking',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(f)))}),v=await r.json();o.textContent=v.message||v.error;if(r.ok){f.querySelectorAll('input').forEach(x=>x.disabled=true);b.hidden=true}}catch{o.textContent='Не удалось связаться с календарём. Попробуйте ещё раз.'}b.disabled=false}</script></body></html>""".replace("__STYLE__", STYLE)
 
@@ -48,6 +83,11 @@ BOOKING_HTML = BOOKING_HTML.replace(
 )
 
 def booking_config(booking_type):
+    _, profile = current_profile()
+    if booking_type != "regular":
+        return profile["lead_title"], profile["lead_duration"]
+    if not profile["regular_enabled"]:
+        return profile["lead_title"], profile["lead_duration"]
     regular = booking_type == "regular"
     prefix = "REGULAR" if regular else "FREE"
     default_title = "Регулярная встреча" if regular else "Бесплатная консультация"
@@ -58,6 +98,7 @@ def booking_config(booking_type):
     return title, duration
 
 def direct_booking_answer(text):
+    _, profile = current_profile()
     low = text.lower()
     if re.search(r"(я\s+)?(уже\s+)?записал(ась|ся)|запись\s+(готова|подтверждена|получилась)", low):
         last = session.get("last_booking")
@@ -70,9 +111,11 @@ def direct_booking_answer(text):
     if not asks_time:
         return None
     if re.search(r"(бесплат|ознакомитель|перв(ая|ую).{0,15}консультац)", low):
-        return "Да. Выберите, пожалуйста, удобные дату и время для бесплатной консультации по кнопке ниже.\n[[BOOK_FREE]]"
-    if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
+        return f"Да. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
+    if profile["regular_enabled"] and re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
         return "Да. Выберите, пожалуйста, удобные дату и время для регулярной встречи по кнопке ниже.\n[[BOOK_REGULAR]]"
+    if not profile["regular_enabled"]:
+        return f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
     return "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
 
 def completed_dialog_answer(text):
@@ -89,6 +132,7 @@ def completed_dialog_answer(text):
     return None
 
 def consultation_stage_answer(text, history):
+    _, profile = current_profile()
     assistant_messages = [x["content"].lower() for x in history if x["role"] == "assistant"]
     last_assistant = assistant_messages[-1] if assistant_messages else ""
     offered = bool(session.get("consultation_offered")) or any(
@@ -97,13 +141,13 @@ def consultation_stage_answer(text, history):
     )
     affirmative = bool(re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", text.lower()))
     if affirmative and "консультац" in last_assistant:
-        return "Хорошо. Выберите, пожалуйста, удобные дату и время для бесплатной консультации.\n[[BOOK_FREE]]"
+        return f"Хорошо. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
     if affirmative and re.search(r"(обсудить.{0,20}подробнее|поговорить.{0,20}подробнее|готовы.{0,30}(обсудить|поговорить))", last_assistant):
-        return "Тогда предлагаю продолжить на короткой бесплатной консультации. На ней я смогу подробнее познакомиться с вашей ситуацией, а вы — понять, подходит ли вам мой подход. Хотите записаться?"
+        return f"Тогда предлагаю продолжить на встрече «{profile['lead_title']}». Она занимает {profile['lead_duration_text']}. Хотите записаться?"
     user_turns = 1 + sum(1 for x in history if x["role"] == "user")
     informational = bool(re.search(r"(сколько|сто(ит|имость)|как проходит|онлайн|очно|формат|дл(ится|ительность)|часто|конфиденц|опыт|образован|метод|платн|после бесплатн|сразу после|можно подумать)", text.lower()))
     if user_turns >= 3 and not offered and not informational:
-        return "Спасибо, теперь я в целом понимаю, с чем вы столкнулись. В чате я не буду пытаться разбирать это глубже — такую работу лучше проводить на встрече. Могу предложить короткую бесплатную консультацию, чтобы познакомиться и понять, подходим ли мы друг другу."
+        return f"Спасибо, теперь я в целом понимаю вашу задачу. Подробно разбирать её лучше на встрече. Могу предложить формат «{profile['lead_title']}» продолжительностью {profile['lead_duration_text']}."
     return None
 
 def yandex_calendar():
@@ -154,6 +198,9 @@ def db():
     create table if not exists messages(session_id text,role text,content text,created_at integer);
     create table if not exists calendar_events(id text primary key,start_at text not null,end_at text not null);
     """)
+    columns = {x["name"] for x in con.execute("pragma table_info(documents)").fetchall()}
+    if "expert_slug" not in columns:
+        con.execute("alter table documents add column expert_slug text not null default 'psychologist'")
     con.execute("insert or ignore into settings values('expert_name','Эксперт')")
     con.commit(); return con
 
@@ -203,14 +250,26 @@ class GigaChat:
 gigachat=GigaChat()
 
 @app.get("/")
-def home(): return HOME_HTML
+def home():
+    _, profile = current_profile()
+    return render_template_string(HOME_HTML, eyebrow=profile["eyebrow"], intro=profile["intro"])
+@app.get("/e/<slug>")
+def expert_home(slug):
+    if not switch_profile(slug): return "Профиль эксперта не найден", 404
+    _, profile = current_profile()
+    return render_template_string(HOME_HTML, eyebrow=profile["eyebrow"], intro=profile["intro"])
 @app.get("/health")
 def health(): return jsonify(status="ok", version=APP_VERSION)
 @app.get("/admin")
-def admin(): return ADMIN_HTML
+def admin():
+    requested = request.args.get("expert", "").strip()
+    if requested and not switch_profile(requested): return "Профиль эксперта не найден", 404
+    _, profile = current_profile()
+    return render_template_string(ADMIN_HTML, expert_name=profile["name"])
 @app.get("/booking")
 def booking_page():
-    booking_type = "regular" if request.args.get("type") == "regular" else "free"
+    _, profile = current_profile()
+    booking_type = "regular" if request.args.get("type") == "regular" and profile["regular_enabled"] else "free"
     title, duration = booking_config(booking_type)
     return render_template_string(BOOKING_HTML, title=title, duration=duration, booking_type=booking_type)
 
@@ -233,7 +292,8 @@ def create_booking():
     phone = str(data.get("phone", "")).strip()
     email = str(data.get("email", "")).strip()
     raw_start = str(data.get("start", "")).strip()
-    booking_type = "regular" if data.get("booking_type") == "regular" else "free"
+    _, profile = current_profile()
+    booking_type = "regular" if data.get("booking_type") == "regular" and profile["regular_enabled"] else "free"
     if not all((name, phone, email, raw_start)):
         return jsonify(error="Заполните дату, время, имя, телефон и email"), 400
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
@@ -280,14 +340,15 @@ def create_booking():
 def chat():
     text=str((request.json or {}).get("message", "")).strip()[:3000]
     if not text: return jsonify(error="Введите сообщение"),400
+    expert_slug, profile = current_profile()
     sid=session.setdefault("sid",str(uuid.uuid4())); con=db()
-    docs=con.execute("select name,text from documents").fetchall()
-    if not docs: return jsonify(error="Сначала загрузите базу знаний в разделе «Настройки»"),409
+    docs=con.execute("select name,text from documents where expert_slug=?",(expert_slug,)).fetchall()
+    if not docs and not profile["profile_context"]: return jsonify(error="Сначала загрузите базу знаний в разделе «Настройки»"),409
     history=con.execute("select role,content from messages where session_id=? order by created_at desc limit 12",(sid,)).fetchall()[::-1]
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
     if session.get("dialog_closed"):
         return jsonify(answer="", closed=True)
-    context=relevant(text,docs)
+    context=(profile["profile_context"]+"\n\n"+relevant(text,docs)).strip()
     completed_answer = completed_dialog_answer(text)
     if completed_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",completed_answer,int(time.time()*1000))); con.commit()
@@ -304,7 +365,10 @@ def chat():
         return jsonify(answer=stage_answer)
     free_title, free_duration = booking_config("free")
     regular_title, regular_duration = booking_config("regular")
-    booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nБесплатная встреча: {free_title}, {free_duration} минут. Регулярная встреча: {regular_title}, {regular_duration} минут."
+    if profile["regular_enabled"]:
+        booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nПервая встреча: {free_title}, {profile['lead_duration_text']}; календарь резервирует {free_duration} минут. Регулярная встреча: {regular_title}, {regular_duration} минут."
+    else:
+        booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nДоступен один тип записи: {free_title}, {profile['lead_duration_text']}; календарь резервирует {free_duration} минут. Не предлагайте регулярную встречу и не добавляйте [[BOOK_REGULAR]]."
     user_turns = 1 + sum(1 for x in history if x["role"] == "user")
     stage_rule = "\nНа текущем этапе запрещено предлагать консультацию: информации о ситуации ещё недостаточно." if user_turns < 3 else ""
     messages=[{"role":"system","content":SYSTEM_RULES+booking_rules+stage_rule+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
@@ -312,7 +376,9 @@ def chat():
     except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
     unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
     if unavailable:
-        answer = "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
+        answer = (f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]" if not profile["regular_enabled"] else "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]")
+    if not profile["regular_enabled"]:
+        answer = answer.replace("[[BOOK_REGULAR]]", "")
     if "консультац" in answer.lower() and re.search(r"(предлаг|предлож|запис|встреч|хотите)", answer.lower()):
         session["consultation_offered"] = True
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
@@ -322,26 +388,27 @@ def check_admin(): return request.headers.get("X-Admin-Password")==ADMIN_PASSWOR
 @app.get("/api/admin")
 def admin_data():
     if not check_admin(): return jsonify(error="Неверный пароль"),401
-    con=db(); return jsonify(documents=[dict(id=x["id"],name=x["name"],characters=len(x["text"])) for x in con.execute("select * from documents order by created_at desc")])
+    expert_slug, _ = current_profile(); con=db(); return jsonify(documents=[dict(id=x["id"],name=x["name"],characters=len(x["text"])) for x in con.execute("select * from documents where expert_slug=? order by created_at desc",(expert_slug,))])
 @app.post("/api/admin/upload")
 def upload():
     if not check_admin(): return jsonify(error="Неверный пароль"),401
-    files=request.files.getlist("files"); added=[]; con=db()
+    expert_slug, _ = current_profile(); files=request.files.getlist("files"); added=[]; con=db()
     try:
         for file in files:
             text=extract(file).strip()
             if not text: raise ValueError(f"В файле {file.filename} не найден текст")
-            ident=str(uuid.uuid4()); con.execute("insert into documents values(?,?,?,?)",(ident,file.filename,text,int(time.time()))); added.append(file.filename)
+            ident=str(uuid.uuid4()); con.execute("insert into documents(id,name,text,created_at,expert_slug) values(?,?,?,?,?)",(ident,file.filename,text,int(time.time()),expert_slug)); added.append(file.filename)
         con.commit(); return jsonify(added=added)
     except (ValueError,json.JSONDecodeError) as e: return jsonify(error=str(e)),400
 @app.delete("/api/admin/document/<ident>")
 def delete_document(ident):
     if not check_admin(): return jsonify(error="Неверный пароль"),401
-    con=db(); con.execute("delete from documents where id=?",(ident,)); con.commit(); return jsonify(ok=True)
+    expert_slug, _ = current_profile(); con=db(); con.execute("delete from documents where id=? and expert_slug=?",(ident,expert_slug)); con.commit(); return jsonify(ok=True)
 @app.post("/api/reset")
 def reset():
-    sid=session.get("sid"); con=db(); con.execute("delete from messages where session_id=?",(sid,)); con.commit()
+    expert_slug=session.get("expert_slug","psychologist"); sid=session.get("sid"); con=db(); con.execute("delete from messages where session_id=?",(sid,)); con.commit()
     session.clear()
+    session["expert_slug"]=expert_slug
     return jsonify(ok=True)
 
 if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.getenv("PORT","3000")))
