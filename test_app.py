@@ -66,12 +66,18 @@ class TestBot(unittest.TestCase):
         self.assertEqual(len(self.calendar.saved), 1)
         self.assertIn("Анна Иванова", self.calendar.saved[0])
 
+    def test_unrelated_date_does_not_start_booking(self):
+        with target.app.test_request_context("/"):
+            target.session["expert_slug"] = "marketer"
+            self.assertIsNone(target.chat_booking_answer("Завтра в 20:00 у меня начинается урок"))
+
     def test_busy_slot_offers_real_alternatives(self):
         tz = ZoneInfo("Europe/Moscow")
         busy_start = (datetime.now(tz) + timedelta(days=60)).replace(hour=20, minute=0, second=0, microsecond=0)
         self.calendar.busy = [(busy_start, busy_start + timedelta(hours=1))]
         with self.client.session_transaction() as session:
             session["expert_slug"] = "marketer"
+            session["consultation_offered"] = True
         result = self.client.post("/api/chat", json={"message": busy_start.strftime("%d.%m.%Y в 20:00")})
         self.assertEqual(result.status_code, 200)
         self.assertIn("уже занято", result.json["answer"])
