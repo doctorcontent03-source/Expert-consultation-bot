@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.3-chat-booking"
+APP_VERSION = "v9.4-discovery-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -66,6 +66,13 @@ EXPERT_PROFILES = {
 Затем проверьте интерес: хочет ли клиент увидеть, как это решение может работать в его ситуации. Только после явного интереса предложите бесплатную консультацию. Если клиент сам прямо спрашивает, как или когда записаться, сразу дайте запись.
 До объяснения подходящего решения запрещено приглашать на консультацию, упоминать запись или добавлять маркеры кнопок.""",
         "minimum_turns": 5,
+        "discovery_stages": {
+            "identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
+            "goal": "Какой результат вы хотите получить?",
+            "process": "Как сейчас у вас устроена эта работа?",
+            "ai_experience": "Вы уже пробовали решать эту задачу с помощью нейросетей? Что получилось, а что пришлось переделывать?",
+            "pain": "Что в этом процессе отнимает больше всего времени или сильнее всего мешает?",
+        },
         "style_rules": """ИНДИВИДУАЛЬНЫЙ СТИЛЬ ЕКАТЕРИНЫ.
 Не употребляйте обороты «исходя из вашего запроса», «применение нейросетевых технологий», «оптимальное решение», «ваше желание вполне осуществимо», «продуктивная и полезная консультация».
 Если клиент спрашивает, почему нельзя всё обсудить сейчас, объясните границу чата честно и дайте столько конкретики, сколько есть в базе. Никогда не говорите, что скрываете детали ради сохранения ценности встречи.
@@ -378,6 +385,89 @@ def consultation_stage_answer(text, history):
         return f"Спасибо, теперь я в целом понимаю вашу задачу. Подробно разбирать её лучше на встрече. Могу предложить формат «{profile['lead_title']}» продолжительностью {profile['lead_duration_text']}."
     return None
 
+DISCOVERY_KEYS = ("identity", "goal", "process", "ai_experience", "pain")
+
+def parse_json_object(value):
+    value = str(value or "").strip()
+    value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I)
+    start, end = value.find("{"), value.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        result = json.loads(value[start:end + 1])
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+def assess_discovery(history, text, profile):
+    stages = profile.get("discovery_stages")
+    if not stages:
+        return None
+    previous = session.get("discovery_state", {})
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history
+    ) + "\nКлиент: " + text
+    prompt = """Проанализируйте диалог продажи консультации. Верните только JSON без пояснений:
+{"identity":false,"goal":false,"process":false,"ai_experience":false,"pain":false,"solution_explained":false,"solution_interest":false}
+Ставьте true только если соответствующая информация явно содержится в словах клиента или уже прозвучавшем диалоге.
+identity — понятны занятие клиента и его аудитория или заказчики.
+goal — понятен желаемый результат.
+process — понятно, как сейчас выполняется нужная работа.
+ai_experience — клиент сообщил, использовал ли нейросети и что получилось или не получилось. Явное отсутствие опыта тоже считается ответом.
+pain — понятны конкретное затруднение и его последствия: потеря времени, переделки, деньги, качество или другая цена проблемы.
+solution_explained — эксперт уже объяснил хотя бы одно конкретное направление решения этой задачи.
+solution_interest — после объяснения решения клиент явно выразил интерес к нему. Согласие просто продолжить разговор или ответ на диагностический вопрос интересом не считается."""
+    try:
+        raw = gigachat.reply([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": transcript[-9000:]},
+        ])
+        assessed = parse_json_object(raw) or {}
+    except Exception:
+        app.logger.exception("Discovery assessment failed")
+        assessed = {}
+    state = {}
+    for key in DISCOVERY_KEYS + ("solution_explained", "solution_interest"):
+        state[key] = bool(previous.get(key)) or assessed.get(key) is True
+    session["discovery_state"] = state
+    return state
+
+def discovery_instruction(state, profile):
+    if state is None:
+        return "", None
+    missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
+    if missing:
+        question = profile["discovery_stages"][missing]
+        instruction = f"""
+КОНТРОЛЛЕР ЭТАПОВ: диагностика ещё не закончена. Следующий недостающий этап: {missing}.
+Сейчас коротко отреагируйте на конкретную деталь последнего сообщения клиента и задайте один вопрос по смыслу: «{question}».
+Не предлагайте продукт, демонстрацию, консультацию, встречу или запись и не спрашивайте, интересно ли клиенту решение."""
+        return instruction, question
+    if not state.get("solution_explained"):
+        return """
+КОНТРОЛЛЕР ЭТАПОВ: диагностика завершена. Объясните одно конкретное направление решения выявленной задачи, опираясь только на базу знаний и детали диалога. Затем одним вопросом проверьте, интересно ли клиенту увидеть, как это может работать в его ситуации. Пока не приглашайте на консультацию и не предлагайте запись.""", None
+    if not state.get("solution_interest"):
+        return """
+КОНТРОЛЛЕР ЭТАПОВ: направление решения уже объяснено, но клиент ещё не выразил явного интереса к нему. Ответьте на его вопрос или сомнение. Можно уточнить, хочет ли он рассмотреть это решение, но пока нельзя приглашать на консультацию или предлагать запись.""", None
+    return "\nКОНТРОЛЛЕР ЭТАПОВ: клиент явно заинтересовался объяснённым решением. Теперь при уместности можно один раз предложить консультацию.", None
+
+def guard_discovery_answer(answer, state, fallback_question, user_text):
+    if state is None:
+        return answer
+    direct_booking = bool(re.search(r"(как|когда|куда).{0,25}запис|хочу.{0,20}запис|запишите|когда.{0,25}(встреч|консультац)", user_text.lower()))
+    if direct_booking:
+        return answer
+    low = answer.lower()
+    diagnostic_complete = all(state.get(key) for key in DISCOVERY_KEYS)
+    early_move = bool(re.search(r"(консультац|запис|встреч|могу.{0,25}(показать|предложить)|хотите.{0,35}(узнать|посмотреть|попробовать)|интересует.{0,20}(возможность|решение))", low))
+    if not diagnostic_complete and early_move:
+        return fallback_question or "Расскажите, пожалуйста, об этом немного подробнее."
+    consultation_move = bool(re.search(r"(предлаг|приглаш|давайте|хотите|готовы).{0,45}(консультац|встреч|запис)|записаться", low))
+    if diagnostic_complete and not state.get("solution_interest") and consultation_move:
+        return "Сначала хочу понять, насколько вам подходит само решение. Хотите, я коротко объясню, как оно может работать в вашей ситуации?"
+    return answer
+
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
         return DemoCalendar()
@@ -577,6 +667,8 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
+    discovery_state = assess_discovery(history, text, profile)
+    controller_rule, fallback_question = discovery_instruction(discovery_state, profile)
     stage_answer = consultation_stage_answer(text, history)
     if stage_answer:
         if "консультац" in stage_answer.lower():
@@ -590,11 +682,12 @@ def chat():
     else:
         booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nДоступен один тип записи: {free_title}, {profile['lead_duration_text']}; календарь резервирует {free_duration} минут. Не предлагайте регулярную встречу и не добавляйте [[BOOK_REGULAR]]."
     user_turns = 1 + sum(1 for x in history if x["role"] == "user")
-    stage_rule = "\nНа текущем этапе запрещено предлагать встречу или запись: обязательные этапы выявления потребности ещё не пройдены." if user_turns < profile["minimum_turns"] else ""
+    stage_rule = "\nНа текущем этапе запрещено предлагать встречу или запись: обязательные этапы выявления потребности ещё не пройдены." if not profile.get("discovery_stages") and user_turns < profile["minimum_turns"] else ""
     style_rules = profile.get("style_rules", "")
-    messages=[{"role":"system","content":SYSTEM_RULES+"\n\n"+BASE_STYLE_RULES+"\n\n"+profile["strategy_rules"]+"\n\n"+style_rules+booking_rules+stage_rule+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
+    messages=[{"role":"system","content":SYSTEM_RULES+"\n\n"+BASE_STYLE_RULES+"\n\n"+profile["strategy_rules"]+"\n\n"+style_rules+booking_rules+stage_rule+controller_rule+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
     try: answer=gigachat.reply(messages)
     except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
+    answer = guard_discovery_answer(answer, discovery_state, fallback_question, text)
     unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
     if unavailable:
         answer = (f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]" if not profile["regular_enabled"] else "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]")
