@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.1-profile-strategies"
+APP_VERSION = "v9.1.1-new-dialog-state"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -75,6 +75,11 @@ def switch_profile(slug):
         session.clear()
         session["expert_slug"] = slug
     return True
+
+def start_new_dialog():
+    expert_slug = session.get("expert_slug", "psychologist")
+    session.clear()
+    session["expert_slug"] = expert_slug
 
 STYLE = """<style>:root{--g:#285c45;--o:#d97932;--bg:#faf8f1;--soft:#e7f0eb;--ink:#22312a;--line:#d8e1dc}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}.shell{width:min(760px,100%);min-height:100vh;margin:auto;background:#fff;padding:28px clamp(16px,4vw,38px)}header{display:flex;justify-content:space-between;gap:20px;align-items:start}h1{margin:2px 0;font-size:clamp(25px,4vw,36px)}.eyebrow{margin:0;color:var(--o);font-weight:800;text-transform:uppercase;font-size:12px;letter-spacing:.08em}a{color:var(--g)}.chat{height:65vh;min-height:420px;overflow:auto;padding:25px 0;display:flex;flex-direction:column;gap:12px}.bubble{max-width:84%;padding:12px 15px;border-radius:18px;white-space:pre-wrap}.bot{align-self:flex-start;background:var(--soft)}.user{align-self:flex-end;background:var(--g);color:#fff}form{display:flex;gap:10px}input{width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;font:inherit}button{padding:12px 16px;border:0;border-radius:12px;background:var(--g);color:#fff;font-weight:750;cursor:pointer}.secondary{background:#fff;color:var(--g);border:1px solid var(--g);margin-top:12px}.card{border:1px solid var(--line);border-radius:16px;padding:16px;margin:18px 0}.card label{display:block;font-weight:700;margin:12px 0}.card input{display:block;margin-top:6px}.row{display:flex;justify-content:space-between;align-items:center}</style>"""
 
@@ -273,6 +278,8 @@ def home():
 @app.get("/e/<slug>")
 def expert_home(slug):
     if not switch_profile(slug): return "Профиль эксперта не найден", 404
+    if session.get("dialog_closed"):
+        start_new_dialog()
     _, profile = current_profile()
     return render_template_string(HOME_HTML, eyebrow=profile["eyebrow"], intro=profile["intro"])
 @app.get("/health")
@@ -357,14 +364,14 @@ def create_booking():
 def chat():
     text=str((request.json or {}).get("message", "")).strip()[:3000]
     if not text: return jsonify(error="Введите сообщение"),400
+    if session.get("dialog_closed"):
+        start_new_dialog()
     expert_slug, profile = current_profile()
     sid=session.setdefault("sid",str(uuid.uuid4())); con=db()
     docs=con.execute("select name,text from documents where expert_slug=?",(expert_slug,)).fetchall()
     if not docs and not profile["profile_context"]: return jsonify(error="Сначала загрузите базу знаний в разделе «Настройки»"),409
     history=con.execute("select role,content from messages where session_id=? order by created_at desc limit 12",(sid,)).fetchall()[::-1]
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
-    if session.get("dialog_closed"):
-        return jsonify(answer="", closed=True)
     context=(profile["profile_context"]+"\n\n"+relevant(text,docs)).strip()
     completed_answer = completed_dialog_answer(text)
     if completed_answer:
