@@ -289,6 +289,10 @@ def chat_booking_answer(text):
             session["pending_booking"] = {"start": start.isoformat(), "type": booking_type}
             return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Для записи пришлите, пожалуйста, одним сообщением ваше имя, телефон и email."
 
+    booking_intent = bool(re.search(r"(запис|встреч|консультац|подойд[её]т|удобно|свободно)", text.lower()))
+    if not session.get("consultation_offered") and not booking_intent:
+        return None
+
     start = parse_requested_slot(text)
     if not start:
         return None
