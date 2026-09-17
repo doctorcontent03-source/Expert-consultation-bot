@@ -117,6 +117,22 @@ class TestBot(unittest.TestCase):
         self.assertTrue(parsed["identity"])
         self.assertFalse(parsed["goal"])
 
+    def test_shared_quality_filter_detects_cliches(self):
+        issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
+        self.assertIn("шаблонная или канцелярская формулировка", issues)
+
+    def test_shared_quality_filter_keeps_one_question(self):
+        answer = target.keep_one_question("Как сейчас устроена работа? Используете ли вы нейросети? Расскажите подробнее.")
+        self.assertEqual(answer.count("?"), 1)
+        self.assertNotIn("Используете", answer)
+
+    def test_shared_quality_filter_removes_unverified_followup(self):
+        answer = target.remove_unverified_promises(
+            "Встреча пройдёт через Телемост. Я свяжусь с вами накануне, чтобы прислать ссылку. До встречи!"
+        )
+        self.assertIn("Телемост", answer)
+        self.assertNotIn("свяжусь", answer)
+
     def test_busy_slot_offers_real_alternatives(self):
         tz = ZoneInfo("Europe/Moscow")
         busy_start = (datetime.now(tz) + timedelta(days=60)).replace(hour=20, minute=0, second=0, microsecond=0)
