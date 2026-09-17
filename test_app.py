@@ -71,6 +71,41 @@ class TestBot(unittest.TestCase):
             target.session["expert_slug"] = "marketer"
             self.assertIsNone(target.chat_booking_answer("Завтра в 20:00 у меня начинается урок"))
 
+    def test_discovery_guard_blocks_early_offer(self):
+        state = {key: False for key in target.DISCOVERY_KEYS}
+        state.update(identity=True, goal=True)
+        answer = target.guard_discovery_answer(
+            "Могу предложить бесплатную консультацию. Хотите попробовать?",
+            state,
+            "Как сейчас у вас устроена эта работа?",
+            "На подготовку уходит много времени",
+        )
+        self.assertEqual(answer, "Как сейчас у вас устроена эта работа?")
+
+    def test_discovery_guard_requires_solution_interest(self):
+        state = {key: True for key in target.DISCOVERY_KEYS}
+        state.update(solution_explained=True, solution_interest=False)
+        answer = target.guard_discovery_answer(
+            "Тогда предлагаю бесплатную консультацию. Хотите записаться?",
+            state,
+            None,
+            "Понятно",
+        )
+        self.assertNotIn("запис", answer.lower())
+        state["solution_interest"] = True
+        allowed = target.guard_discovery_answer(
+            "Тогда предлагаю бесплатную консультацию. Хотите записаться?",
+            state,
+            None,
+            "Да, мне интересно",
+        )
+        self.assertIn("записаться", allowed)
+
+    def test_discovery_json_parser(self):
+        parsed = target.parse_json_object('```json\n{"identity":true,"goal":false}\n```')
+        self.assertTrue(parsed["identity"])
+        self.assertFalse(parsed["goal"])
+
     def test_busy_slot_offers_real_alternatives(self):
         tz = ZoneInfo("Europe/Moscow")
         busy_start = (datetime.now(tz) + timedelta(days=60)).replace(hour=20, minute=0, second=0, microsecond=0)
