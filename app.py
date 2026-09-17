@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.4.1-neutral-goal-question"
+APP_VERSION = "v9.5-shared-quality-filter"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -29,7 +29,8 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 BASE_STYLE_RULES = """ОБЩИЙ СТИЛЬ ДИАЛОГА.
 Говорите тепло, живо и по-человечески, без официоза, рекламных штампов и канцелярита. Перед следующим вопросом коротко откликайтесь на конкретную мысль, сомнение или затруднение клиента, показывая, что ответ услышан. Используйте детали из его сообщения вместо формальной фразы «понимаю вас».
 Не задавайте вопрос, на который клиент уже ответил. Перед ответом молча проверьте весь доступный диалог и учтите известные факты. Если всё же повторились и клиент указал на это, коротко признайте ошибку и продолжите с учётом его ответа.
-Не превращайте эмпатию в давление, не драматизируйте и не обещайте результат. Не скрывайте полезную информацию ради «сохранения ценности» встречи. Не придумывайте требования к подготовке, условия, факты или действия эксперта, которых нет в базе знаний."""
+Не превращайте эмпатию в давление, не драматизируйте и не обещайте результат. Не скрывайте полезную информацию ради «сохранения ценности» встречи. Не придумывайте требования к подготовке, условия, факты или действия эксперта, которых нет в базе знаний.
+Не начинайте реплику шаблонами «Понятно, вы…», «Понимаю вас», «Ваш опыт показывает», «Отлично!» или «Замечательно!». Не используйте выражения «мощный инструмент», «под ваши конкретные нужды», «оптимальное решение», «вас заинтересует такой подход». Не пересказывайте слова клиента более официальным языком. В одной реплике задавайте не более одного вопроса."""
 
 EXPERT_PROFILES = {
     "psychologist": {
@@ -472,6 +473,81 @@ def guard_discovery_answer(answer, state, fallback_question, user_text):
         return "Сначала хочу понять, насколько вам подходит само решение. Хотите, я коротко объясню, как оно может работать в вашей ситуации?"
     return answer
 
+QUALITY_CLICHES = re.compile(
+    r"(понятно,\s*вы|мне понятно ваш|понимаю (вас|ваш[еу])|ваш опыт показывает|"
+    r"важно понимать|мощн(ый|ым|ого) инструмент|под ваши конкретные нужды|"
+    r"оптимальн(ое|ый|ого) решени|вас заинтересует такой подход|"
+    r"^(отлично|замечательно)[!.]|давайте уточним)",
+    re.I,
+)
+UNVERIFIED_FOLLOWUP = re.compile(
+    r"\b(я\s+)?(свяжусь|пришлю|отправлю|напомню|позвоню|подготовлю).{0,80}\b(накануне|до встречи|ссылк|материал|напомин)",
+    re.I,
+)
+
+def quality_issues(answer):
+    if "[[BOOK_" in answer:
+        return []
+    issues = []
+    if QUALITY_CLICHES.search(answer):
+        issues.append("шаблонная или канцелярская формулировка")
+    if answer.count("?") > 1:
+        issues.append("больше одного вопроса")
+    if UNVERIFIED_FOLLOWUP.search(answer):
+        issues.append("неподтверждённое обещание будущего действия")
+    return issues
+
+def remove_unverified_promises(answer):
+    parts = re.split(r"(?<=[.!?])\s+", answer.strip())
+    kept = [part for part in parts if not UNVERIFIED_FOLLOWUP.search(part)]
+    return " ".join(kept).strip() or "До встречи!"
+
+def keep_one_question(answer):
+    parts = re.split(r"(?<=[.!?])\s+", answer.strip())
+    kept, seen_question = [], False
+    for part in parts:
+        if "?" in part:
+            if seen_question:
+                continue
+            seen_question = True
+        kept.append(part)
+    return " ".join(kept).strip()
+
+def improve_answer_quality(answer, user_text, history, context, profile):
+    issues = quality_issues(answer)
+    if not issues:
+        return answer
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    editor_prompt = f"""Вы — редактор одной реплики чат-бота эксперта. Перепишите черновик естественным разговорным русским языком.
+Проблемы черновика: {', '.join(issues)}.
+Сохраните смысл и текущий этап разговора. Коротко отреагируйте на одну конкретную деталь из последнего сообщения клиента, если это уместно. Не пересказывайте сообщение клиента официальными словами. Не используйте формальную похвалу, рекламные штампы и канцелярит. Задайте не более одного вопроса.
+Не добавляйте фактов, возможностей продукта, требований, обещаний, сроков или будущих действий эксперта, которых нет в базе знаний. Не приглашайте на консультацию, если этого не было в черновике. Не удаляйте приглашение, если оно уже было в черновике.
+{profile.get('style_rules', '')}
+
+БАЗА ЗНАНИЙ:
+{context[-9000:]}
+
+ПОСЛЕДНИЕ РЕПЛИКИ:
+{transcript[-5000:]}
+Клиент: {user_text}
+
+ЧЕРНОВИК:
+{answer}
+
+Верните только исправленную реплику без пояснений."""
+    try:
+        revised = str(gigachat.reply([{"role": "system", "content": editor_prompt}])).strip()
+        if revised and not revised.startswith("{"):
+            answer = revised
+    except Exception:
+        app.logger.exception("Answer quality rewrite failed")
+    answer = remove_unverified_promises(answer)
+    answer = keep_one_question(answer)
+    return answer
+
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
         return DemoCalendar()
@@ -692,6 +768,7 @@ def chat():
     try: answer=gigachat.reply(messages)
     except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
     answer = guard_discovery_answer(answer, discovery_state, fallback_question, text)
+    answer = improve_answer_quality(answer, text, history, context, profile)
     unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
     if unavailable:
         answer = (f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]" if not profile["regular_enabled"] else "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]")
