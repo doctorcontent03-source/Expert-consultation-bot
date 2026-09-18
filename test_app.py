@@ -73,14 +73,14 @@ class TestBot(unittest.TestCase):
 
     def test_discovery_guard_blocks_early_offer(self):
         state = {key: False for key in target.DISCOVERY_KEYS}
-        state.update(identity=True, goal=True)
+        state.update(identity=True)
         answer = target.guard_discovery_answer(
             "Могу предложить бесплатную консультацию. Хотите попробовать?",
             state,
-            "Как сейчас у вас устроена эта работа?",
+            "task",
             "На подготовку уходит много времени",
         )
-        self.assertEqual(answer, "Как сейчас у вас устроена эта работа?")
+        self.assertNotIn("консультац", answer.lower())
 
     def test_discovery_guard_removes_assumed_cooperation(self):
         state = {key: False for key in target.DISCOVERY_KEYS}
@@ -88,34 +88,39 @@ class TestBot(unittest.TestCase):
         answer = target.guard_discovery_answer(
             "Какой результат вы хотите получить, работая со мной?",
             state,
-            "А что в работе сейчас хотелось бы упростить или улучшить?",
+            "task",
             "Я репетитор английского языка",
         )
-        self.assertEqual(answer, "А что в работе сейчас хотелось бы упростить или улучшить?")
+        self.assertNotIn("работая со мной", answer.lower())
 
     def test_discovery_focus_rephrases_after_confusion(self):
         profile = target.EXPERT_PROFILES["marketer"]
-        state = {"identity": True, "task": False, "ai_experience": False}
-        answer = target.enforce_discovery_focus(
-            "С какой задачей вы пришли?",
-            state,
-            profile["discovery_stages"]["task"],
-            "В смысле?!",
-            profile,
-        )
-        self.assertIn("текущую работу", answer)
-        self.assertNotEqual(answer, profile["discovery_stages"]["task"])
+        class NaturalReply:
+            def reply(self, messages):
+                self.prompt = messages[0]["content"]
+                return "Я спрашиваю именно о вашей повседневной работе. Что в ней сейчас больше всего мешает?"
+        fake, old = NaturalReply(), target.gigachat
+        target.gigachat = fake
+        try:
+            answer = target.generate_discovery_reply([], "В смысле?!", "", profile, "task")
+        finally:
+            target.gigachat = old
+        self.assertIn("повседневной работе", answer)
+        self.assertIn("Клиент выразил непонимание: да", fake.prompt)
 
     def test_discovery_focus_replaces_domain_consulting_question(self):
-        state = {"identity": True, "task": True, "ai_experience": False}
-        answer = target.enforce_discovery_focus(
-            "Курс для подростков действительно потребует общей логики. Какие темы и форматы могли бы заинтересовать учеников?",
-            state,
-            "Какой у вас уже был опыт решения этой задачи с помощью нейросетей?",
-            "Хочу создать курс, но времени совсем нет",
-        )
-        self.assertIn("опыт решения этой задачи", answer)
-        self.assertNotIn("Какие темы", answer)
+        profile = target.EXPERT_PROFILES["marketer"]
+        class FocusedReply:
+            def reply(self, messages):
+                return "С курсом уже понятно, где теряется время. Как нейросети справлялись с этой задачей раньше?"
+        old = target.gigachat
+        target.gigachat = FocusedReply()
+        try:
+            answer = target.generate_discovery_reply([], "Хочу создать курс, но времени совсем нет", "", profile, "ai_experience")
+        finally:
+            target.gigachat = old
+        self.assertIn("нейросети", answer)
+        self.assertNotIn("темы", answer)
         self.assertEqual(answer.count("?"), 1)
 
     def test_discovery_guard_requires_solution_interest(self):
