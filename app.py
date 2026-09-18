@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.6.1-natural-task-question"
+APP_VERSION = "v9.7-semantic-dialog-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -63,13 +63,9 @@ EXPERT_PROFILES = {
 До объяснения подходящего решения запрещено приглашать на консультацию, упоминать запись или добавлять маркеры кнопок.""",
         "minimum_turns": 5,
         "discovery_stages": {
-            "identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
-            "task": "А что в работе сейчас хотелось бы упростить или улучшить?",
-            "ai_experience": "Какой у вас уже был опыт решения этой задачи с помощью нейросетей?",
-        },
-        "discovery_clarifications": {
-            "task": "Я имею в виду вашу текущую работу: что в ней отнимает слишком много времени или получается не так, как хотелось бы?",
-            "ai_experience": "Я спрашиваю о нейросетях: пробовали ли вы уже использовать их для этой задачи и устроил ли вас результат?",
+            "identity": "понять, чем занимается клиент и с кем он работает",
+            "task": "понять конкретную рабочую задачу, затруднение и желаемое изменение",
+            "ai_experience": "понять, пробовал ли клиент решать эту задачу с помощью нейросетей и что его устроило или не устроило в результате",
         },
         "style_rules": """ИНДИВИДУАЛЬНЫЙ СТИЛЬ ЕКАТЕРИНЫ.
 Не употребляйте обороты «исходя из вашего запроса», «применение нейросетевых технологий», «оптимальное решение», «ваше желание вполне осуществимо», «продуктивная и полезная консультация».
@@ -436,14 +432,15 @@ def discovery_instruction(state, profile):
         return "", None
     missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
     if missing:
-        question = profile["discovery_stages"][missing]
+        stage_goal = profile["discovery_stages"][missing]
         instruction = f"""
 КОНТРОЛЛЕР ЭТАПОВ: диагностика ещё не закончена. Следующий недостающий этап: {missing}.
-Сейчас коротко отреагируйте на конкретную деталь последнего сообщения клиента и задайте один вопрос по смыслу: «{question}».
+Цель следующей реплики: {stage_goal}.
+Сформулируйте вопрос заново с учётом конкретных слов клиента и предыдущего разговора. Не используйте заранее заданную стандартную формулировку и не повторяйте предыдущий вопрос другими словами без объяснения.
 Не предлагайте продукт, демонстрацию, консультацию, встречу или запись и не спрашивайте, интересно ли клиенту решение.
 Не углубляйтесь в профессиональную область клиента и не помогайте ему прямо сейчас проектировать курс, стратегию, лечение, урок, контент или другой результат его работы. Ваша задача — понять потребность в услуге эксперта.
 Не предполагайте, что клиент уже решил работать с экспертом. Запрещены формулировки «работая со мной», «в нашей работе», «от совместной работы» и похожие."""
-        return instruction, question
+        return instruction, missing
     if not state.get("solution_explained"):
         return """
 КОНТРОЛЛЕР ЭТАПОВ: диагностика завершена. Объясните одно конкретное направление решения выявленной задачи, опираясь только на базу знаний и детали диалога. Затем одним вопросом проверьте, интересно ли клиенту увидеть, как это может работать в его ситуации. Пока не приглашайте на консультацию и не предлагайте запись.""", None
@@ -452,7 +449,7 @@ def discovery_instruction(state, profile):
 КОНТРОЛЛЕР ЭТАПОВ: направление решения уже объяснено, но клиент ещё не выразил явного интереса к нему. Ответьте на его вопрос или сомнение. Можно уточнить, хочет ли он рассмотреть это решение, но пока нельзя приглашать на консультацию или предлагать запись.""", None
     return "\nКОНТРОЛЛЕР ЭТАПОВ: клиент явно заинтересовался объяснённым решением. Теперь при уместности можно один раз предложить консультацию.", None
 
-def guard_discovery_answer(answer, state, fallback_question, user_text):
+def guard_discovery_answer(answer, state, missing_stage, user_text):
     if state is None:
         return answer
     direct_booking = bool(re.search(r"(как|когда|куда).{0,25}запис|хочу.{0,20}запис|запишите|когда.{0,25}(встреч|консультац)", user_text.lower()))
@@ -462,43 +459,67 @@ def guard_discovery_answer(answer, state, fallback_question, user_text):
     diagnostic_complete = all(state.get(key) for key in DISCOVERY_KEYS)
     premature_cooperation = bool(re.search(r"((работая|сотрудничая).{0,20}(со мной|с нами)|в (нашей|совместной) работе|от (нашей|совместной) работы)", low))
     if not diagnostic_complete and premature_cooperation:
-        return fallback_question or "Какую задачу вы хотели бы решить?"
+        answer = " ".join(
+            part for part in re.split(r"(?<=[.!?])\s+", answer)
+            if not re.search(r"(работая|сотрудничая|совместн|нашей работе)", part.lower())
+        ).strip()
     early_move = bool(re.search(r"(консультац|запис|встреч|могу.{0,25}(показать|предложить)|хотите.{0,35}(узнать|посмотреть|попробовать)|интересует.{0,20}(возможность|решение))", low))
     if not diagnostic_complete and early_move:
-        return fallback_question or "Расскажите, пожалуйста, об этом немного подробнее."
+        answer = " ".join(
+            part for part in re.split(r"(?<=[.!?])\s+", answer)
+            if not re.search(r"(консультац|запис|встреч|могу.{0,25}(показать|предложить)|хотите|интересует)", part.lower())
+        ).strip()
     consultation_move = bool(re.search(r"(предлаг|приглаш|давайте|хотите|готовы).{0,45}(консультац|встреч|запис)|записаться", low))
     if diagnostic_complete and not state.get("solution_interest") and consultation_move:
         return "Сначала хочу понять, насколько вам подходит само решение. Хотите, я коротко объясню, как оно может работать в вашей ситуации?"
     return answer
 
-def enforce_discovery_focus(answer, state, fallback_question, user_text, profile=None):
-    if state is None or not fallback_question:
-        return answer
-    missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
-    confusion = bool(re.search(r"(^|\b)(в смысле|не понял(?:а)?|не понимаю|что вы имеете в виду|неясно|непонятно)(\b|[?!.,])", user_text.lower()))
-    if confusion:
-        clarification = (profile or {}).get("discovery_clarifications", {}).get(missing)
-        if clarification:
-            return clarification
-    informational_question = "?" in user_text and bool(re.search(
+def is_informational_question(text):
+    return "?" in text and bool(re.search(
         r"(вы (кто|методист|психолог|маркетолог)|чем вы занимаетесь|что вы предлагаете|"
         r"какие (решения|услуги|продукты)|сколько|как проходит|онлайн|очно|формат|стоимость|цена)",
-        user_text.lower(),
+        text.lower(),
     ))
-    if informational_question:
-        return answer
-    statements = []
-    for part in re.split(r"(?<=[.!?])\s+", answer.strip()):
-        if "?" in part:
-            continue
-        if re.search(r"(консультац|запис|встреч|могу.{0,20}(показать|предложить))", part.lower()):
-            continue
-        if part:
-            statements.append(part)
-        if sum(len(x) for x in statements) >= 220:
-            break
-    prefix = " ".join(statements).strip()
-    return (prefix + " " + fallback_question).strip() if prefix else fallback_question
+
+def generate_discovery_reply(history, text, context, profile, missing_stage):
+    if not missing_stage or is_informational_question(text):
+        return None
+    stage_goal = profile["discovery_stages"][missing_stage]
+    confusion = bool(re.search(r"(в смысле|не понял(?:а)?|не понимаю|что вы имеете в виду|неясно|непонятно)", text.lower()))
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    prompt = f"""Сформулируйте следующую реплику эксперта в живом диагностическом диалоге.
+Смысловая цель реплики: {stage_goal}.
+Опирайтесь на конкретные детали последнего сообщения и всего разговора. Коротко покажите, что услышали клиента, затем задайте один естественный вопрос, который поможет получить недостающую информацию. Не используйте стандартную заготовку и не называйте этап диагностики.
+Клиент выразил непонимание: {'да — коротко объясните смысл вопроса и сформулируйте его иначе, не повторяя прежние слова' if confusion else 'нет'}.
+Не предлагайте продукт, консультацию, встречу или запись. Не консультируйте клиента по его профессии, не помогайте проектировать результат и не задавайте вопрос о содержании его курса, урока, стратегии или контента. Не предполагайте, что клиент уже согласился работать с экспертом. Задайте не более одного вопроса. Ответ — не более трёх предложений.
+{BASE_STYLE_RULES}
+{profile.get('style_rules', '')}
+
+БАЗА ЗНАНИЙ:
+{context[-7000:]}
+
+ДИАЛОГ:
+{transcript[-5000:]}
+Клиент: {text}
+
+Верните только реплику эксперта."""
+    try:
+        answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
+    except Exception:
+        app.logger.exception("Discovery reply generation failed")
+        return None
+    if not answer:
+        return None
+    answer = remove_unverified_promises(answer)
+    answer = keep_one_question(answer)
+    if re.search(r"(консультац|запис|встреч|работая со мной|в нашей работе)", answer.lower()):
+        return None
+    if CONSULTING_IN_CHAT.search(answer):
+        return None
+    return answer
 
 QUALITY_CLICHES = re.compile(
     r"(понятно,\s*вы|мне понятно ваш|понимаю (вас|ваш[еу])|ваш опыт показывает|"
@@ -783,7 +804,11 @@ def chat():
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
     discovery_state = assess_discovery(history, text, profile)
-    controller_rule, fallback_question = discovery_instruction(discovery_state, profile)
+    controller_rule, missing_stage = discovery_instruction(discovery_state, profile)
+    focused_answer = generate_discovery_reply(history, text, context, profile, missing_stage)
+    if focused_answer:
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",focused_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=focused_answer)
     stage_answer = consultation_stage_answer(text, history)
     if stage_answer:
         if "консультац" in stage_answer.lower():
@@ -802,9 +827,8 @@ def chat():
     messages=[{"role":"system","content":SYSTEM_RULES+"\n\n"+BASE_STYLE_RULES+"\n\n"+profile["strategy_rules"]+"\n\n"+style_rules+booking_rules+stage_rule+controller_rule+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
     try: answer=gigachat.reply(messages)
     except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
-    answer = guard_discovery_answer(answer, discovery_state, fallback_question, text)
+    answer = guard_discovery_answer(answer, discovery_state, missing_stage, text)
     answer = improve_answer_quality(answer, text, history, context, profile)
-    answer = enforce_discovery_focus(answer, discovery_state, fallback_question, text, profile)
     unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
     if unavailable:
         answer = (f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]" if not profile["regular_enabled"] else "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]")
