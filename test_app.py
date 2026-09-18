@@ -88,10 +88,23 @@ class TestBot(unittest.TestCase):
         answer = target.guard_discovery_answer(
             "Какой результат вы хотите получить, работая со мной?",
             state,
-            "Какую задачу вы хотели бы решить?",
+            "А что в работе сейчас хотелось бы упростить или улучшить?",
             "Я репетитор английского языка",
         )
-        self.assertEqual(answer, "Какую задачу вы хотели бы решить?")
+        self.assertEqual(answer, "А что в работе сейчас хотелось бы упростить или улучшить?")
+
+    def test_discovery_focus_rephrases_after_confusion(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        state = {"identity": True, "task": False, "ai_experience": False}
+        answer = target.enforce_discovery_focus(
+            "С какой задачей вы пришли?",
+            state,
+            profile["discovery_stages"]["task"],
+            "В смысле?!",
+            profile,
+        )
+        self.assertIn("текущую работу", answer)
+        self.assertNotEqual(answer, profile["discovery_stages"]["task"])
 
     def test_discovery_focus_replaces_domain_consulting_question(self):
         state = {"identity": True, "task": True, "ai_experience": False}
