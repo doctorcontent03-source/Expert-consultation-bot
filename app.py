@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.6-focused-discovery"
+APP_VERSION = "v9.6.1-natural-task-question"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -64,8 +64,12 @@ EXPERT_PROFILES = {
         "minimum_turns": 5,
         "discovery_stages": {
             "identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
-            "task": "С какой задачей вы пришли?",
+            "task": "А что в работе сейчас хотелось бы упростить или улучшить?",
             "ai_experience": "Какой у вас уже был опыт решения этой задачи с помощью нейросетей?",
+        },
+        "discovery_clarifications": {
+            "task": "Я имею в виду вашу текущую работу: что в ней отнимает слишком много времени или получается не так, как хотелось бы?",
+            "ai_experience": "Я спрашиваю о нейросетях: пробовали ли вы уже использовать их для этой задачи и устроил ли вас результат?",
         },
         "style_rules": """ИНДИВИДУАЛЬНЫЙ СТИЛЬ ЕКАТЕРИНЫ.
 Не употребляйте обороты «исходя из вашего запроса», «применение нейросетевых технологий», «оптимальное решение», «ваше желание вполне осуществимо», «продуктивная и полезная консультация».
@@ -467,9 +471,15 @@ def guard_discovery_answer(answer, state, fallback_question, user_text):
         return "Сначала хочу понять, насколько вам подходит само решение. Хотите, я коротко объясню, как оно может работать в вашей ситуации?"
     return answer
 
-def enforce_discovery_focus(answer, state, fallback_question, user_text):
+def enforce_discovery_focus(answer, state, fallback_question, user_text, profile=None):
     if state is None or not fallback_question:
         return answer
+    missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
+    confusion = bool(re.search(r"(^|\b)(в смысле|не понял(?:а)?|не понимаю|что вы имеете в виду|неясно|непонятно)(\b|[?!.,])", user_text.lower()))
+    if confusion:
+        clarification = (profile or {}).get("discovery_clarifications", {}).get(missing)
+        if clarification:
+            return clarification
     informational_question = "?" in user_text and bool(re.search(
         r"(вы (кто|методист|психолог|маркетолог)|чем вы занимаетесь|что вы предлагаете|"
         r"какие (решения|услуги|продукты)|сколько|как проходит|онлайн|очно|формат|стоимость|цена)",
@@ -794,7 +804,7 @@ def chat():
     except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
     answer = guard_discovery_answer(answer, discovery_state, fallback_question, text)
     answer = improve_answer_quality(answer, text, history, context, profile)
-    answer = enforce_discovery_focus(answer, discovery_state, fallback_question, text)
+    answer = enforce_discovery_focus(answer, discovery_state, fallback_question, text, profile)
     unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
     if unavailable:
         answer = (f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]" if not profile["regular_enabled"] else "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]")
