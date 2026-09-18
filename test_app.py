@@ -93,6 +93,18 @@ class TestBot(unittest.TestCase):
         )
         self.assertEqual(answer, "Какую задачу вы хотели бы решить?")
 
+    def test_discovery_focus_replaces_domain_consulting_question(self):
+        state = {"identity": True, "task": True, "ai_experience": False}
+        answer = target.enforce_discovery_focus(
+            "Курс для подростков действительно потребует общей логики. Какие темы и форматы могли бы заинтересовать учеников?",
+            state,
+            "Какой у вас уже был опыт решения этой задачи с помощью нейросетей?",
+            "Хочу создать курс, но времени совсем нет",
+        )
+        self.assertIn("опыт решения этой задачи", answer)
+        self.assertNotIn("Какие темы", answer)
+        self.assertEqual(answer.count("?"), 1)
+
     def test_discovery_guard_requires_solution_interest(self):
         state = {key: True for key in target.DISCOVERY_KEYS}
         state.update(solution_explained=True, solution_interest=False)
@@ -132,6 +144,10 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("Телемост", answer)
         self.assertNotIn("свяжусь", answer)
+
+    def test_shared_quality_filter_detects_consulting_in_chat(self):
+        issues = target.quality_issues("Может быть, обсудим, какие темы и форматы включить в ваш курс?")
+        self.assertIn("попытка консультировать клиента внутри чата вместо выявления потребности", issues)
 
     def test_busy_slot_offers_real_alternatives(self):
         tz = ZoneInfo("Europe/Moscow")
