@@ -10,6 +10,11 @@ import app as target
 
 class FakeGigaChat:
     def reply(self, messages):
+        prompt = messages[0]["content"]
+        if "Извлеките из собственных слов клиента" in prompt:
+            return '{"stages":{}}'
+        if "Определите функцию реплики" in prompt:
+            return '{"question_purpose":"answer_client_question","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"claims_unverified_product":false,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}'
         return "Тестовый ответ"
 
 
@@ -71,8 +76,16 @@ class TestBot(unittest.TestCase):
             target.session["expert_slug"] = "marketer"
             self.assertIsNone(target.chat_booking_answer("Завтра в 20:00 у меня начинается урок"))
 
+    def test_consultation_acceptance_moves_to_booking_once(self):
+        with target.app.test_request_context("/"):
+            target.session["expert_slug"] = "marketer"
+            target.session["consultation_offered"] = True
+            answer = target.accepted_consultation_answer("Хочу")
+        self.assertIn("[[BOOK_FREE]]", answer)
+        self.assertNotIn("[[BOOK_REGULAR]]", answer)
+
     def test_discovery_guard_blocks_early_offer(self):
-        state = {key: False for key in target.DISCOVERY_KEYS}
+        state = {key: False for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
         state.update(identity=True)
         answer = target.guard_discovery_answer(
             "Могу предложить бесплатную консультацию. Хотите попробовать?",
@@ -83,7 +96,7 @@ class TestBot(unittest.TestCase):
         self.assertNotIn("консультац", answer.lower())
 
     def test_discovery_guard_removes_assumed_cooperation(self):
-        state = {key: False for key in target.DISCOVERY_KEYS}
+        state = {key: False for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
         state["identity"] = True
         answer = target.guard_discovery_answer(
             "Какой результат вы хотите получить, работая со мной?",
@@ -124,7 +137,7 @@ class TestBot(unittest.TestCase):
         self.assertEqual(answer.count("?"), 1)
 
     def test_discovery_guard_requires_solution_interest(self):
-        state = {key: True for key in target.DISCOVERY_KEYS}
+        state = {key: True for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
         state.update(solution_explained=True, solution_interest=False)
         answer = target.guard_discovery_answer(
             "Тогда предлагаю бесплатную консультацию. Хотите записаться?",
@@ -147,6 +160,59 @@ class TestBot(unittest.TestCase):
         self.assertTrue(parsed["identity"])
         self.assertFalse(parsed["goal"])
 
+    def test_state_machine_requires_grounded_stage_evidence(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        class Extractor:
+            def __init__(self, response): self.response = response
+            def reply(self, messages): return self.response
+        old = target.gigachat
+        try:
+            with target.app.test_request_context("/"):
+                target.gigachat = Extractor('{"stages":{"identity":{"complete":true,"evidence":"Я репетитор английского"},"task":{"complete":true,"evidence":"Я репетитор английского"},"ai_experience":{"complete":true,"evidence":"Я репетитор английского"}}}')
+                state = target.assess_discovery([], "Я репетитор английского, работаю с детьми и взрослыми", profile)
+        finally:
+            target.gigachat = old
+        self.assertTrue(state["identity"])
+        self.assertFalse(state["task"])
+        self.assertFalse(state["ai_experience"])
+        self.assertFalse(state["solution_explained"])
+        self.assertFalse(state["solution_interest"])
+
+    def test_state_machine_accepts_need_only_from_client_words(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        class Extractor:
+            def reply(self, messages):
+                return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор"},"task":{"complete":true,"evidence":"Хотелось бы побыстрее готовиться к урокам"},"ai_experience":{"complete":false,"evidence":""}}}'
+        old = target.gigachat
+        target.gigachat = Extractor()
+        try:
+            with target.app.test_request_context("/"):
+                history = [{"role":"user","content":"Я репетитор"},{"role":"assistant","content":"Что хотелось бы изменить?"}]
+                state = target.assess_discovery(history, "Хотелось бы побыстрее готовиться к урокам", profile)
+        finally:
+            target.gigachat = old
+        self.assertTrue(state["identity"])
+        self.assertTrue(state["task"])
+        self.assertFalse(state["ai_experience"])
+
+    def test_interest_cannot_exist_before_solution_explanation(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        class Extractor:
+            def reply(self, messages):
+                return '{"stages":{"identity":{"complete":false,"evidence":""},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
+        old = target.gigachat
+        target.gigachat = Extractor()
+        try:
+            with target.app.test_request_context("/"):
+                target.session["discovery_state"] = {"identity":True,"task":True,"ai_experience":True,"solution_explained":False,"solution_interest":False}
+                state = target.assess_discovery([], "Да, интересно", profile)
+                self.assertFalse(state["solution_interest"])
+                target.session["discovery_state"]["solution_explained"] = True
+                state = target.assess_discovery([], "Да, интересно", profile)
+                self.assertTrue(state["solution_interest"])
+        finally:
+            target.gigachat = old
+
     def test_phase_controller_never_explains_solution_without_task(self):
         profile = target.EXPERT_PROFILES["marketer"]
         state = dict(identity=True, task=True, ai_experience=False, solution_explained=False, solution_interest=False)
@@ -165,6 +231,28 @@ class TestBot(unittest.TestCase):
         state = dict(identity=True, task=True, ai_experience=True, solution_explained=False, solution_interest=False)
         with target.app.test_request_context("/"):
             self.assertEqual(target.discovery_action(state, profile, "Не знаю, можно ли это исправить"), "explain_solution")
+
+    def test_full_marketer_state_sequence(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        with target.app.test_request_context("/"):
+            state = dict(identity=True, task=False, ai_experience=False, solution_explained=False, solution_interest=False)
+            self.assertEqual(target.discovery_action(state, profile, "Я репетитор"), "explore_task")
+            state["task"] = True
+            self.assertEqual(target.discovery_action(state, profile, "Хочу быстрее готовиться"), "explore_ai_experience")
+            state["ai_experience"] = True
+            self.assertEqual(target.discovery_action(state, profile, "Пробовала, но переделываю"), "explain_solution")
+            state["solution_explained"] = True
+            self.assertEqual(target.discovery_action(state, profile, "Понятно"), "handle_solution_interest")
+            state["solution_interest"] = True
+            self.assertEqual(target.discovery_action(state, profile, "Да, интересно"), "offer_consultation")
+
+    def test_psychologist_uses_same_state_machine(self):
+        profile = target.EXPERT_PROFILES["psychologist"]
+        with target.app.test_request_context("/"):
+            state = dict(situation=True, duration_impact=False, solution_explained=False, solution_interest=False)
+            self.assertEqual(target.discovery_action(state, profile, "Так уже давно"), "explore_duration_impact")
+            state["duration_impact"] = True
+            self.assertEqual(target.discovery_action(state, profile, "Это мешает жить"), "explain_solution")
 
     def test_phase_validation_detects_repeated_opening(self):
         history = [{"role": "assistant", "content": "Похоже, здесь теряется логика курса."}]
