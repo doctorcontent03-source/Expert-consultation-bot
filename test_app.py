@@ -822,6 +822,39 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("проблема выведена из профессии или аудитории клиента", issues)
 
+    def test_task_question_cannot_presuppose_a_difficulty(self):
+        issues = target.phase_reply_issues(
+            "Какую именно трудность вы испытываете при работе с учениками?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("вопрос заранее приписывает клиенту проблему", issues)
+
+    def test_denial_of_suggested_problem_does_not_complete_need_stage(self):
+        class MisleadingExtractor:
+            def reply(self, messages):
+                return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор по английскому"},"task":{"complete":true,"evidence":"сложности меня не пугают"},"ai_experience":{"complete":false,"evidence":""}}}'
+        old = target.gigachat
+        target.gigachat = MisleadingExtractor()
+        profile = target.EXPERT_PROFILES["marketer"]
+        try:
+            with target.app.test_request_context("/"):
+                target.session["sid"] = "denied-assumption"
+                history = [
+                    {"role": "user", "content": "Я репетитор по английскому, работаю с детьми и взрослыми."},
+                    {"role": "assistant", "content": "Какие сложности возникают у вас во время занятий?"},
+                ]
+                state = target.assess_discovery(
+                    history,
+                    "Во время занятий — никаких. Я работаю 18 лет, сложности меня не пугают.",
+                    profile,
+                )
+                self.assertTrue(state["identity"])
+                self.assertFalse(state["task"])
+                self.assertEqual(target.discovery_action(state, profile, ""), "explore_task")
+        finally:
+            target.gigachat = old
+
     def test_marketer_discovery_advances_from_direct_answers_without_model_labels(self):
         class EmptyExtractor:
             def reply(self, messages):
