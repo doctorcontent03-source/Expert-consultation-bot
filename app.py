@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.5.1-positive-offer-catalog"
+APP_VERSION = "v11.6-structured-discovery-generation"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -825,6 +825,44 @@ natural_and_clear=false, если реплика похожа на анкету,
         app.logger.exception("Phase reply review failed")
         return ["не удалось проверить смысл реплики"]
 
+def generate_structured_discovery_reply(history, text, profile, action):
+    """Generate an open discovery turn without any prewritten user-facing wording."""
+    key = action.removeprefix("explore_").removeprefix("repair_")
+    goal = profile.get("discovery_stages", {}).get(key, "получить недостающую информацию")
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    prompt = f"""Создайте следующую реплику эксперта для диагностического диалога.
+Смысловая цель: {goal}.
+Верните только JSON: {{"reaction":"","question":""}}
+
+reaction — короткая естественная реакция на конкретную деталь последнего сообщения; может быть пустой, если содержательно реагировать пока не на что.
+question — один открытый вопрос, на который нельзя ответить только «да» или «нет». Он должен получать недостающую информацию, не угадывать проблему по профессии и не предлагать клиенту варианты ответа. Не спрашивайте то, что клиент уже сообщил. Не упоминайте продукт, решение, консультацию или встречу.
+
+ДИАЛОГ:
+{transcript[-5000:]}
+Клиент: {text}"""
+    for _ in range(3):
+        try:
+            parsed = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+        except Exception:
+            app.logger.exception("Structured discovery generation failed")
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        reaction = str(parsed.get("reaction", "")).strip()
+        question = str(parsed.get("question", "")).strip()
+        if not question:
+            continue
+        if not question.endswith("?"):
+            question += "?"
+        answer = " ".join(part for part in (reaction, question) if part)
+        if not blocking_reply_issues(phase_reply_issues(answer, action, history)):
+            return answer
+        prompt += "\nПредыдущий вариант не прошёл проверку открытого вопроса. Создайте другой вариант, сохранив только указанную смысловую цель."
+    return None
+
 def generate_phase_reply(history, text, context, profile, action):
     if not action:
         return None
@@ -891,6 +929,8 @@ def generate_phase_reply(history, text, context, profile, action):
     blocking = list(dict.fromkeys(blocking))
     if blocking:
         app.logger.warning("Rejected final phase reply for %s: %s", action, blocking)
+        if action.startswith(("explore_", "repair_")):
+            return generate_structured_discovery_reply(history, text, profile, action)
         return None
     if deterministic_issues:
         app.logger.info("Accepted phase reply with non-blocking style issues for %s: %s", action, deterministic_issues)
