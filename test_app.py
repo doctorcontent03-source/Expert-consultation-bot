@@ -222,11 +222,14 @@ class TestBot(unittest.TestCase):
         target.gigachat = Extractor()
         try:
             with target.app.test_request_context("/"):
+                target.session["sid"] = "same-dialog"
+                target.session["discovery_sid"] = "same-dialog"
                 target.session["discovery_state"] = {"identity":True,"task":True,"ai_experience":True,"solution_explained":False,"solution_interest":False}
-                state = target.assess_discovery([], "Да, интересно", profile)
+                history = [{"role": "user", "content": "Предыдущая часть разговора"}]
+                state = target.assess_discovery(history, "Да, интересно", profile)
                 self.assertFalse(state["solution_interest"])
                 target.session["discovery_state"]["solution_explained"] = True
-                state = target.assess_discovery([], "Да, интересно", profile)
+                state = target.assess_discovery(history, "Да, интересно", profile)
                 self.assertTrue(state["solution_interest"])
         finally:
             target.gigachat = old
@@ -442,6 +445,37 @@ class TestBot(unittest.TestCase):
             con.execute("select count(*) from messages where session_id=?", ("old-dialog",)).fetchone()[0],
             0,
         )
+
+    def test_stale_discovery_cookie_cannot_skip_new_dialog(self):
+        class IdentityExtractor:
+            def reply(self, messages):
+                return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми"},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
+        old = target.gigachat
+        target.gigachat = IdentityExtractor()
+        try:
+            with target.app.test_request_context("/"):
+                target.session["sid"] = "new-dialog"
+                target.session["discovery_sid"] = "old-dialog"
+                target.session["discovery_state"] = {
+                    "identity": True,
+                    "task": True,
+                    "ai_experience": True,
+                    "solution_explained": True,
+                    "solution_interest": True,
+                }
+                state = target.assess_discovery(
+                    [],
+                    "Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми.",
+                    target.EXPERT_PROFILES["marketer"],
+                )
+                self.assertTrue(state["identity"])
+                self.assertFalse(state["task"])
+                self.assertFalse(state["ai_experience"])
+                self.assertFalse(state["solution_explained"])
+                self.assertFalse(state["solution_interest"])
+                self.assertEqual(target.discovery_action(state, target.EXPERT_PROFILES["marketer"], ""), "explore_task")
+        finally:
+            target.gigachat = old
 
     def test_upload_and_chat(self):
         headers = {"X-Admin-Password": "admin123"}
