@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.8-phase-controller"
+APP_VERSION = "v9.8.1-grounded-phases"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -455,11 +455,13 @@ def discovery_action(state, profile, text):
         return None
     if is_informational_question(text):
         return "answer_information"
+    if re.search(r"(не понял(?:а)?|не понимаю|в смысле|что вы имеете в виду|вы издеваетесь|какое отношение|странн(?:ый|ая|ое).{0,20}(вопрос|бесед))", text.lower()):
+        missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
+        return "repair_" + missing if missing else "answer_information"
     missing = [key for key in DISCOVERY_KEYS if not state.get(key)]
-    followups = int(session.get("discovery_followups", 0))
-    if missing and followups < 2:
+    if missing:
         return "explore_" + missing[0]
-    if missing or not state.get("solution_explained"):
+    if not state.get("solution_explained"):
         return "explain_solution"
     if not state.get("solution_interest"):
         return "handle_solution_interest"
@@ -474,7 +476,7 @@ def phase_reply_issues(answer, action, history):
     low = answer.lower()
     if not answer.strip():
         issues.append("пустой ответ")
-    if action.startswith("explore_") and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
+    if (action.startswith("explore_") or action.startswith("repair_")) and re.search(r"(консультац|встреч|запис|продукт|решени[ея]|автоматиз|нейросет.{0,20}поможет)", low):
         issues.append("преждевременный переход к решению или встрече")
     if action == "explain_solution" and "?" in answer and re.search(r"(поделитесь|расскажите|что именно|какие именно|как именно)", low):
         issues.append("продолжение диагностики после собранной информации")
@@ -487,10 +489,13 @@ def phase_reply_issues(answer, action, history):
     return list(dict.fromkeys(issues))
 
 def phase_prompt(action, profile):
+    if action.startswith("repair_"):
+        key = action.removeprefix("repair_")
+        return f"""Клиент не понял вопрос или возмутился. Коротко признайте, что вопрос был неудачным, и объясните, зачем вам нужна только эта информация: {profile['discovery_stages'][key]}. Затем сформулируйте один простой вопрос заново. Не защищайте прежний вопрос, не делайте предположений о задаче клиента и не предлагайте варианты ответа."""
     if action.startswith("explore_"):
         key = action.removeprefix("explore_")
         return f"""Получите только недостающую информацию: {profile['discovery_stages'][key]}.
-Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не пересказывайте его ответ и не просите ещё деталей о том, что он уже объяснил. Не обсуждайте решение, продукт или встречу."""
+Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не угадывайте его задачу по профессии, не предлагайте категории и варианты ответа. Если клиент пока сообщил только профессию и аудиторию, спросите о его реальной рабочей трудности или причине обращения к эксперту, не сужая тему до материалов, контента, продаж или других предполагаемых областей. Не пересказывайте ответ и не обсуждайте решение, продукт или встречу."""
     if action == "explain_solution":
         return """Диагностика закончена. Больше ничего не выясняйте. Коротко назовите выявленный разрыв и объясните одно конкретное направление ИИ-решения из базы знаний. Не проектируйте решение прямо в чате. В конце одним простым вопросом проверьте, хочется ли клиенту увидеть это на своём примере. Не приглашайте на консультацию."""
     if action == "handle_solution_interest":
@@ -528,6 +533,24 @@ def generate_phase_reply(history, text, context, profile, action):
         app.logger.exception("Phase reply generation failed")
         return None
     issues = phase_reply_issues(answer, action, history)
+    review_prompt = f"""Проверьте реплику чат-бота как строгий контролёр этапа. Верните только JSON:
+{{"valid":true,"issues":[]}}
+Текущая задача реплики: {task}
+Реплика должна опираться только на уже сказанное клиентом, не угадывать его проблему по профессии, не предлагать варианты ответа, не повторять вопрос, на который уже ответили, и не начинать консультацию по существу. Она должна быть простой и естественной.
+
+ДИАЛОГ:
+{transcript[-6000:]}
+Клиент: {text}
+
+ПРОВЕРЯЕМАЯ РЕПЛИКА:
+{answer}"""
+    try:
+        review = parse_json_object(gigachat.reply([{"role": "system", "content": review_prompt}]))
+        if review and review.get("valid") is not True:
+            issues.extend(str(x) for x in review.get("issues", []) if x)
+    except Exception:
+        app.logger.exception("Phase reply review failed")
+    issues = list(dict.fromkeys(issues))
     if issues:
         retry = prompt + f"""
 
@@ -900,9 +923,7 @@ def chat():
     action = discovery_action(discovery_state, profile, text)
     phase_answer = generate_phase_reply(history, text, context, profile, action)
     if phase_answer:
-        if action and action.startswith("explore_"):
-            session["discovery_followups"] = int(session.get("discovery_followups", 0)) + 1
-        elif action == "explain_solution":
+        if action == "explain_solution":
             discovery_state = dict(discovery_state or {})
             discovery_state["solution_explained"] = True
             session["discovery_state"] = discovery_state
