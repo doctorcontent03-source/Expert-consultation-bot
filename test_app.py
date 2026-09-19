@@ -187,6 +187,30 @@ class TestBot(unittest.TestCase):
         self.assertIn("бот начинает выполнять работу живого эксперта", issues)
         self.assertIn("бот собирает данные для создания результата вместо продажи решения", issues)
 
+    def test_semantic_review_blocks_invented_product_and_promises(self):
+        issues = target.phase_review_issues({
+            "question_purpose": "answer_client_question",
+            "performs_expert_work": False,
+            "asks_for_deliverable_details": False,
+            "uses_unsupported_assumption": False,
+            "repeats_answered_question": False,
+            "claims_unverified_product": True,
+            "makes_unverified_promise": True,
+            "answers_client_question": False,
+            "natural_and_clear": True,
+        }, "answer_information")
+        self.assertIn("бот выдаёт возможное направление решения за существующий продукт", issues)
+        self.assertIn("бот обещает неподтверждённый результат", issues)
+        self.assertIn("бот не ответил на прямой вопрос клиента", issues)
+
+    def test_solution_question_is_recognized_as_informational(self):
+        self.assertTrue(target.is_informational_question("Что за помощник?"))
+        self.assertTrue(target.is_informational_question("А как он работает?"))
+
+    def test_quality_filter_detects_result_promises(self):
+        issues = target.quality_issues("Вы быстро получите качественные материалы и сэкономите время.")
+        self.assertIn("неподтверждённое обещание результата", issues)
+
     def test_phase_validation_rejects_suggested_task_options(self):
         issues = target.phase_reply_issues(
             "Вам нужно автоматизировать подготовку уроков или улучшить контент для занятий?",
