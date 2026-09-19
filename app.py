@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.3-warm-chat-booking"
+APP_VERSION = "v10.4-answer-before-offer"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -62,7 +62,7 @@ EXPERT_PROFILES = {
         "lead_duration": 60,
         "lead_duration_text": "30–60 минут",
         "regular_enabled": False,
-        "profile_context": """Эксперт — Екатерина Алексеева, контент-маркетолог и специалист по нейросетям. Она создаёт ИИ-решения для экспертов и бизнеса: готовые решения и решения под заказ. Бесплатная онлайн-консультация занимает от 30 до 60 минут и проходит через Телемост. На встрече: знакомство, выявление опыта использования нейросетей, диагностика текущей потребности, демонстрация подходящего продукта и предложение готового ИИ-решения или разработки под заказ. Для календаря резервируется 60 минут.""",
+        "profile_context": """Эксперт — Екатерина Алексеева, контент-маркетолог и специалист по нейросетям. Она создаёт для экспертов и бизнеса ИИ-ассистентов, чат-ботов и приложения: готовые решения и решения под заказ. Бесплатная онлайн-консультация занимает от 30 до 60 минут и проходит через Телемост. На встрече: знакомство, выявление опыта использования нейросетей, диагностика текущей потребности, демонстрация подходящего продукта и предложение готового ИИ-решения или разработки под заказ. Для календаря резервируется 60 минут.""",
         "strategy_rules": """СТРАТЕГИЯ ДИАГНОСТИЧЕСКОЙ ПРОДАЖИ ДЛЯ ХОЛОДНОГО КЛИЕНТА.
 Не ведите человека к записи, пока потребность в ИИ-решении ещё не сформирована.
 За 2–3 содержательных вопроса выясните: кто клиент и с кем работает; с какой конкретной задачей пришёл; пробовал ли решать её с помощью нейросетей и что не получилось. Из одного развёрнутого ответа извлекайте сразу все содержащиеся в нём сведения. Не растягивайте диагностику ради прохождения формального списка и не задавайте вопрос повторно, если ответ уже дан.
@@ -467,13 +467,27 @@ def evidence_is_grounded(stage_type, evidence, client_text, text, history):
     return True
 
 def explicit_solution_interest(text):
-    if "?" in text:
-        return False
     return bool(re.search(
-        r"(^|\b)(да|интересно|хочу (увидеть|посмотреть|попробовать|узнать)|"
-        r"покажите|давайте посмотрим|подходит|мне подходит)(\b|[.!])",
+        r"(^|\b)(да|интересно|хочу(?:\s+(увидеть|посмотреть|попробовать|узнать))?|"
+        r"покажите|давайте посмотрим|подходит|мне подходит|можно)(\b|[.!])",
         text.lower().strip(),
     ))
+
+def consultation_refusal(text):
+    low = str(text or "").lower().strip()
+    return bool(re.search(
+        r"\b(нет[, ]+спасибо|не хочу|не интересно|не надо|не буду|отказываюсь|"
+        r"я уже (сказал|сказала).{0,12}нет|не записывайте|не настаивайте)\b",
+        low,
+    ))
+
+def solution_was_explained(answer, profile):
+    if profile.get("solution_mode") == "expert_service":
+        return bool(re.search(r"(встреч|консультац|разобрать|обсудить)", answer.lower()))
+    low = answer.lower()
+    solution_type = bool(re.search(r"(ассистент|помощник|чат-бот|приложен|систем)", low))
+    useful_function = bool(re.search(r"(готов|созда|подготов|адапт|автомат|материал|контент|упражнен|процесс)", low))
+    return solution_type and useful_function
 
 def is_substantive_identity_answer(text):
     """Recognize a direct answer to the profile's opening question without AI judgment."""
@@ -607,6 +621,10 @@ def phase_reply_issues(answer, action, history):
             issues.append("проблема выведена из профессии или аудитории клиента")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
+    if action == "answer_information" and re.search(r"(хотите.{0,40}(запис|встреч|консультац)|давайте.{0,30}(запиш|встретим)|записаться)", low):
+        issues.append("вместо ответа бот снова предлагает консультацию")
+    if re.search(r"(прямо (здесь|сейчас)|здесь и сейчас|давайте начн[её]м|запущу|попробуем на практике|покажу.{0,40}(материал|задани|пример))", low):
+        issues.append("бот пытается провести демонстрацию или работу эксперта внутри чата")
     opening = normalized_opening(answer)
     recent = [normalized_opening(row["content"]) for row in history if row["role"] == "assistant"][-3:]
     if opening and opening in recent:
@@ -690,13 +708,15 @@ def safe_phase_reply(action, profile=None, text=""):
         "repair_task": "Я неудачно сформулировала вопрос и начала угадывать за вас. Что в вашей работе сейчас хотелось бы изменить?",
         "explore_ai_experience": "Пробовали уже решать эту задачу с помощью нейросетей? Что получилось?",
         "repair_ai_experience": "Я неудачно спросила. Пробовали ли вы решать именно эту задачу с помощью нейросетей и что получилось?",
-        "explain_solution": "Здесь может подойти ИИ-решение, настроенное под ваш рабочий процесс и требования. Хотите посмотреть, как оно может работать в вашей ситуации?",
+        "explain_solution": "Возможное направление здесь — персональный ИИ-помощник для подготовки материалов. Ему можно задать правила работы и дать примеры, на которые он будет ориентироваться. Хотите посмотреть, как такой помощник может работать в вашей ситуации?",
         "handle_solution_interest": "Хотите посмотреть, как такое решение может работать в вашей ситуации?",
         "offer_consultation": "Могу показать это на бесплатной консультации. Хотите записаться?",
         "answer_information": "Не хочу придумывать детали: в материалах эксперта нет точного ответа на этот вопрос.",
     }
     if action == "explain_solution" and profile and profile.get("solution_mode") == "expert_service":
         return "Такую ситуацию лучше подробно разбирать на встрече с экспертом. Подходит ли вам такой следующий шаг?"
+    if action == "answer_information" and profile and profile.get("solution_mode") == "ai_solution" and re.search(r"(какое.{0,15}решени|ассистент|приложен|чат-?бот|помощник)", text.lower()):
+        return "Я имею в виду возможный формат ИИ-решения, а не уже выбранный за вас продукт. Для такой задачи можно рассматривать персонального ИИ-ассистента для подготовки материалов; чат-бот или отдельное приложение нужны, только если потребуется другой способ работы с ним."
     acknowledgement = contextual_acknowledgement(text)
     if action in {"explore_ai_experience", "explain_solution"} and acknowledgement:
         return acknowledgement + " " + replies[action]
@@ -829,7 +849,8 @@ def guard_discovery_answer(answer, state, missing_stage, user_text):
 def is_informational_question(text):
     return "?" in text and bool(re.search(
         r"(вы (кто|методист|психолог|маркетолог)|чем вы занимаетесь|что вы предлагаете|"
-        r"какие (решения|услуги|продукты)|что за|как (он|она|оно|это) работает|что (он|она|оно|это) умеет|"
+        r"как(ое|ой|ая|ие) решени|какие (решения|услуги|продукты)|что за|что имеете в виду|"
+        r"ассистент|приложен|чат-?бот|как (он|она|оно|это) работает|что (он|она|оно|это) умеет|"
         r"в ч[её]м (суть|разница)|сколько|как проходит|онлайн|очно|формат|стоимость|цена)",
         text.lower(),
     ))
@@ -1163,6 +1184,15 @@ def chat():
     if accepted_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=accepted_answer)
+    if consultation_refusal(text) and session.get("consultation_offered"):
+        session["consultation_declined"] = True
+        declined_answer = "Хорошо, не буду настаивать."
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=declined_answer)
+    if session.get("consultation_declined") and not is_informational_question(text):
+        declined_answer = "Хорошо, предложение закрыто."
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=declined_answer)
     discovery_state = assess_discovery(history, text, profile)
     controller_rule, missing_stage = discovery_instruction(discovery_state, profile)
     action = discovery_action(discovery_state, profile, text)
@@ -1170,7 +1200,7 @@ def chat():
     if action:
         if not phase_answer:
             phase_answer = safe_phase_reply(action, profile, text)
-        if action == "explain_solution":
+        if action == "explain_solution" and solution_was_explained(phase_answer, profile):
             discovery_state = dict(discovery_state or {})
             discovery_state["solution_explained"] = True
             session["discovery_state"] = discovery_state
