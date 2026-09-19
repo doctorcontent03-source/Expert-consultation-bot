@@ -201,6 +201,23 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
 
+    def test_solution_phase_rejects_designing_client_course(self):
+        issues = target.phase_reply_issues(
+            "Давайте разберёмся вместе: какие игры и игровые механики нравятся вашим ученикам?",
+            "explain_solution",
+            [],
+        )
+        self.assertIn("проектирование результата клиента вместо объяснения ИИ-решения", issues)
+        self.assertIn("попытка начать рабочую консультацию внутри чата", issues)
+
+    def test_solution_phase_allows_interest_check_about_ai_solution(self):
+        issues = target.phase_reply_issues(
+            "Здесь нужен ассистент, который удерживает логику всего курса, требования к заданиям и уже созданные материалы. Хотите увидеть, как такое решение может работать на вашем примере?",
+            "explain_solution",
+            [],
+        )
+        self.assertNotIn("проектирование результата клиента вместо объяснения ИИ-решения", issues)
+
     def test_shared_quality_filter_detects_cliches(self):
         issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
         self.assertIn("шаблонная или канцелярская формулировка", issues)
