@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.9.2-grounded-solution"
+APP_VERSION = "v10-state-machine"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -44,6 +44,15 @@ EXPERT_PROFILES = {
         "profile_context": "",
         "strategy_rules": """СТРАТЕГИЯ БЕРЕЖНОГО ЗНАКОМСТВА. За 2–3 уточняющих вопроса выясните суть ситуации, её длительность или влияние на жизнь и желаемое изменение. Как только запрос в целом понятен, прекратите расспросы, кратко отразите услышанное и один раз предложите первую встречу.""",
         "minimum_turns": 3,
+        "solution_mode": "expert_service",
+        "discovery_stages": {
+            "situation": "понять, с какой ситуацией или состоянием пришёл клиент",
+            "duration_impact": "понять длительность ситуации или её влияние на жизнь клиента",
+        },
+        "discovery_stage_types": {
+            "situation": "situation",
+            "duration_impact": "duration_impact",
+        },
     },
     "marketer": {
         "name": "Екатерина — маркетолог и специалист по нейросетям",
@@ -62,10 +71,16 @@ EXPERT_PROFILES = {
 Затем проверьте интерес: хочет ли клиент увидеть, как это решение может работать в его ситуации. Только после явного интереса предложите бесплатную консультацию. Если клиент сам прямо спрашивает, как или когда записаться, сразу дайте запись.
 До объяснения подходящего решения запрещено приглашать на консультацию, упоминать запись или добавлять маркеры кнопок.""",
         "minimum_turns": 5,
+        "solution_mode": "ai_solution",
         "discovery_stages": {
             "identity": "понять, чем занимается клиент и с кем он работает",
             "task": "понять конкретную рабочую задачу, затруднение и желаемое изменение",
             "ai_experience": "понять, пробовал ли клиент решать эту задачу с помощью нейросетей и что его устроило или не устроило в результате",
+        },
+        "discovery_stage_types": {
+            "identity": "identity",
+            "task": "need",
+            "ai_experience": "prior_attempts",
         },
         "style_rules": """ИНДИВИДУАЛЬНЫЙ СТИЛЬ ЕКАТЕРИНЫ.
 Не употребляйте обороты «исходя из вашего запроса», «применение нейросетевых технологий», «оптимальное решение», «ваше желание вполне осуществимо», «продуктивная и полезная консультация».
@@ -343,6 +358,20 @@ def direct_booking_answer(text):
         return f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
     return "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
 
+def accepted_consultation_answer(text):
+    if not session.get("consultation_offered") or "?" in text:
+        return None
+    accepted = bool(re.fullmatch(
+        r"\s*(да|давайте|хочу|можно|хорошо|согласен|согласна|попробуем|записывайте)[.!\s]*",
+        text.lower(),
+    ))
+    if not accepted:
+        return None
+    _, profile = current_profile()
+    if profile["regular_enabled"]:
+        return "Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
+    return f"Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
+
 def completed_dialog_answer(text):
     if not session.get("last_booking") or session.get("dialog_closed"):
         return None
@@ -379,8 +408,6 @@ def consultation_stage_answer(text, history):
         return f"Спасибо, теперь я в целом понимаю вашу задачу. Подробно разбирать её лучше на встрече. Могу предложить формат «{profile['lead_title']}» продолжительностью {profile['lead_duration_text']}."
     return None
 
-DISCOVERY_KEYS = ("identity", "task", "ai_experience")
-
 def parse_json_object(value):
     value = str(value or "").strip()
     value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I)
@@ -393,6 +420,46 @@ def parse_json_object(value):
     except json.JSONDecodeError:
         return None
 
+def normalized_text(value):
+    return " ".join(re.findall(r"[а-яёa-z0-9]+", str(value or "").lower()))
+
+def evidence_is_grounded(stage_type, evidence, client_text, text, history):
+    evidence_norm = normalized_text(evidence)
+    client_norm = normalized_text(client_text)
+    if len(evidence_norm) < 2 or evidence_norm not in client_norm:
+        return False
+    if stage_type == "need":
+        return bool(re.search(
+            r"(хочу|хотел|хотелось|нужно|надо|сложн|трудн|не получ|не уме|не знаю|"
+            r"меша|проблем|плохо|долго|времени|приходится|не устраива|изменить|"
+            r"улучшить|упростить|ускорить|сократить)", client_text.lower()
+        ))
+    if stage_type == "prior_attempts":
+        ai_words = r"(нейросет|gpt|chatgpt|гигач|искусственн.{0,10}интеллект|\bии\b)"
+        if re.search(ai_words, client_text.lower()):
+            return True
+        last_assistant = next((row["content"] for row in reversed(history) if row["role"] == "assistant"), "")
+        direct_answer = bool(re.search(r"\b(да|нет|пробовал|пробовала|пытаюсь|пытался|пыталась|не пользовал|получилось|не получилось)\b", text.lower()))
+        return bool(re.search(ai_words, last_assistant.lower())) and direct_answer
+    if stage_type == "situation":
+        return len(evidence_norm.split()) >= 3
+    if stage_type == "duration_impact":
+        return bool(re.search(
+            r"(день|недел|месяц|год|давно|недавно|с детства|после|влияет|мешает|"
+            r"не могу|не хочу|перестал|перестала|ничего|работ|общен|сон|жизн)",
+            client_text.lower(),
+        ))
+    return True
+
+def explicit_solution_interest(text):
+    if "?" in text:
+        return False
+    return bool(re.search(
+        r"(^|\b)(да|интересно|хочу (увидеть|посмотреть|попробовать|узнать)|"
+        r"покажите|давайте посмотрим|подходит|мне подходит)(\b|[.!])",
+        text.lower().strip(),
+    ))
+
 def assess_discovery(history, text, profile):
     stages = profile.get("discovery_stages")
     if not stages:
@@ -402,14 +469,15 @@ def assess_discovery(history, text, profile):
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history
     ) + "\nКлиент: " + text
-    prompt = """Проанализируйте диалог продажи консультации. Верните только JSON без пояснений:
-{"identity":false,"task":false,"ai_experience":false,"solution_explained":false,"solution_interest":false}
-Ставьте true только если соответствующая информация явно содержится в собственных словах клиента. Предположения, варианты ответа и формулировки эксперта не являются сведениями о клиенте.
-identity — понятны занятие клиента и его аудитория или заказчики.
-task — клиент своими словами описал конкретную задачу или проблему и желаемое изменение. Короткие ответы «да», «нет», «и то и другое», «всё это» на предложенные экспертом варианты этап не закрывают. Один развёрнутый ответ клиента может полностью раскрыть этап.
-ai_experience — клиент сообщил, использовал ли нейросети и что получилось или не получилось. Явное отсутствие опыта тоже считается ответом.
-solution_explained — эксперт уже объяснил хотя бы одно конкретное направление решения этой задачи.
-solution_interest — после объяснения решения клиент явно выразил интерес к нему. Согласие просто продолжить разговор или ответ на диагностический вопрос интересом не считается."""
+    stage_lines = "\n".join(f"{key}: {goal}" for key, goal in stages.items())
+    schema = {key: {"complete": False, "evidence": ""} for key in stages}
+    prompt = f"""Извлеките из собственных слов клиента сведения для этапов диалога.
+Верните только JSON такого вида: {json.dumps({'stages': schema}, ensure_ascii=False)}
+
+ЭТАПЫ:
+{stage_lines}
+
+Для complete=true укажите в evidence точную непрерывную цитату из слов клиента, которая сама подтверждает этап. Не используйте слова эксперта как доказательство. Не делайте вывод из профессии о проблеме клиента. Короткое согласие с вариантом, предложенным экспертом, не раскрывает потребность. Если точной цитаты нет, ставьте complete=false."""
     try:
         raw = gigachat.reply([
             {"role": "system", "content": prompt},
@@ -419,18 +487,27 @@ solution_interest — после объяснения решения клиен�
     except Exception:
         app.logger.exception("Discovery assessment failed")
         assessed = None
-    if assessed is None:
-        return previous or None
-    state = {}
-    for key in DISCOVERY_KEYS + ("solution_explained", "solution_interest"):
-        state[key] = bool(previous.get(key)) or assessed.get(key) is True
+    state = {key: bool(previous.get(key)) for key in stages}
+    client_text = "\n".join([row["content"] for row in history if row["role"] == "user"] + [text])
+    extracted = assessed.get("stages", {}) if isinstance(assessed, dict) else {}
+    stage_types = profile.get("discovery_stage_types", {})
+    for key in stages:
+        item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
+        evidence = item.get("evidence", "") if isinstance(item, dict) else ""
+        if item.get("complete") is True and evidence_is_grounded(stage_types.get(key, key), evidence, client_text, text, history):
+            state[key] = True
+    state["solution_explained"] = bool(previous.get("solution_explained"))
+    state["solution_interest"] = bool(previous.get("solution_interest")) or (
+        state["solution_explained"] and explicit_solution_interest(text)
+    )
     session["discovery_state"] = state
     return state
 
 def discovery_instruction(state, profile):
     if state is None:
         return "", None
-    missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
+    stage_keys = tuple(profile.get("discovery_stages", {}))
+    missing = next((key for key in stage_keys if not state.get(key)), None)
     if missing:
         stage_goal = profile["discovery_stages"][missing]
         instruction = f"""
@@ -456,9 +533,10 @@ def discovery_action(state, profile, text):
     if is_informational_question(text):
         return "answer_information"
     if re.search(r"(не понял(?:а)?|не понимаю|в смысле|что вы имеете в виду|вы издеваетесь|какое отношение|странн(?:ый|ая|ое).{0,20}(вопрос|бесед))", text.lower()):
-        missing = next((key for key in DISCOVERY_KEYS if not state.get(key)), None)
+        stage_keys = tuple(profile.get("discovery_stages", {}))
+        missing = next((key for key in stage_keys if not state.get(key)), None)
         return "repair_" + missing if missing else "answer_information"
-    missing = [key for key in DISCOVERY_KEYS if not state.get(key)]
+    missing = [key for key in profile.get("discovery_stages", {}) if not state.get(key)]
     if missing:
         return "explore_" + missing[0]
     if not state.get("solution_explained"):
@@ -498,18 +576,20 @@ def phase_review_issues(review, action):
         return ["контролёр не смог определить функцию реплики"]
     issues = []
     purpose = str(review.get("question_purpose", "none"))
-    expected = {
-        "explore_identity": {"discover_client_context"},
-        "explore_task": {"discover_need"},
-        "explore_ai_experience": {"discover_prior_attempts"},
-        "repair_identity": {"discover_client_context"},
-        "repair_task": {"discover_need"},
-        "repair_ai_experience": {"discover_prior_attempts"},
+    if action.startswith(("explore_", "repair_")):
+        if action.endswith("identity"):
+            expected = {"discover_client_context"}
+        elif action.endswith("ai_experience"):
+            expected = {"discover_prior_attempts"}
+        else:
+            expected = {"discover_need"}
+    else:
+        expected = {
         "explain_solution": {"check_solution_interest", "none"},
         "handle_solution_interest": {"check_solution_interest", "answer_client_question", "none"},
         "offer_consultation": {"offer_next_step", "answer_client_question", "none"},
         "answer_information": {"answer_client_question", "none"},
-    }.get(action, {"none"})
+        }.get(action, {"none"})
     if purpose not in expected:
         issues.append(f"вопрос выполняет другую функцию: {purpose}")
     if review.get("performs_expert_work") is True:
@@ -539,6 +619,8 @@ def phase_prompt(action, profile):
         return f"""Получите только недостающую информацию: {profile['discovery_stages'][key]}.
 Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не угадывайте его задачу по профессии, не предлагайте категории и варианты ответа. Если клиент пока сообщил только профессию и аудиторию, спросите о его реальной рабочей трудности или причине обращения к эксперту, не сужая тему до предполагаемой области. Не пересказывайте ответ и не обсуждайте решение, продукт или встречу."""
     if action == "explain_solution":
+        if profile.get("solution_mode") == "expert_service":
+            return """Диагностика закончена. Больше ничего не выясняйте и не консультируйте по существу в чате. Коротко объясните, почему выявленную ситуацию уместно разбирать с экспертом на встрече и что можно определить на первой встрече, используя только базу знаний. Не обещайте результат. В конце допустим только один вопрос: подходит ли клиенту такой следующий шаг. Пока не предлагайте запись."""
         return """Диагностика закончена. Больше ничего не выясняйте. Коротко назовите выявленный разрыв и объясните одно конкретное направление ИИ-решения из базы знаний: какой тип помощника или системы может подойти и какую часть процесса можно ему передать. Не утверждайте, что у эксперта уже есть конкретный готовый продукт, если это прямо не указано в базе знаний. Не обещайте результат. Не начинайте создавать конечный результат клиента и не запрашивайте сведения, которые нужны для его создания. В конце допустим только один вопрос: интересно ли клиенту увидеть предложенное ИИ-решение на своём примере. Не приглашайте на консультацию."""
     if action == "handle_solution_interest":
         return """Ответьте на вопрос или сомнение клиента о предложенном направлении решения. Не возвращайтесь к диагностике и пока не приглашайте на консультацию. Если вопроса нет, одним коротким вопросом проверьте интерес к демонстрации решения на его примере."""
@@ -546,7 +628,7 @@ def phase_prompt(action, profile):
         return """Клиент явно заинтересован в решении. Теперь можно один раз предложить бесплатную консультацию и кратко связать её содержание с его задачей. Не повторяйте уже сказанные объяснения."""
     return "Ответьте прямо и содержательно только на информационный вопрос клиента, используя факты из базы знаний и разговора. Если клиент спрашивает о предложенном решении, ясно отделите возможное направление от реально существующего продукта. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
 
-def safe_phase_reply(action):
+def safe_phase_reply(action, profile=None):
     """Last-resort output used only when generated variants still violate the phase."""
     replies = {
         "explore_identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
@@ -560,6 +642,12 @@ def safe_phase_reply(action):
         "offer_consultation": "Могу показать это на бесплатной консультации. Хотите записаться?",
         "answer_information": "Не хочу придумывать детали: в материалах эксперта нет точного ответа на этот вопрос.",
     }
+    if action == "explain_solution" and profile and profile.get("solution_mode") == "expert_service":
+        return "Такую ситуацию лучше подробно разбирать на встрече с экспертом. Подходит ли вам такой следующий шаг?"
+    if action in replies:
+        return replies[action]
+    if action.startswith(("explore_", "repair_")):
+        return "Расскажите, пожалуйста, об этом немного подробнее."
     return replies.get(action, "Уточните, пожалуйста, ваш вопрос.")
 
 def semantic_phase_issues(answer, action, task, transcript, text, context):
@@ -652,7 +740,7 @@ def generate_phase_reply(history, text, context, profile, action):
     final_issues = list(dict.fromkeys(final_issues))
     if final_issues:
         app.logger.warning("Rejected final phase reply for %s: %s", action, final_issues)
-        answer = safe_phase_reply(action)
+        answer = safe_phase_reply(action, profile)
     answer = remove_unverified_promises(answer)
     return keep_one_question(answer)
 
@@ -663,7 +751,7 @@ def guard_discovery_answer(answer, state, missing_stage, user_text):
     if direct_booking:
         return answer
     low = answer.lower()
-    diagnostic_complete = all(state.get(key) for key in DISCOVERY_KEYS)
+    diagnostic_complete = missing_stage is None
     premature_cooperation = bool(re.search(r"((работая|сотрудничая).{0,20}(со мной|с нами)|в (нашей|совместной) работе|от (нашей|совместной) работы)", low))
     if not diagnostic_complete and premature_cooperation:
         answer = " ".join(
@@ -1010,6 +1098,10 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
+    accepted_answer = accepted_consultation_answer(text)
+    if accepted_answer:
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=accepted_answer)
     discovery_state = assess_discovery(history, text, profile)
     controller_rule, missing_stage = discovery_instruction(discovery_state, profile)
     action = discovery_action(discovery_state, profile, text)
