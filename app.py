@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.6-no-deliverable-interrogation"
+APP_VERSION = "v11-semantic-dialog-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -489,6 +489,52 @@ def sales_hesitation(text):
         str(text or "").lower(),
     ))
 
+def classify_client_move(history, text):
+    """Classify the function of the client's turn independently of its wording."""
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    prompt = f"""Определите функцию последней реплики клиента с учётом предыдущей реплики эксперта.
+Верните только JSON:
+{{"intent":"other","subject":"other","confidence":"high"}}
+
+intent — одно из: information_question, interest, hesitation, refusal, booking_request, other.
+subject — одно из: solution, consultation, booking, other.
+
+information_question: клиент просит объяснить факт, формат, платформу, тип или принцип работы.
+interest: клиент положительно или осторожно-положительно оценивает предложенное решение или следующий шаг.
+hesitation: клиент не отказывается, но пока не готов решить.
+refusal: клиент отвергает предложенное решение, демонстрацию, встречу или просит прекратить обсуждение.
+booking_request: клиент хочет выбрать или проверить время записи.
+Не считайте отказом слова «не интересно», «не подходит» и подобные, если они описывают учеников, материалы, прошлый опыт или другую часть проблемы, а не предложение эксперта.
+
+ДИАЛОГ:
+{transcript[-5000:]}
+Клиент: {text}"""
+    try:
+        parsed = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+    except Exception:
+        app.logger.exception("Client move classification failed")
+        parsed = None
+    allowed_intents = {"information_question", "interest", "hesitation", "refusal", "booking_request", "other"}
+    allowed_subjects = {"solution", "consultation", "booking", "other"}
+    if isinstance(parsed, dict) and parsed.get("intent") in allowed_intents:
+        return {
+            "intent": parsed["intent"],
+            "subject": parsed.get("subject") if parsed.get("subject") in allowed_subjects else "other",
+        }
+    # Safety fallback only when semantic classification is unavailable.
+    if is_informational_question(text):
+        return {"intent": "information_question", "subject": "solution"}
+    if consultation_refusal(text):
+        return {"intent": "refusal", "subject": "other"}
+    if sales_hesitation(text):
+        return {"intent": "hesitation", "subject": "other"}
+    if explicit_solution_interest(text):
+        return {"intent": "interest", "subject": "solution"}
+    return {"intent": "other", "subject": "other"}
+
 def consultation_offer_active():
     """An offer flag is valid only inside the dialog that created it."""
     return bool(
@@ -533,7 +579,7 @@ def has_direct_stage_evidence(stage_type, text, client_text, history):
         return False
     return evidence_is_grounded(stage_type, text, client_text, text, history)
 
-def assess_discovery(history, text, profile):
+def assess_discovery(history, text, profile, client_move=None):
     stages = profile.get("discovery_stages")
     if not stages:
         return None
@@ -582,8 +628,9 @@ def assess_discovery(history, text, profile):
     if not history and first_stage and stage_types.get(first_stage) == "identity" and is_substantive_identity_answer(text):
         state[first_stage] = True
     state["solution_explained"] = bool(previous.get("solution_explained"))
+    semantic_interest = isinstance(client_move, dict) and client_move.get("intent") == "interest"
     state["solution_interest"] = bool(previous.get("solution_interest")) or (
-        state["solution_explained"] and explicit_solution_interest(text)
+        state["solution_explained"] and (semantic_interest or explicit_solution_interest(text))
     )
     session["discovery_state"] = state
     session["discovery_sid"] = sid
@@ -612,11 +659,11 @@ def discovery_instruction(state, profile):
 КОНТРОЛЛЕР ЭТАПОВ: направление решения уже объяснено, но клиент ещё не выразил явного интереса к нему. Ответьте на его вопрос или сомнение. Можно уточнить, хочет ли он рассмотреть это решение, но пока нельзя приглашать на консультацию или предлагать запись.""", None
     return "\nКОНТРОЛЛЕР ЭТАПОВ: клиент явно заинтересовался объяснённым решением. Теперь при уместности можно один раз предложить консультацию.", None
 
-def discovery_action(state, profile, text):
+def discovery_action(state, profile, text, client_move=None):
     """Choose the next conversational job; wording remains the model's job."""
     if state is None:
         return None
-    if is_informational_question(text):
+    if (isinstance(client_move, dict) and client_move.get("intent") == "information_question") or is_informational_question(text):
         return "answer_information"
     if re.search(r"(не понял(?:а)?|не понимаю|в смысле|что вы имеете в виду|вы издеваетесь|какое отношение|странн(?:ый|ая|ое).{0,20}(вопрос|бесед))", text.lower()):
         stage_keys = tuple(profile.get("discovery_stages", {}))
@@ -1222,18 +1269,19 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
+    client_move = classify_client_move(history, text)
     accepted_answer = accepted_consultation_answer(text)
     if accepted_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=accepted_answer)
-    if sales_hesitation(text) and last_assistant_asked_sales_interest(history):
+    if client_move.get("intent") == "hesitation" and last_assistant_asked_sales_interest(history):
         session["sales_paused"] = True
         session["sales_paused_sid"] = sid
         paused_answer = "Конечно, решать прямо сейчас не обязательно. Можно спокойно подумать."
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",paused_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=paused_answer)
     strong_stop = bool(re.search(r"\b(да ну вас|оставьте меня|хватит|не настаивайте)\b", text.lower()))
-    refusal_in_context = consultation_refusal(text) and (
+    refusal_in_context = client_move.get("intent") == "refusal" and (
         (consultation_offer_active() and last_assistant_offered_consultation(history))
         or last_assistant_asked_sales_interest(history)
         or (session.get("sales_paused") and session.get("sales_paused_sid") == sid)
@@ -1249,9 +1297,9 @@ def chat():
         declined_answer = "Хорошо, не буду возвращаться к этому предложению."
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=declined_answer)
-    discovery_state = assess_discovery(history, text, profile)
+    discovery_state = assess_discovery(history, text, profile, client_move)
     controller_rule, missing_stage = discovery_instruction(discovery_state, profile)
-    action = discovery_action(discovery_state, profile, text)
+    action = discovery_action(discovery_state, profile, text, client_move)
     phase_answer = generate_phase_reply(history, text, context, profile, action)
     if action:
         if not phase_answer:
