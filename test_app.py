@@ -42,6 +42,11 @@ class TestBot(unittest.TestCase):
         self.original_calendar = target.yandex_calendar
         target.yandex_calendar = lambda: self.calendar
 
+    def test_home_script_keeps_message_separator_escaped(self):
+        script = target.HOME_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+        self.assertIn("pending.join('\\n\\n')", script)
+        self.assertNotIn("pending.join('\n\n')", script)
+
     def tearDown(self):
         target.yandex_calendar = self.original_calendar
         self.tmp.close()
