@@ -891,9 +891,29 @@ class TestBot(unittest.TestCase):
             state,
             target.EXPERT_PROFILES["marketer"],
             "Мне уже расхотелось отвечать на вопросы.",
-            {"intent": "refusal", "subject": "other"},
+            {"intent": "refusal", "subject": "conversation", "refusal_reason": "conversation_breakdown"},
         )
         self.assertEqual(action, "pause_discovery")
+
+    def test_no_current_need_is_not_conversation_breakdown(self):
+        state = {"identity": True, "task": False, "ai_experience": False, "solution_explained": False, "solution_interest": False}
+        action = target.discovery_action(
+            state,
+            target.EXPERT_PROFILES["marketer"],
+            "Мне сейчас никакие ИИ-решения не нужны.",
+            {"intent": "refusal", "subject": "need", "refusal_reason": "no_current_need"},
+        )
+        self.assertEqual(action, "close_no_need")
+
+    def test_offer_rejection_does_not_erase_underlying_need(self):
+        state = {"identity": True, "task": True, "ai_experience": True, "solution_explained": True, "solution_interest": False}
+        action = target.discovery_action(
+            state,
+            target.EXPERT_PROFILES["marketer"],
+            "Нет, это решение мне не подходит.",
+            {"intent": "refusal", "subject": "solution", "refusal_reason": "offer_rejection"},
+        )
+        self.assertEqual(action, "acknowledge_offer_rejection")
 
     def test_denial_of_suggested_problem_does_not_complete_need_stage(self):
         class MisleadingExtractor:
