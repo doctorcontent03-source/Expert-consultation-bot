@@ -59,7 +59,9 @@ class TestBot(unittest.TestCase):
     def test_chat_checks_slot_and_books_from_contacts(self):
         with self.client.session_transaction() as session:
             session["expert_slug"] = "marketer"
+            session["sid"] = "booking-dialog"
             session["consultation_offered"] = True
+            session["consultation_offered_sid"] = "booking-dialog"
         future = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=60)
         request_text = future.strftime("%d.%m.%Y в 20:00")
         first = self.client.post("/api/chat", json={"message": request_text})
@@ -79,7 +81,9 @@ class TestBot(unittest.TestCase):
     def test_consultation_acceptance_moves_to_booking_once(self):
         with target.app.test_request_context("/"):
             target.session["expert_slug"] = "marketer"
+            target.session["sid"] = "booking-dialog"
             target.session["consultation_offered"] = True
+            target.session["consultation_offered_sid"] = "booking-dialog"
             answer = target.accepted_consultation_answer("Хочу")
             self.assertIn("дату и время", answer)
             self.assertNotIn("[[BOOK_", answer)
@@ -431,14 +435,39 @@ class TestBot(unittest.TestCase):
         self.assertIn("бот пытается провести демонстрацию или работу эксперта внутри чата", issues)
 
     def test_refusal_stops_consultation_pressure(self):
+        con = target.db()
+        con.execute(
+            "insert into messages(session_id,role,content,created_at) values(?,?,?,?)",
+            ("refusal-dialog", "assistant", "Хотите записаться на бесплатную консультацию?", 1),
+        )
+        con.commit()
         with self.client.session_transaction() as session:
             session["expert_slug"] = "marketer"
+            session["sid"] = "refusal-dialog"
             session["consultation_offered"] = True
+            session["consultation_offered_sid"] = "refusal-dialog"
         first = self.client.post("/api/chat", json={"message": "Нет, спасибо."})
         self.assertEqual(first.json["answer"], "Хорошо, не буду настаивать.")
         second = self.client.post("/api/chat", json={"message": "Я уже сказала, нет."})
         self.assertNotIn("консультац", second.json["answer"].lower())
         self.assertNotIn("встреч", second.json["answer"].lower())
+
+    def test_not_interesting_inside_problem_description_is_not_refusal(self):
+        history = [{
+            "role": "assistant",
+            "content": "А что в вашей работе сейчас хотелось бы упростить или изменить?",
+        }]
+        self.assertTrue(target.consultation_refusal(
+            "Особенно сложно с подростками, которым вообще ничего не интересно."
+        ))
+        self.assertFalse(target.last_assistant_offered_consultation(history))
+
+    def test_offer_flag_from_another_dialog_is_inactive(self):
+        with target.app.test_request_context("/"):
+            target.session["sid"] = "new-dialog"
+            target.session["consultation_offered"] = True
+            target.session["consultation_offered_sid"] = "old-dialog"
+            self.assertFalse(target.consultation_offer_active())
 
     def test_safe_reply_acknowledges_specific_client_difficulty(self):
         answer = target.safe_phase_reply(
@@ -475,7 +504,9 @@ class TestBot(unittest.TestCase):
         self.calendar.busy = [(busy_start, busy_start + timedelta(hours=1))]
         with self.client.session_transaction() as session:
             session["expert_slug"] = "marketer"
+            session["sid"] = "busy-dialog"
             session["consultation_offered"] = True
+            session["consultation_offered_sid"] = "busy-dialog"
         result = self.client.post("/api/chat", json={"message": busy_start.strftime("%d.%m.%Y в 20:00")})
         self.assertEqual(result.status_code, 200)
         self.assertIn("уже занято", result.json["answer"])
