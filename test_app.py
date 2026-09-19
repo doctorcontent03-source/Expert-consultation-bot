@@ -376,6 +376,29 @@ class TestBot(unittest.TestCase):
             issues = target.phase_reply_issues(answer, "explore_task", [])
             self.assertIn("закрытый или наводящий вопрос вместо открытого выяснения задачи", issues)
 
+    def test_structured_discovery_recovers_after_closed_generated_questions(self):
+        class ClosedThenStructured:
+            def reply(self, messages):
+                prompt = messages[0]["content"]
+                if 'Верните только JSON: {"reaction":"","question":""}' in prompt:
+                    return '{"reaction":"","question":"Что в вашей работе хотелось бы изменить в первую очередь?"}'
+                if "Определите функцию реплики чат-бота" in prompt:
+                    return '{"question_purpose":"discover_need","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"claims_unverified_product":false,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}'
+                return "Вам приходится подбирать материалы для каждого ученика?"
+        old = target.gigachat
+        target.gigachat = ClosedThenStructured()
+        try:
+            answer = target.generate_phase_reply(
+                [],
+                "Я репетитор английского языка и работаю с детьми и взрослыми.",
+                "",
+                target.EXPERT_PROFILES["marketer"],
+                "explore_task",
+            )
+        finally:
+            target.gigachat = old
+        self.assertEqual(answer, "Что в вашей работе хотелось бы изменить в первую очередь?")
+
     def test_invalid_last_generation_cannot_reach_dialog(self):
         profile = target.EXPERT_PROFILES["marketer"]
         class AlwaysInvalid:
