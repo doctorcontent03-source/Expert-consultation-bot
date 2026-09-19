@@ -523,6 +523,41 @@ class TestBot(unittest.TestCase):
             target.session["consultation_offered_sid"] = "old-dialog"
             self.assertFalse(target.consultation_offer_active())
 
+    def test_semantic_client_move_controls_transition_without_phrase_matching(self):
+        class SemanticClassifier:
+            def reply(self, messages):
+                return '{"intent":"interest","subject":"solution","confidence":"high"}'
+        old = target.gigachat
+        target.gigachat = SemanticClassifier()
+        try:
+            move = target.classify_client_move(
+                [{"role": "assistant", "content": "Речь идёт о возможном ИИ-решении."}],
+                "Возможно, в этом что-то есть.",
+            )
+        finally:
+            target.gigachat = old
+        self.assertEqual(move["intent"], "interest")
+        state = dict(identity=True, task=True, ai_experience=True, solution_explained=True, solution_interest=True)
+        self.assertEqual(
+            target.discovery_action(state, target.EXPERT_PROFILES["marketer"], "Возможно, в этом что-то есть.", move),
+            "offer_consultation",
+        )
+
+    def test_semantic_classifier_keeps_problem_description_out_of_refusal_state(self):
+        class SemanticClassifier:
+            def reply(self, messages):
+                return '{"intent":"other","subject":"other","confidence":"high"}'
+        old = target.gigachat
+        target.gigachat = SemanticClassifier()
+        try:
+            move = target.classify_client_move(
+                [{"role": "assistant", "content": "Что хотелось бы изменить в работе?"}],
+                "Подросткам вообще ничего не интересно.",
+            )
+        finally:
+            target.gigachat = old
+        self.assertEqual(move["intent"], "other")
+
     def test_safe_reply_acknowledges_specific_client_difficulty(self):
         answer = target.safe_phase_reply(
             "explain_solution",
