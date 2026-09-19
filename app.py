@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.9.1-validated-output"
+APP_VERSION = "v9.9.2-grounded-solution"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -520,6 +520,12 @@ def phase_review_issues(review, action):
         issues.append("бот приписывает клиенту сведения, которых тот не сообщал")
     if review.get("repeats_answered_question") is True:
         issues.append("бот снова спрашивает уже известное")
+    if review.get("claims_unverified_product") is True:
+        issues.append("бот выдаёт возможное направление решения за существующий продукт")
+    if review.get("makes_unverified_promise") is True:
+        issues.append("бот обещает неподтверждённый результат")
+    if action == "answer_information" and review.get("answers_client_question") is not True:
+        issues.append("бот не ответил на прямой вопрос клиента")
     if review.get("natural_and_clear") is not True:
         issues.append("реплика звучит неестественно или непонятно")
     return issues
@@ -533,12 +539,12 @@ def phase_prompt(action, profile):
         return f"""Получите только недостающую информацию: {profile['discovery_stages'][key]}.
 Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не угадывайте его задачу по профессии, не предлагайте категории и варианты ответа. Если клиент пока сообщил только профессию и аудиторию, спросите о его реальной рабочей трудности или причине обращения к эксперту, не сужая тему до предполагаемой области. Не пересказывайте ответ и не обсуждайте решение, продукт или встречу."""
     if action == "explain_solution":
-        return """Диагностика закончена. Больше ничего не выясняйте. Коротко назовите выявленный разрыв и объясните одно конкретное направление ИИ-решения из базы знаний: какой тип помощника или системы снимает проблему и какую часть процесса он берёт на себя. Не начинайте создавать конечный результат клиента и не запрашивайте сведения, которые нужны для его создания. В конце допустим только один вопрос: интересно ли клиенту увидеть предложенное ИИ-решение на своём примере. Не приглашайте на консультацию."""
+        return """Диагностика закончена. Больше ничего не выясняйте. Коротко назовите выявленный разрыв и объясните одно конкретное направление ИИ-решения из базы знаний: какой тип помощника или системы может подойти и какую часть процесса можно ему передать. Не утверждайте, что у эксперта уже есть конкретный готовый продукт, если это прямо не указано в базе знаний. Не обещайте результат. Не начинайте создавать конечный результат клиента и не запрашивайте сведения, которые нужны для его создания. В конце допустим только один вопрос: интересно ли клиенту увидеть предложенное ИИ-решение на своём примере. Не приглашайте на консультацию."""
     if action == "handle_solution_interest":
         return """Ответьте на вопрос или сомнение клиента о предложенном направлении решения. Не возвращайтесь к диагностике и пока не приглашайте на консультацию. Если вопроса нет, одним коротким вопросом проверьте интерес к демонстрации решения на его примере."""
     if action == "offer_consultation":
         return """Клиент явно заинтересован в решении. Теперь можно один раз предложить бесплатную консультацию и кратко связать её содержание с его задачей. Не повторяйте уже сказанные объяснения."""
-    return "Ответьте только на информационный вопрос клиента. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
+    return "Ответьте прямо и содержательно только на информационный вопрос клиента, используя факты из базы знаний и разговора. Если клиент спрашивает о предложенном решении, ясно отделите возможное направление от реально существующего продукта. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
 
 def safe_phase_reply(action):
     """Last-resort output used only when generated variants still violate the phase."""
@@ -552,8 +558,41 @@ def safe_phase_reply(action):
         "explain_solution": "Здесь может подойти ИИ-решение, настроенное под ваш рабочий процесс и требования. Хотите посмотреть, как оно может работать в вашей ситуации?",
         "handle_solution_interest": "Хотите посмотреть, как такое решение может работать в вашей ситуации?",
         "offer_consultation": "Могу показать это на бесплатной консультации. Хотите записаться?",
+        "answer_information": "Не хочу придумывать детали: в материалах эксперта нет точного ответа на этот вопрос.",
     }
     return replies.get(action, "Уточните, пожалуйста, ваш вопрос.")
+
+def semantic_phase_issues(answer, action, task, transcript, text, context):
+    review_prompt = f"""Определите функцию реплики чат-бота, не оценивая её по отдельным словам. Верните только JSON:
+{{"question_purpose":"none","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"claims_unverified_product":false,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}}
+
+Допустимые значения question_purpose: none, discover_client_context, discover_need, discover_prior_attempts, check_solution_interest, answer_client_question, offer_next_step, other.
+performs_expert_work=true, если бот уже начинает решать профессиональную задачу клиента вместо живого эксперта.
+asks_for_deliverable_details=true, если бот просит данные, нужные для разработки конечного результата клиента, хотя на текущем этапе должен только объяснить предлагаемое решение.
+uses_unsupported_assumption=true, если бот выдаёт свою догадку о клиенте за установленный факт.
+repeats_answered_question=true, если нужная информация уже есть в словах клиента.
+claims_unverified_product=true, если бот утверждает, что у эксперта есть конкретный готовый продукт, услуга или возможность, которых нет в источнике фактов.
+makes_unverified_promise=true, если бот гарантирует качество, экономию, результат или объём выполненной работы без основания в источнике фактов.
+answers_client_question=false, если клиент задал прямой вопрос, а реплика ушла от ответа или заменила его рекламной формулировкой.
+natural_and_clear=false, если реплика похожа на анкету, содержит формальную пустую реакцию, тяжело читается или непонятна.
+
+Текущая задача реплики: {task}
+
+ИСТОЧНИК ФАКТОВ:
+{context[-8000:]}
+
+ДИАЛОГ:
+{transcript[-6000:]}
+Клиент: {text}
+
+ПРОВЕРЯЕМАЯ РЕПЛИКА:
+{answer}"""
+    try:
+        review = parse_json_object(gigachat.reply([{"role": "system", "content": review_prompt}]))
+        return phase_review_issues(review, action)
+    except Exception:
+        app.logger.exception("Phase reply review failed")
+        return ["не удалось проверить смысл реплики"]
 
 def generate_phase_reply(history, text, context, profile, action):
     if not action:
@@ -585,29 +624,7 @@ def generate_phase_reply(history, text, context, profile, action):
         app.logger.exception("Phase reply generation failed")
         return None
     issues = phase_reply_issues(answer, action, history)
-    review_prompt = f"""Определите функцию реплики чат-бота, не оценивая её по отдельным словам. Верните только JSON:
-{{"question_purpose":"none","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"natural_and_clear":true}}
-
-Допустимые значения question_purpose: none, discover_client_context, discover_need, discover_prior_attempts, check_solution_interest, answer_client_question, offer_next_step, other.
-performs_expert_work=true, если бот уже начинает решать профессиональную задачу клиента вместо живого эксперта.
-asks_for_deliverable_details=true, если бот просит данные, нужные для разработки конечного результата клиента, хотя на текущем этапе должен только объяснить предлагаемое решение.
-uses_unsupported_assumption=true, если бот выдаёт свою догадку о клиенте за установленный факт.
-repeats_answered_question=true, если нужная информация уже есть в словах клиента.
-natural_and_clear=false, если реплика похожа на анкету, содержит формальную пустую реакцию, тяжело читается или непонятна.
-
-Текущая задача реплики: {task}
-
-ДИАЛОГ:
-{transcript[-6000:]}
-Клиент: {text}
-
-ПРОВЕРЯЕМАЯ РЕПЛИКА:
-{answer}"""
-    try:
-        review = parse_json_object(gigachat.reply([{"role": "system", "content": review_prompt}]))
-        issues.extend(phase_review_issues(review, action))
-    except Exception:
-        app.logger.exception("Phase reply review failed")
+    issues.extend(semantic_phase_issues(answer, action, task, transcript, text, context))
     issues = list(dict.fromkeys(issues))
     if issues:
         retry = prompt + f"""
@@ -631,6 +648,8 @@ natural_and_clear=false, если реплика похожа на анкету,
         except Exception:
             app.logger.exception("Strict phase reply retry failed")
     final_issues = phase_reply_issues(answer, action, history)
+    final_issues.extend(semantic_phase_issues(answer, action, task, transcript, text, context))
+    final_issues = list(dict.fromkeys(final_issues))
     if final_issues:
         app.logger.warning("Rejected final phase reply for %s: %s", action, final_issues)
         answer = safe_phase_reply(action)
@@ -665,7 +684,8 @@ def guard_discovery_answer(answer, state, missing_stage, user_text):
 def is_informational_question(text):
     return "?" in text and bool(re.search(
         r"(вы (кто|методист|психолог|маркетолог)|чем вы занимаетесь|что вы предлагаете|"
-        r"какие (решения|услуги|продукты)|сколько|как проходит|онлайн|очно|формат|стоимость|цена)",
+        r"какие (решения|услуги|продукты)|что за|как (он|она|оно|это) работает|что (он|она|оно|это) умеет|"
+        r"в ч[её]м (суть|разница)|сколько|как проходит|онлайн|очно|формат|стоимость|цена)",
         text.lower(),
     ))
 
@@ -719,6 +739,12 @@ UNVERIFIED_FOLLOWUP = re.compile(
     r"\b(я\s+)?(свяжусь|пришлю|отправлю|напомню|позвоню|подготовлю).{0,80}\b(накануне|до встречи|ссылк|материал|напомин)",
     re.I,
 )
+UNVERIFIED_RESULT_PROMISE = re.compile(
+    r"(идеальн.{0,25}(подойд|соответств)|гарантир|точно получите|"
+    r"сэконом(ит|ите|ив)|возьм[её]т на себя (всю|большую часть)|"
+    r"быстро получить качественн)",
+    re.I,
+)
 def quality_issues(answer):
     if "[[BOOK_" in answer:
         return []
@@ -729,6 +755,8 @@ def quality_issues(answer):
         issues.append("больше одного вопроса")
     if UNVERIFIED_FOLLOWUP.search(answer):
         issues.append("неподтверждённое обещание будущего действия")
+    if UNVERIFIED_RESULT_PROMISE.search(answer):
+        issues.append("неподтверждённое обещание результата")
     return issues
 
 def remove_unverified_promises(answer):
