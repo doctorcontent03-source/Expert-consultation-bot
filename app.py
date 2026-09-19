@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.6-structured-discovery-generation"
+APP_VERSION = "v11.6.1-graceful-structured-discovery"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -843,25 +843,38 @@ question — один открытый вопрос, на который нел�
 ДИАЛОГ:
 {transcript[-5000:]}
 Клиент: {text}"""
+    safe_candidate = None
     for _ in range(3):
         try:
-            parsed = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+            raw = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
+            parsed = parse_json_object(raw)
         except Exception:
             app.logger.exception("Structured discovery generation failed")
             continue
-        if not isinstance(parsed, dict):
-            continue
-        reaction = str(parsed.get("reaction", "")).strip()
-        question = str(parsed.get("question", "")).strip()
+        if isinstance(parsed, dict):
+            reaction = str(parsed.get("reaction", "")).strip()
+            question = str(parsed.get("question", "")).strip()
+        else:
+            reaction = ""
+            question = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I).strip()
         if not question:
             continue
         if not question.endswith("?"):
             question += "?"
         answer = " ".join(part for part in (reaction, question) if part)
+        safety_violation = bool(re.search(
+            r"(консультац|встреч|запис|продукт|решени[ея]|"
+            r"поделитесь|пришлите|покажите|приведите.{0,40}(пример|задани|материал|документ))",
+            answer.lower(),
+        ))
+        if safety_violation:
+            prompt += "\nПредыдущий вариант вышел за пределы диагностического вопроса. Создайте другой вариант только для указанной смысловой цели."
+            continue
+        safe_candidate = answer
         if not blocking_reply_issues(phase_reply_issues(answer, action, history)):
             return answer
         prompt += "\nПредыдущий вариант не прошёл проверку открытого вопроса. Создайте другой вариант, сохранив только указанную смысловую цель."
-    return None
+    return safe_candidate
 
 def generate_phase_reply(history, text, context, profile, action):
     if not action:
