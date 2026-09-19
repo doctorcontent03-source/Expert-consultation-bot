@@ -477,6 +477,34 @@ class TestBot(unittest.TestCase):
         finally:
             target.gigachat = old
 
+    def test_first_direct_identity_answer_closes_identity_stage_without_model_help(self):
+        class EmptyExtractor:
+            def reply(self, messages):
+                return '{"stages":{"identity":{"complete":false,"evidence":""},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
+        old = target.gigachat
+        target.gigachat = EmptyExtractor()
+        try:
+            with target.app.test_request_context("/"):
+                target.session["sid"] = "fresh-dialog"
+                state = target.assess_discovery(
+                    [],
+                    "Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми.",
+                    target.EXPERT_PROFILES["marketer"],
+                )
+                self.assertTrue(state["identity"])
+                self.assertFalse(state["task"])
+                self.assertEqual(target.discovery_action(state, target.EXPERT_PROFILES["marketer"], ""), "explore_task")
+        finally:
+            target.gigachat = old
+
+    def test_task_question_cannot_invent_problem_from_audience(self):
+        issues = target.phase_reply_issues(
+            "Расскажите подробнее, какие сложности возникают у вас при работе с разными возрастными группами?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("проблема выведена из профессии или аудитории клиента", issues)
+
     def test_upload_and_chat(self):
         headers = {"X-Admin-Password": "admin123"}
         uploaded = self.client.post(
