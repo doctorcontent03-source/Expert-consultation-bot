@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.4.1-contextual-refusal"
+APP_VERSION = "v10.5-respect-any-sales-refusal"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -497,6 +497,13 @@ def last_assistant_offered_consultation(history):
         and re.search(r"(хотите|предлаг|приглаш|записаться|подходит ли|готовы)", low)
     )
 
+def last_assistant_asked_sales_interest(history):
+    last = next((row["content"] for row in reversed(history) if row["role"] == "assistant"), "")
+    low = last.lower()
+    asks_interest = bool(re.search(r"(хотите|интересно|готовы|согласны|как вам.{0,15}идея|давайте.{0,20}(посмотр|попроб))", low))
+    sales_subject = bool(re.search(r"(решени|ассистент|помощник|продукт|демонстрац|показать|консультац|встреч|запис)", low))
+    return asks_interest and sales_subject
+
 def solution_was_explained(answer, profile):
     if profile.get("solution_mode") == "expert_service":
         return bool(re.search(r"(встреч|консультац|разобрать|обсудить)", answer.lower()))
@@ -733,6 +740,8 @@ def safe_phase_reply(action, profile=None, text=""):
         return "Такую ситуацию лучше подробно разбирать на встрече с экспертом. Подходит ли вам такой следующий шаг?"
     if action == "answer_information" and profile and profile.get("solution_mode") == "ai_solution" and re.search(r"(какое.{0,15}решени|ассистент|приложен|чат-?бот|помощник)", text.lower()):
         return "Я имею в виду возможный формат ИИ-решения, а не уже выбранный за вас продукт. Для такой задачи можно рассматривать персонального ИИ-ассистента для подготовки материалов; чат-бот или отдельное приложение нужны, только если потребуется другой способ работы с ним."
+    if action == "answer_information" and profile and profile.get("solution_mode") == "ai_solution" and re.search(r"(chatgpt|gpt|гигач|где.{0,20}(работает|находится|открывать))", text.lower()):
+        return "Не обязательно в ChatGPT. ИИ-ассистент может работать внутри нейросетевого сервиса, в чат-боте или в отдельном приложении — формат выбирают под задачу и удобный для клиента способ работы."
     acknowledgement = contextual_acknowledgement(text)
     if action in {"explore_ai_experience", "explain_solution"} and acknowledgement:
         return acknowledgement + " " + replies[action]
@@ -866,7 +875,8 @@ def is_informational_question(text):
     return "?" in text and bool(re.search(
         r"(вы (кто|методист|психолог|маркетолог)|чем вы занимаетесь|что вы предлагаете|"
         r"как(ое|ой|ая|ие) решени|какие (решения|услуги|продукты)|что за|что имеете в виду|"
-        r"ассистент|приложен|чат-?бот|как (он|она|оно|это) работает|что (он|она|оно|это) умеет|"
+        r"ассистент|приложен|чат-?бот|chatgpt|gpt|гигач|в chatgpt|в gpt|"
+        r"где.{0,20}(работает|находится|открывать)|как (он|она|оно|это) работает|что (он|она|оно|это) умеет|"
         r"в ч[её]м (суть|разница)|сколько|как проходит|онлайн|очно|формат|стоимость|цена)",
         text.lower(),
     ))
@@ -924,7 +934,7 @@ UNVERIFIED_FOLLOWUP = re.compile(
 UNVERIFIED_RESULT_PROMISE = re.compile(
     r"(идеальн.{0,25}(подойд|соответств)|гарантир|точно получите|"
     r"сэконом(ит|ите|ив)|возьм[её]т на себя (всю|большую часть)|"
-    r"быстро получить качественн)",
+    r"быстро получить качественн|помож(ет|ет вам).{0,35}(быстро|сэконом))",
     re.I,
 )
 def quality_issues(answer):
@@ -1200,14 +1210,18 @@ def chat():
     if accepted_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=accepted_answer)
-    if consultation_refusal(text) and consultation_offer_active() and last_assistant_offered_consultation(history):
-        session["consultation_declined"] = True
-        session["consultation_declined_sid"] = sid
+    refusal_in_context = consultation_refusal(text) and (
+        (consultation_offer_active() and last_assistant_offered_consultation(history))
+        or last_assistant_asked_sales_interest(history)
+    )
+    if refusal_in_context:
+        session["sales_declined"] = True
+        session["sales_declined_sid"] = sid
         declined_answer = "Хорошо, не буду настаивать."
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=declined_answer)
-    if session.get("consultation_declined") and session.get("consultation_declined_sid") == sid and not is_informational_question(text):
-        declined_answer = "Хорошо, предложение закрыто."
+    if session.get("sales_declined") and session.get("sales_declined_sid") == sid and not is_informational_question(text):
+        declined_answer = "Хорошо, не буду возвращаться к этому предложению."
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=declined_answer)
     discovery_state = assess_discovery(history, text, profile)
