@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v12-stage-bound-discovery"
+APP_VERSION = "v12.1-contextual-refusal"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -504,10 +504,11 @@ def classify_client_move(history, text):
     )
     prompt = f"""Определите функцию последней реплики клиента с учётом предыдущей реплики эксперта.
 Верните только JSON:
-{{"intent":"other","subject":"other","confidence":"high"}}
+{{"intent":"other","subject":"other","refusal_reason":"none","confidence":"high"}}
 
 intent — одно из: information_question, confusion, interest, hesitation, refusal, booking_request, other.
-subject — одно из: solution, consultation, booking, other.
+subject — одно из: solution, consultation, booking, conversation, need, other.
+refusal_reason — одно из: none, conversation_breakdown, no_current_need, offer_rejection, end_dialog, unclear.
 
 information_question: клиент просит объяснить факт, формат, платформу, тип или принцип работы.
 confusion: клиент сообщает, что не понял предыдущий ответ, и ожидает более ясного объяснения.
@@ -516,6 +517,10 @@ hesitation: клиент не отказывается, но пока не го�
 refusal: клиент отвергает предложенное решение, демонстрацию, встречу или просит прекратить обсуждение.
 booking_request: клиент хочет выбрать или проверить время записи.
 Не считайте отказом слова «не интересно», «не подходит» и подобные, если они описывают учеников, материалы, прошлый опыт или другую часть проблемы, а не предложение эксперта.
+conversation_breakdown: клиент раздражён тем, что его не услышали, повторили вопрос, дали непрошеный совет или плохо ведут беседу. Это не означает отсутствия потребности.
+no_current_need: клиент сообщает, что сама услуга или решение ему сейчас не нужны, независимо от качества беседы.
+offer_rejection: клиент отвергает конкретное уже сделанное предложение, но не обязательно отрицает саму потребность.
+end_dialog: клиент явно завершает разговор или просит больше не писать.
 
 ДИАЛОГ:
 {transcript[-5000:]}
@@ -526,24 +531,26 @@ booking_request: клиент хочет выбрать или проверит�
         app.logger.exception("Client move classification failed")
         parsed = None
     allowed_intents = {"information_question", "confusion", "interest", "hesitation", "refusal", "booking_request", "other"}
-    allowed_subjects = {"solution", "consultation", "booking", "other"}
+    allowed_subjects = {"solution", "consultation", "booking", "conversation", "need", "other"}
+    allowed_refusal_reasons = {"none", "conversation_breakdown", "no_current_need", "offer_rejection", "end_dialog", "unclear"}
     if isinstance(parsed, dict) and parsed.get("intent") in allowed_intents:
         return {
             "intent": parsed["intent"],
             "subject": parsed.get("subject") if parsed.get("subject") in allowed_subjects else "other",
+            "refusal_reason": parsed.get("refusal_reason") if parsed.get("refusal_reason") in allowed_refusal_reasons else "none",
         }
     # Safety fallback only when semantic classification is unavailable.
     if re.search(r"(не понял(?:а)?|не понимаю|ничего не понял(?:а)?|что это значит|перефразируйте)", text.lower()):
-        return {"intent": "confusion", "subject": "other"}
+        return {"intent": "confusion", "subject": "conversation", "refusal_reason": "conversation_breakdown"}
     if is_informational_question(text):
-        return {"intent": "information_question", "subject": "solution"}
+        return {"intent": "information_question", "subject": "solution", "refusal_reason": "none"}
     if consultation_refusal(text):
-        return {"intent": "refusal", "subject": "other"}
+        return {"intent": "refusal", "subject": "other", "refusal_reason": "unclear"}
     if sales_hesitation(text):
-        return {"intent": "hesitation", "subject": "other"}
+        return {"intent": "hesitation", "subject": "other", "refusal_reason": "none"}
     if explicit_solution_interest(text):
-        return {"intent": "interest", "subject": "solution"}
-    return {"intent": "other", "subject": "other"}
+        return {"intent": "interest", "subject": "solution", "refusal_reason": "none"}
+    return {"intent": "other", "subject": "other", "refusal_reason": "none"}
 
 def consultation_offer_active():
     """An offer flag is valid only inside the dialog that created it."""
@@ -700,7 +707,14 @@ def discovery_action(state, profile, text, client_move=None):
     if state is None:
         return None
     missing = [key for key in profile.get("discovery_stages", {}) if not state.get(key)]
-    if re.search(r"(не хочу.{0,20}отвечать|расхотелось.{0,20}отвечать|не буду.{0,20}отвечать|хватит.{0,20}вопрос)", text.lower()):
+    refusal_reason = client_move.get("refusal_reason") if isinstance(client_move, dict) else "none"
+    if refusal_reason == "no_current_need":
+        return "close_no_need"
+    if refusal_reason == "end_dialog":
+        return "end_dialog"
+    if refusal_reason == "offer_rejection":
+        return "acknowledge_offer_rejection"
+    if refusal_reason == "conversation_breakdown" or re.search(r"(не хочу.{0,20}отвечать|расхотелось.{0,20}отвечать|не буду.{0,20}отвечать|хватит.{0,20}вопрос)", text.lower()):
         return "pause_discovery"
     confused = (
         isinstance(client_move, dict) and client_move.get("intent") == "confusion"
@@ -730,7 +744,7 @@ def phase_reply_issues(answer, action, history):
         issues.append("пустой ответ")
     if action.startswith(("explore_", "repair_")) and answer.count("?") != 1:
         issues.append("диагностическая реплика должна содержать ровно один вопрос")
-    if action == "pause_discovery" and "?" in answer:
+    if action in {"pause_discovery", "close_no_need", "end_dialog", "acknowledge_offer_rejection"} and "?" in answer:
         issues.append("после отказа отвечать бот снова задаёт вопрос")
     if re.search(r"\b(клиент|пользователь)\s+(?:испытыва|говорит|считает|хочет|уверен|сообщил)|\bстоит уточнить\b", low):
         issues.append("наружу выведено служебное рассуждение о клиенте")
@@ -761,7 +775,7 @@ def phase_reply_issues(answer, action, history):
             issues.append("вопрос ушёл от рабочей задачи к общему разговору о профессии")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
-    if action == "pause_discovery" and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
+    if action in {"pause_discovery", "close_no_need", "end_dialog", "acknowledge_offer_rejection"} and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
         issues.append("после отказа отвечать бот продолжает продажу")
     if action in {"explain_solution", "handle_solution_interest", "offer_consultation"} and re.search(
         r"(поделитесь|пришлите|покажите|приведите).{0,60}(пример|задани|тем|материал|документ)|"
@@ -834,6 +848,12 @@ def blocking_reply_issues(issues):
 def phase_prompt(action, profile):
     if action == "pause_discovery":
         return """Клиент прямо сказал, что больше не хочет отвечать на вопросы. Коротко признайте это и остановите расспрос. Не задавайте новый вопрос, не оправдывайтесь, не предлагайте решение, продукт, консультацию или запись."""
+    if action == "close_no_need":
+        return """Клиент сообщил, что услуга или решение ему сейчас не нужны. Спокойно примите это без попытки переубедить. Не задавайте вопросов и не предлагайте другой продукт, консультацию или запись."""
+    if action == "end_dialog":
+        return """Клиент явно завершил разговор. Коротко и вежливо попрощайтесь. Не задавайте вопросов и не продолжайте продажу."""
+    if action == "acknowledge_offer_rejection":
+        return """Клиент отверг конкретное предложение, но не говорил, что у него исчезла исходная задача. Спокойно примите отказ именно от предложения. Не повторяйте его, не предлагайте замену и не задавайте новый вопрос."""
     if action.startswith("repair_"):
         key = action.removeprefix("repair_")
         return f"""Клиент не понял вопрос или возмутился. Коротко признайте, что вопрос был неудачным, и объясните, зачем вам нужна только эта информация: {profile['discovery_stages'][key]}. Затем сформулируйте один простой вопрос заново. Не защищайте прежний вопрос, не делайте предположений о задаче клиента и не предлагайте варианты ответа."""
@@ -1416,7 +1436,7 @@ def chat():
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",paused_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=paused_answer)
     strong_stop = bool(re.search(r"\b(да ну вас|оставьте меня|хватит|не настаивайте)\b", text.lower()))
-    refusal_in_context = client_move.get("intent") == "refusal" and (
+    refusal_in_context = client_move.get("intent") == "refusal" and client_move.get("refusal_reason") in {"offer_rejection", "unclear", "none"} and (
         (consultation_offer_active() and last_assistant_offered_consultation(history))
         or last_assistant_asked_sales_interest(history)
         or (session.get("sales_paused") and session.get("sales_paused_sid") == sid)
@@ -1442,7 +1462,7 @@ def chat():
         if action.startswith(("explore_", "repair_")):
             session["pending_discovery_stage"] = action.removeprefix("explore_").removeprefix("repair_")
             session["pending_discovery_sid"] = sid
-        elif action == "pause_discovery":
+        elif action in {"pause_discovery", "close_no_need", "end_dialog", "acknowledge_offer_rejection"}:
             session.pop("pending_discovery_stage", None)
             session.pop("pending_discovery_sid", None)
         if action == "explain_solution" and solution_was_explained(phase_answer, profile):
