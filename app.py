@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.6.1-graceful-structured-discovery"
+APP_VERSION = "v11.7-grounded-need-stage"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -113,7 +113,9 @@ const chat=document.querySelector('#chat'),form=document.querySelector('#form'),
 function bookingLink(box,href,label){const link=document.createElement('a');link.href=href;link.textContent=label;link.style.cssText='display:block;width:max-content;margin:10px 0 0;padding:10px 14px;border-radius:12px;background:#285c45;color:white;text-decoration:none;font-weight:700';box.append(document.createElement('br'),link)}
 function add(text,kind){const box=document.createElement('div');box.className='bubble '+kind;const free=text.includes('[[BOOK_FREE]]'),regular=text.includes('[[BOOK_REGULAR]]');box.textContent=text.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim();if(free)bookingLink(box,'/booking?type=free','Записаться на бесплатную консультацию');if(regular)bookingLink(box,'/booking?type=regular','Записаться на регулярную встречу');chat.append(box);chat.scrollTop=chat.scrollHeight;return box}
 async function restore(){try{const response=await fetch('/api/history'),data=await response.json();(data.messages||[]).forEach(item=>add(item.content,item.role==='user'?'user':'bot'));if(data.closed)form.hidden=true}catch{add('Не удалось восстановить историю диалога. Обновите страницу.','bot')}finally{if(!form.hidden){input.disabled=false;send.disabled=false;input.focus()}}}
-form.onsubmit=async event=>{event.preventDefault();const message=input.value.trim();if(!message)return;add(message,'user');input.value='';input.disabled=true;send.disabled=true;const waiting=add('…','bot');try{const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message})}),data=await response.json();waiting.remove();add(data.answer||data.error||'','bot');if(data.closed)form.hidden=true}catch{waiting.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}finally{if(!form.hidden){input.disabled=false;send.disabled=false;input.focus()}}};
+let sending=false,pending=[];
+async function flush(){if(sending||!pending.length||form.hidden)return;sending=true;const message=pending.join('\n\n');pending=[];const waiting=add('…','bot');try{const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message})}),data=await response.json();waiting.remove();add(data.answer||data.error||'','bot');if(data.closed)form.hidden=true}catch{waiting.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}finally{sending=false;if(!form.hidden){input.focus();if(pending.length)flush()}}}
+form.onsubmit=event=>{event.preventDefault();const message=input.value.trim();if(!message)return;add(message,'user');input.value='';pending.push(message);input.focus();flush()};
 document.querySelector('#reset').onclick=async()=>{await fetch('/api/reset',{method:'POST'});location.reload()};restore();
 </script></body></html>""".replace("__STYLE__", STYLE)
 
@@ -444,10 +446,15 @@ def evidence_is_grounded(stage_type, evidence, client_text, text, history):
     if len(evidence_norm) < 2 or evidence_norm not in client_norm:
         return False
     if stage_type == "need":
+        # A need must be present in the quoted evidence itself. Looking for need
+        # words in the whole transcript turns answers such as "сложностей нет"
+        # into a completed need stage merely because the earlier question used
+        # the word "сложности".
         return bool(re.search(
-            r"(хочу|хотел|хотелось|нужно|надо|сложн|трудн|не получ|не уме|не знаю|"
-            r"меша|проблем|беда|плохо|долго|времени|приходится|не устраива|не подход|изменить|"
-            r"улучшить|упростить|ускорить|сократить)", client_text.lower()
+            r"(хочу|хотел|хотелось|нужно|надо|(?:мне|нам)\s+(?:сложно|трудно)|"
+            r"проблема\s+(?:в|с|том)|не получ|не уме|не знаю|"
+            r"меша|беда|плохо|долго|времени|приходится|не устраива|не подход|изменить|"
+            r"улучшить|упростить|ускорить|сократить)", evidence.lower()
         ))
     if stage_type == "prior_attempts":
         ai_words = r"(нейросет|gpt|chatgpt|гигач|искусственн.{0,10}интеллект|\bии\b)"
@@ -700,6 +707,13 @@ def phase_reply_issues(answer, action, history):
             issues.append("варианты ответа внутри вопроса")
         if re.search(r"(какие|какого рода).{0,25}(сложност|проблем|трудност).{0,50}(при|с|из-за)", low):
             issues.append("проблема выведена из профессии или аудитории клиента")
+        if re.search(
+            r"(как(?:ую|ие).{0,30}(трудност|сложност|проблем).{0,35}"
+            r"(испытыва|возника|сталкива|есть|име)|"
+            r"с какими.{0,25}(трудност|сложност|проблем).{0,25}(сталкива|встреча))",
+            low,
+        ):
+            issues.append("вопрос заранее приписывает клиенту проблему")
         if not re.search(r"\b(что|какая|какие|какой|где|с чем|из-за чего|почему)\b", low):
             issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
         if re.search(r"(вам приходится|вы сталкиваетесь|вам важно|выходит,? вам|значит,? вам)", low):
