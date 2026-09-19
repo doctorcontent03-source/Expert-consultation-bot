@@ -472,6 +472,13 @@ class TestBot(unittest.TestCase):
             target.gigachat = old
         self.assertIsNone(answer)
 
+    def test_expert_profile_uses_positive_offer_catalog_not_example_blacklist(self):
+        context = target.EXPERT_PROFILES["marketer"]["profile_context"].lower()
+        self.assertIn("готовый ассистент по созданию нестандартных курсов", context)
+        self.assertIn("разработки персонального ассистента", context)
+        self.assertNotIn("такие предложения делать нельзя", context)
+        self.assertNotIn("нет сведений о", context)
+
     def test_confusion_is_a_separate_client_intent(self):
         class ConfusionClassifier:
             def reply(self, messages):
