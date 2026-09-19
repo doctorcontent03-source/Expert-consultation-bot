@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.7-grounded-need-stage"
+APP_VERSION = "v11.7.1-input-unlocked"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -114,7 +114,7 @@ function bookingLink(box,href,label){const link=document.createElement('a');link
 function add(text,kind){const box=document.createElement('div');box.className='bubble '+kind;const free=text.includes('[[BOOK_FREE]]'),regular=text.includes('[[BOOK_REGULAR]]');box.textContent=text.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim();if(free)bookingLink(box,'/booking?type=free','Записаться на бесплатную консультацию');if(regular)bookingLink(box,'/booking?type=regular','Записаться на регулярную встречу');chat.append(box);chat.scrollTop=chat.scrollHeight;return box}
 async function restore(){try{const response=await fetch('/api/history'),data=await response.json();(data.messages||[]).forEach(item=>add(item.content,item.role==='user'?'user':'bot'));if(data.closed)form.hidden=true}catch{add('Не удалось восстановить историю диалога. Обновите страницу.','bot')}finally{if(!form.hidden){input.disabled=false;send.disabled=false;input.focus()}}}
 let sending=false,pending=[];
-async function flush(){if(sending||!pending.length||form.hidden)return;sending=true;const message=pending.join('\n\n');pending=[];const waiting=add('…','bot');try{const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message})}),data=await response.json();waiting.remove();add(data.answer||data.error||'','bot');if(data.closed)form.hidden=true}catch{waiting.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}finally{sending=false;if(!form.hidden){input.focus();if(pending.length)flush()}}}
+async function flush(){if(sending||!pending.length||form.hidden)return;sending=true;const message=pending.join('\\n\\n');pending=[];const waiting=add('…','bot');try{const response=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message})}),data=await response.json();waiting.remove();add(data.answer||data.error||'','bot');if(data.closed)form.hidden=true}catch{waiting.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}finally{sending=false;if(!form.hidden){input.focus();if(pending.length)flush()}}}
 form.onsubmit=event=>{event.preventDefault();const message=input.value.trim();if(!message)return;add(message,'user');input.value='';pending.push(message);input.focus();flush()};
 document.querySelector('#reset').onclick=async()=>{await fetch('/api/reset',{method:'POST'});location.reload()};restore();
 </script></body></html>""".replace("__STYLE__", STYLE)
