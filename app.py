@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.2-no-scripted-fallbacks"
+APP_VERSION = "v11.3-hard-vs-soft-validation"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -690,7 +690,7 @@ def phase_reply_issues(answer, action, history):
     if (action.startswith("explore_") or action.startswith("repair_")) and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
         issues.append("преждевременный переход к решению или встрече")
     if action in {"explore_task", "repair_task"}:
-        if re.search(r"((вам|вы)\s+(сложно|трудно|нужно|не хватает|хочется|хотите|планируете|пытаетесь|ищете)|планируете ли|что думаете попробовать|какие конкретно|какой тип)", low):
+        if re.search(r"((вам|вы)\s+(сложно|трудно|нужно|не хватает|хочется|хотите|планируете|пытаетесь|ищете)|\bвы уже\b|планируете ли|что думаете попробовать|какие конкретно|какой тип)", low):
             issues.append("догадка о задаче клиента вместо открытого вопроса")
         question = answer.rsplit("?", 1)[0] if "?" in answer else answer
         if " или " in question.lower():
@@ -756,6 +756,17 @@ def phase_review_issues(review, action):
     if review.get("natural_and_clear") is not True:
         issues.append("реплика звучит неестественно или непонятно")
     return issues
+
+def blocking_reply_issues(issues):
+    """Only state-machine and factual violations may suppress a generated reply."""
+    non_blocking = {
+        "шаблонная или канцелярская формулировка",
+        "реплика звучит неестественно или непонятно",
+        "не удалось проверить смысл реплики",
+        "контролёр не смог определить функцию реплики",
+        "больше одного вопроса",
+    }
+    return [issue for issue in issues if issue not in non_blocking]
 
 def phase_prompt(action, profile):
     if action.startswith("repair_"):
@@ -863,9 +874,12 @@ def generate_phase_reply(history, text, context, profile, action):
     final_issues = phase_reply_issues(answer, action, history)
     final_issues.extend(semantic_phase_issues(answer, action, task, transcript, text, context))
     final_issues = list(dict.fromkeys(final_issues))
-    if final_issues:
-        app.logger.warning("Rejected final phase reply for %s: %s", action, final_issues)
+    blocking = blocking_reply_issues(final_issues)
+    if blocking:
+        app.logger.warning("Rejected final phase reply for %s: %s", action, blocking)
         return None
+    if final_issues:
+        app.logger.info("Accepted phase reply with non-blocking style issues for %s: %s", action, final_issues)
     answer = remove_unverified_promises(answer)
     answer = re.sub(r"^\s*(?:Екатерина|Эксперт|Психолог)\s*:\s*", "", answer, flags=re.I)
     return keep_one_question(answer)
