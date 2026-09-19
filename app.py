@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.2-deterministic-discovery"
+APP_VERSION = "v10.3-warm-chat-booking"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -23,7 +23,7 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 Не придумывайте очный приём, города, адреса или платформы связи. Сведения о формате работы берите только из базы знаний. Точно сохраняйте расстановку акцентов: различайте основной формат и дополнительный вариант, доступный по договорённости. Не представляйте дополнительный вариант как равноправный или основной.
 Не ставьте диагнозов, не обещайте результат и не давите. При признаках непосредственной опасности задайте прямой вопрос о безопасности и посоветуйте срочно обратиться в местную экстренную службу или к близкому человеку.
 Не проводите консультацию внутри чата и не выполняйте профессиональную работу эксперта: не создавайте для клиента конечный результат и не собирайте сведения, которые нужны уже для его разработки. Задача чата — понять общий запрос, дать информацию о работе эксперта и привести к записи. Содержательный разбор проводит живой эксперт на встрече.
-Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Не предлагайте посмотреть календарь клиента и не придумывайте свободные даты и часы: календарь проверяет само приложение. Если клиент называет желаемые дату и время, не подтверждайте их самостоятельно и не отправляйте его повторно заполнять форму — приложение проверит интервал и продолжит запись прямо в диалоге. Вопросы «зачем бесплатная встреча», «нужно ли потом сразу записываться», «как часто встречаться» и подобные являются информационными: отвечайте на них без кнопок и без призыва записаться. Если клиент хочет сам посмотреть доступное время, добавьте маркер [[BOOK_FREE]] или [[BOOK_REGULAR]]. После подтверждённой записи поздравьте клиента с записью и больше не предлагайте запись, если он не просит изменить или создать ещё одну встречу. Не упоминайте «наш сайт», раздел сайта, форму или технические адреса.
+Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Не предлагайте посмотреть календарь клиента и не придумывайте свободные даты и часы: календарь проверяет само приложение. Запись проходит полностью в чате, без формы и кнопок. Сначала попросите клиента назвать желаемые дату и время; приложение проверит интервал. Если время свободно, приложение запросит имя, телефон и email и создаст встречу. Вопросы «зачем бесплатная встреча», «нужно ли потом сразу записываться», «как часто встречаться» и подобные являются информационными: отвечайте на них без призыва записаться. После подтверждённой записи поздравьте клиента с записью и больше не предлагайте запись, если он не просит изменить или создать ещё одну встречу. Не упоминайте «наш сайт», раздел сайта, форму, кнопку или технические адреса.
 Отвечайте кратко и естественно, без служебных комментариев о правилах."""
 
 BASE_STYLE_RULES = """ОБЩИЙ СТИЛЬ ДИАЛОГА.
@@ -267,6 +267,16 @@ def create_calendar_booking(start, booking_type, name, phone, email):
 
 def chat_booking_answer(text):
     _, profile = current_profile()
+    if session.get("awaiting_booking_type"):
+        low = text.lower()
+        if re.search(r"(бесплат|первичн|ознакомитель)", low):
+            session.pop("awaiting_booking_type", None)
+            session["requested_booking_type"] = "free"
+            return "Назовите удобные дату и время — я сразу проверю их в календаре."
+        if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
+            session.pop("awaiting_booking_type", None)
+            session["requested_booking_type"] = "regular"
+            return "Назовите удобные дату и время — я сразу проверю их в календаре."
     pending = session.get("pending_booking")
     if pending:
         if re.search(r"\b(отменить|отмена|не хочу записываться|передумал(?:а)?)\b", text.lower()):
@@ -283,7 +293,7 @@ def chat_booking_answer(text):
             confirmation, error = create_calendar_booking(start, pending["type"], name, phone, email)
         except Exception as exc:
             app.logger.exception("Chat calendar booking failed")
-            return "Не удалось связаться с календарём. Попробуйте ещё раз чуть позже или воспользуйтесь формой записи.\n[[BOOK_FREE]]"
+            return "Сейчас не удалось проверить календарь. Попробуйте, пожалуйста, ещё раз чуть позже."
         if error:
             session.pop("pending_booking", None)
             return error
@@ -312,7 +322,7 @@ def chat_booking_answer(text):
     if not start:
         return None
     low = text.lower()
-    booking_type = "regular" if profile["regular_enabled"] and re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low) else "free"
+    booking_type = session.pop("requested_booking_type", None) or ("regular" if profile["regular_enabled"] and re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low) else "free")
     _, duration = booking_config(booking_type)
     if start < datetime.now(start.tzinfo) + timedelta(minutes=30):
         return "Это время уже прошло или осталось меньше 30 минут. Назовите, пожалуйста, другое время."
@@ -328,8 +338,7 @@ def chat_booking_answer(text):
             return "Это время занято. Назовите, пожалуйста, другой удобный день и время."
     except Exception:
         app.logger.exception("Chat calendar availability check failed")
-        marker = "[[BOOK_REGULAR]]" if booking_type == "regular" else "[[BOOK_FREE]]"
-        return "Сейчас не удалось проверить календарь. Можно выбрать время в форме записи.\n" + marker
+        return "Сейчас не удалось проверить календарь. Попробуйте, пожалуйста, ещё раз чуть позже."
     session["pending_booking"] = {"start": start.isoformat(), "type": booking_type}
     return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Для записи пришлите, пожалуйста, одним сообщением ваше имя, телефон и email."
 
@@ -350,12 +359,16 @@ def direct_booking_answer(text):
     if not asks_time:
         return None
     if re.search(r"(бесплат|ознакомитель|перв(ая|ую).{0,15}консультац)", low):
-        return f"Да. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
+        session["requested_booking_type"] = "free"
+        return "Назовите удобные дату и время — я сразу проверю их в календаре."
     if profile["regular_enabled"] and re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
-        return "Да. Выберите, пожалуйста, удобные дату и время для регулярной встречи по кнопке ниже.\n[[BOOK_REGULAR]]"
+        session["requested_booking_type"] = "regular"
+        return "Назовите удобные дату и время — я сразу проверю их в календаре."
     if not profile["regular_enabled"]:
-        return f"Календарь подключён. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
-    return "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
+        session["requested_booking_type"] = "free"
+        return "Назовите удобные дату и время — я сразу проверю их в календаре."
+    session["awaiting_booking_type"] = True
+    return "На какую встречу хотите записаться: на бесплатную первичную или на регулярную?"
 
 def accepted_consultation_answer(text):
     if not session.get("consultation_offered") or "?" in text:
@@ -368,8 +381,10 @@ def accepted_consultation_answer(text):
         return None
     _, profile = current_profile()
     if profile["regular_enabled"]:
-        return "Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
-    return f"Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
+        session["awaiting_booking_type"] = True
+        return "На какую встречу хотите записаться: на бесплатную первичную или на регулярную?"
+    session["requested_booking_type"] = "free"
+    return "Назовите удобные дату и время — я сразу проверю их в календаре."
 
 def completed_dialog_answer(text):
     if not session.get("last_booking") or session.get("dialog_closed"):
@@ -398,7 +413,8 @@ def consultation_stage_answer(text, history):
     )
     affirmative = bool(re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", text.lower()))
     if affirmative and "консультац" in last_assistant:
-        return f"Хорошо. Выберите, пожалуйста, удобные дату и время: {profile['lead_title'].lower()}.\n[[BOOK_FREE]]"
+        session["requested_booking_type"] = "free"
+        return "Хорошо. Назовите удобные дату и время — я сразу проверю их в календаре."
     if affirmative and re.search(r"(обсудить.{0,20}подробнее|поговорить.{0,20}подробнее|готовы.{0,30}(обсудить|поговорить))", last_assistant):
         return f"Тогда предлагаю продолжить на встрече «{profile['lead_title']}». Она занимает {profile['lead_duration_text']}. Хотите записаться?"
     user_turns = 1 + sum(1 for x in history if x["role"] == "user")
@@ -655,7 +671,17 @@ def phase_prompt(action, profile):
         return """Клиент явно заинтересован в решении. Теперь можно один раз предложить бесплатную консультацию и кратко связать её содержание с его задачей. Не повторяйте уже сказанные объяснения."""
     return "Ответьте прямо и содержательно только на информационный вопрос клиента, используя факты из базы знаний и разговора. Если клиент спрашивает о предложенном решении, ясно отделите возможное направление от реально существующего продукта. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
 
-def safe_phase_reply(action, profile=None):
+def contextual_acknowledgement(text):
+    low = str(text or "").lower()
+    if re.search(r"(передел|додел|исправ).{0,45}(вручн|сам|сама)|вручн.{0,45}(передел|додел|исправ)", low):
+        return "Если результат всё равно приходится переделывать вручную, экономия времени действительно получается сомнительной."
+    if re.search(r"(много|слишком много|целый день).{0,25}времен|времен.{0,25}(много|не хватает|занимает)", low):
+        return "Когда подготовка отнимает столько времени, это уже отдельная рабочая проблема."
+    if re.search(r"(не подходит|не подходят|не устраива|не получилось|не понравил)", low):
+        return "Да, готовый вариант здесь явно не закрыл вашу задачу."
+    return ""
+
+def safe_phase_reply(action, profile=None, text=""):
     """Last-resort output used only when generated variants still violate the phase."""
     replies = {
         "explore_identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
@@ -671,6 +697,9 @@ def safe_phase_reply(action, profile=None):
     }
     if action == "explain_solution" and profile and profile.get("solution_mode") == "expert_service":
         return "Такую ситуацию лучше подробно разбирать на встрече с экспертом. Подходит ли вам такой следующий шаг?"
+    acknowledgement = contextual_acknowledgement(text)
+    if action in {"explore_ai_experience", "explain_solution"} and acknowledgement:
+        return acknowledgement + " " + replies[action]
     if action in replies:
         return replies[action]
     if action.startswith(("explore_", "repair_")):
@@ -767,7 +796,7 @@ def generate_phase_reply(history, text, context, profile, action):
     final_issues = list(dict.fromkeys(final_issues))
     if final_issues:
         app.logger.warning("Rejected final phase reply for %s: %s", action, final_issues)
-        answer = safe_phase_reply(action, profile)
+        answer = safe_phase_reply(action, profile, text)
     answer = remove_unverified_promises(answer)
     answer = re.sub(r"^\s*(?:Екатерина|Эксперт|Психолог)\s*:\s*", "", answer, flags=re.I)
     return keep_one_question(answer)
@@ -873,6 +902,10 @@ def quality_issues(answer):
         issues.append("неподтверждённое обещание будущего действия")
     if UNVERIFIED_RESULT_PROMISE.search(answer):
         issues.append("неподтверждённое обещание результата")
+    if re.search(r"\b(мы|нам|нами|наш|наша|наше|наши|нашего|нашей)\b", answer.lower()):
+        issues.append("эксперт говорит от имени команды, а не от первого лица")
+    if re.search(r"специально\s+разработан|создан(?:ный|ная|ное)?\s+специально", answer.lower()):
+        issues.append("придумана неподтверждённая специализация продукта")
     return issues
 
 def remove_unverified_promises(answer):
@@ -1136,7 +1169,7 @@ def chat():
     phase_answer = generate_phase_reply(history, text, context, profile, action)
     if action:
         if not phase_answer:
-            phase_answer = safe_phase_reply(action, profile)
+            phase_answer = safe_phase_reply(action, profile, text)
         if action == "explain_solution":
             discovery_state = dict(discovery_state or {})
             discovery_state["solution_explained"] = True
