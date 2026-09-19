@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.7.1-input-unlocked"
+APP_VERSION = "v11.8-strict-discovery-function"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -697,6 +697,8 @@ def phase_reply_issues(answer, action, history):
     low = answer.lower()
     if not answer.strip():
         issues.append("пустой ответ")
+    if re.search(r"\b(клиент|пользователь)\s+(?:испытыва|говорит|считает|хочет|уверен|сообщил)|\bстоит уточнить\b", low):
+        issues.append("наружу выведено служебное рассуждение о клиенте")
     if (action.startswith("explore_") or action.startswith("repair_")) and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
         issues.append("преждевременный переход к решению или встрече")
     if action in {"explore_task", "repair_task"}:
@@ -718,6 +720,8 @@ def phase_reply_issues(answer, action, history):
             issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
         if re.search(r"(вам приходится|вы сталкиваетесь|вам важно|выходит,? вам|значит,? вам)", low):
             issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
+        if re.search(r"(приносит.{0,30}удовлетворен|нравится.{0,30}(работ|професси)|любите.{0,30}(работ|професси)|сильн(?:ая|ые).{0,20}сторон)", low):
+            issues.append("вопрос ушёл от рабочей задачи к общему разговору о профессии")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
     if action in {"explain_solution", "handle_solution_interest", "offer_consultation"} and re.search(
@@ -785,7 +789,6 @@ def blocking_reply_issues(issues):
         "реплика звучит неестественно или непонятно",
         "не удалось проверить смысл реплики",
         "контролёр не смог определить функцию реплики",
-        "больше одного вопроса",
     }
     return [issue for issue in issues if issue not in non_blocking]
 
@@ -796,7 +799,7 @@ def phase_prompt(action, profile):
     if action.startswith("explore_"):
         key = action.removeprefix("explore_")
         return f"""Получите только недостающую информацию: {profile['discovery_stages'][key]}.
-Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не угадывайте его задачу по профессии, не предлагайте категории и варианты ответа. Если клиент пока сообщил только профессию и аудиторию, спросите о его реальной рабочей трудности или причине обращения к эксперту, не сужая тему до предполагаемой области. Не пересказывайте ответ и не обсуждайте решение, продукт или встречу."""
+Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не угадывайте его задачу по профессии, не приписывайте ему наличие трудностей, не предлагайте категории и варианты ответа. Если клиент пока сообщил только профессию и аудиторию, выясните, что в своей работе он сам хотел бы изменить, упростить или получить, не сужая тему до предполагаемой области. Не пересказывайте ответ и не обсуждайте решение, продукт или встречу."""
     if action == "explain_solution":
         if profile.get("solution_mode") == "expert_service":
             return """Диагностика закончена. Больше ничего не выясняйте и не консультируйте по существу в чате. Коротко объясните, почему выявленную ситуацию уместно разбирать с экспертом на встрече и что можно определить на первой встрече, используя только базу знаний. Не обещайте результат. В конце допустим только один вопрос: подходит ли клиенту такой следующий шаг. Пока не предлагайте запись."""
@@ -857,8 +860,7 @@ question — один открытый вопрос, на который нел�
 ДИАЛОГ:
 {transcript[-5000:]}
 Клиент: {text}"""
-    safe_candidate = None
-    for _ in range(3):
+    for _ in range(5):
         try:
             raw = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
             parsed = parse_json_object(raw)
@@ -884,11 +886,10 @@ question — один открытый вопрос, на который нел�
         if safety_violation:
             prompt += "\nПредыдущий вариант вышел за пределы диагностического вопроса. Создайте другой вариант только для указанной смысловой цели."
             continue
-        safe_candidate = answer
         if not blocking_reply_issues(phase_reply_issues(answer, action, history)):
             return answer
         prompt += "\nПредыдущий вариант не прошёл проверку открытого вопроса. Создайте другой вариант, сохранив только указанную смысловую цель."
-    return safe_candidate
+    return None
 
 def generate_phase_reply(history, text, context, profile, action):
     if not action:
@@ -953,6 +954,15 @@ def generate_phase_reply(history, text, context, profile, action):
         "бот обещает неподтверждённый результат",
     }
     blocking.extend(issue for issue in semantic_final if issue in factual_safety_issues)
+    if action.startswith(("explore_", "repair_")):
+        blocking.extend(
+            issue for issue in semantic_final
+            if issue.startswith("вопрос выполняет другую функцию")
+            or issue in {
+                "бот приписывает клиенту сведения, которых тот не сообщал",
+                "бот снова спрашивает уже известное",
+            }
+        )
     blocking = list(dict.fromkeys(blocking))
     if blocking:
         app.logger.warning("Rejected final phase reply for %s: %s", action, blocking)
