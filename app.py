@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.9-semantic-action-guard"
+APP_VERSION = "v9.9.1-validated-output"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -479,7 +479,7 @@ def phase_reply_issues(answer, action, history):
     if (action.startswith("explore_") or action.startswith("repair_")) and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
         issues.append("преждевременный переход к решению или встрече")
     if action in {"explore_task", "repair_task"}:
-        if re.search(r"(вам нужно|вы хотите|планируете ли|что думаете попробовать|какие конкретно|какой тип)", low):
+        if re.search(r"((вам|вы)\s+(сложно|трудно|нужно|не хватает|хочется|хотите|планируете|пытаетесь|ищете)|планируете ли|что думаете попробовать|какие конкретно|какой тип)", low):
             issues.append("догадка о задаче клиента вместо открытого вопроса")
         question = answer.rsplit("?", 1)[0] if "?" in answer else answer
         if " или " in question.lower():
@@ -539,6 +539,21 @@ def phase_prompt(action, profile):
     if action == "offer_consultation":
         return """Клиент явно заинтересован в решении. Теперь можно один раз предложить бесплатную консультацию и кратко связать её содержание с его задачей. Не повторяйте уже сказанные объяснения."""
     return "Ответьте только на информационный вопрос клиента. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
+
+def safe_phase_reply(action):
+    """Last-resort output used only when generated variants still violate the phase."""
+    replies = {
+        "explore_identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
+        "repair_identity": "Я неудачно сформулировала вопрос. Расскажите, пожалуйста, чем вы занимаетесь и с кем работаете?",
+        "explore_task": "А что в вашей работе сейчас хотелось бы упростить или изменить?",
+        "repair_task": "Я неудачно сформулировала вопрос и начала угадывать за вас. Что в вашей работе сейчас хотелось бы изменить?",
+        "explore_ai_experience": "Пробовали уже решать эту задачу с помощью нейросетей? Что получилось?",
+        "repair_ai_experience": "Я неудачно спросила. Пробовали ли вы решать именно эту задачу с помощью нейросетей и что получилось?",
+        "explain_solution": "Здесь может подойти ИИ-решение, настроенное под ваш рабочий процесс и требования. Хотите посмотреть, как оно может работать в вашей ситуации?",
+        "handle_solution_interest": "Хотите посмотреть, как такое решение может работать в вашей ситуации?",
+        "offer_consultation": "Могу показать это на бесплатной консультации. Хотите записаться?",
+    }
+    return replies.get(action, "Уточните, пожалуйста, ваш вопрос.")
 
 def generate_phase_reply(history, text, context, profile, action):
     if not action:
@@ -615,6 +630,10 @@ natural_and_clear=false, если реплика похожа на анкету,
                 answer = revised
         except Exception:
             app.logger.exception("Strict phase reply retry failed")
+    final_issues = phase_reply_issues(answer, action, history)
+    if final_issues:
+        app.logger.warning("Rejected final phase reply for %s: %s", action, final_issues)
+        answer = safe_phase_reply(action)
     answer = remove_unverified_promises(answer)
     return keep_one_question(answer)
 
