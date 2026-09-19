@@ -166,7 +166,7 @@ class TestBot(unittest.TestCase):
         with target.app.test_request_context("/"):
             self.assertEqual(target.discovery_action(state, profile, "Не знаю, можно ли это исправить"), "explain_solution")
 
-    def test_phase_validation_detects_repeated_opening_and_more_diagnosis(self):
+    def test_phase_validation_detects_repeated_opening(self):
         history = [{"role": "assistant", "content": "Похоже, здесь теряется логика курса."}]
         issues = target.phase_reply_issues(
             "Похоже, здесь мало контекста. Расскажите подробнее, что именно не получилось?",
@@ -174,15 +174,18 @@ class TestBot(unittest.TestCase):
             history,
         )
         self.assertIn("повтор того же начала реплики", issues)
-        self.assertIn("продолжение диагностики после собранной информации", issues)
 
-    def test_phase_validation_blocks_consulting_in_chat(self):
-        issues = target.phase_reply_issues(
-            "Давайте вместе составим структуру курса и подберём темы?",
-            "explain_solution",
-            [],
-        )
-        self.assertIn("попытка консультировать клиента внутри чата вместо выявления потребности", issues)
+    def test_semantic_review_blocks_expert_work_in_chat(self):
+        issues = target.phase_review_issues({
+            "question_purpose": "other",
+            "performs_expert_work": True,
+            "asks_for_deliverable_details": True,
+            "uses_unsupported_assumption": False,
+            "repeats_answered_question": False,
+            "natural_and_clear": True,
+        }, "explain_solution")
+        self.assertIn("бот начинает выполнять работу живого эксперта", issues)
+        self.assertIn("бот собирает данные для создания результата вместо продажи решения", issues)
 
     def test_phase_validation_rejects_suggested_task_options(self):
         issues = target.phase_reply_issues(
@@ -201,22 +204,25 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
 
-    def test_solution_phase_rejects_designing_client_course(self):
-        issues = target.phase_reply_issues(
-            "Давайте разберёмся вместе: какие игры и игровые механики нравятся вашим ученикам?",
-            "explain_solution",
-            [],
-        )
-        self.assertIn("проектирование результата клиента вместо объяснения ИИ-решения", issues)
-        self.assertIn("попытка начать рабочую консультацию внутри чата", issues)
-
-    def test_solution_phase_allows_interest_check_about_ai_solution(self):
-        issues = target.phase_reply_issues(
-            "Здесь нужен ассистент, который удерживает логику всего курса, требования к заданиям и уже созданные материалы. Хотите увидеть, как такое решение может работать на вашем примере?",
-            "explain_solution",
-            [],
-        )
-        self.assertNotIn("проектирование результата клиента вместо объяснения ИИ-решения", issues)
+    def test_semantic_review_allows_only_interest_question_after_solution(self):
+        valid = target.phase_review_issues({
+            "question_purpose": "check_solution_interest",
+            "performs_expert_work": False,
+            "asks_for_deliverable_details": False,
+            "uses_unsupported_assumption": False,
+            "repeats_answered_question": False,
+            "natural_and_clear": True,
+        }, "explain_solution")
+        self.assertEqual(valid, [])
+        wrong = target.phase_review_issues({
+            "question_purpose": "discover_need",
+            "performs_expert_work": False,
+            "asks_for_deliverable_details": False,
+            "uses_unsupported_assumption": False,
+            "repeats_answered_question": False,
+            "natural_and_clear": True,
+        }, "explain_solution")
+        self.assertTrue(any("другую функцию" in issue for issue in wrong))
 
     def test_shared_quality_filter_detects_cliches(self):
         issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
@@ -233,10 +239,6 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("Телемост", answer)
         self.assertNotIn("свяжусь", answer)
-
-    def test_shared_quality_filter_detects_consulting_in_chat(self):
-        issues = target.quality_issues("Может быть, обсудим, какие темы и форматы включить в ваш курс?")
-        self.assertIn("попытка консультировать клиента внутри чата вместо выявления потребности", issues)
 
     def test_busy_slot_offers_real_alternatives(self):
         tz = ZoneInfo("Europe/Moscow")
