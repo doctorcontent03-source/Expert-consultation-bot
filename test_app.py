@@ -184,6 +184,23 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("попытка консультировать клиента внутри чата вместо выявления потребности", issues)
 
+    def test_phase_validation_rejects_suggested_task_options(self):
+        issues = target.phase_reply_issues(
+            "Вам нужно автоматизировать подготовку уроков или улучшить контент для занятий?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
+        self.assertIn("варианты ответа внутри вопроса", issues)
+
+    def test_phase_validation_rejects_presumed_materials(self):
+        issues = target.phase_reply_issues(
+            "Какие конкретно учебные материалы вы хотели бы создавать?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
+
     def test_shared_quality_filter_detects_cliches(self):
         issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
         self.assertIn("шаблонная или канцелярская формулировка", issues)
