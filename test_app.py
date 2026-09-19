@@ -505,6 +505,40 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("проблема выведена из профессии или аудитории клиента", issues)
 
+    def test_marketer_discovery_advances_from_direct_answers_without_model_labels(self):
+        class EmptyExtractor:
+            def reply(self, messages):
+                return '{"stages":{"identity":{"complete":false,"evidence":""},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
+        old = target.gigachat
+        target.gigachat = EmptyExtractor()
+        profile = target.EXPERT_PROFILES["marketer"]
+        try:
+            with target.app.test_request_context("/"):
+                target.session["sid"] = "sequence-dialog"
+                identity = "Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми."
+                state = target.assess_discovery([], identity, profile)
+                self.assertEqual(target.discovery_action(state, profile, identity), "explore_task")
+
+                history = [
+                    {"role": "user", "content": identity},
+                    {"role": "assistant", "content": "А что в вашей работе сейчас хотелось бы упростить или изменить?"},
+                ]
+                need = "Хотелось бы сократить время подготовки к урокам. Очень много времени занимает."
+                state = target.assess_discovery(history, need, profile)
+                self.assertTrue(state["task"])
+                self.assertEqual(target.discovery_action(state, profile, need), "explore_ai_experience")
+
+                history += [
+                    {"role": "user", "content": need},
+                    {"role": "assistant", "content": "Пробовали уже решать эту задачу с помощью нейросетей?"},
+                ]
+                attempt = "Пробовала, мне не понравилось. Всё равно многое приходится переделывать вручную."
+                state = target.assess_discovery(history, attempt, profile)
+                self.assertTrue(state["ai_experience"])
+                self.assertEqual(target.discovery_action(state, profile, attempt), "explain_solution")
+        finally:
+            target.gigachat = old
+
     def test_upload_and_chat(self):
         headers = {"X-Admin-Password": "admin123"}
         uploaded = self.client.post(
