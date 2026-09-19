@@ -367,6 +367,15 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
 
+    def test_task_discovery_requires_open_question(self):
+        for answer in (
+            "Вам приходится подбирать материалы для каждого ученика?",
+            "Вы сталкиваетесь с проблемой подбора интересных тем?",
+            "Выходит, вам важно найти актуальные задания?",
+        ):
+            issues = target.phase_reply_issues(answer, "explore_task", [])
+            self.assertIn("закрытый или наводящий вопрос вместо открытого выяснения задачи", issues)
+
     def test_invalid_last_generation_cannot_reach_dialog(self):
         profile = target.EXPERT_PROFILES["marketer"]
         class AlwaysInvalid:
@@ -441,6 +450,47 @@ class TestBot(unittest.TestCase):
         finally:
             target.gigachat = old
         self.assertEqual(answer, "Что в вашей работе сейчас отнимает больше всего времени?")
+
+    def test_unverified_product_claim_from_semantic_review_still_blocks(self):
+        class ProductHallucinator:
+            def reply(self, messages):
+                prompt = messages[0]["content"]
+                if "Определите функцию реплики чат-бота" in prompt:
+                    return '{"question_purpose":"check_solution_interest","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"claims_unverified_product":true,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}'
+                return "У меня есть готовый ассистент, который анализирует популярные игры. Хотите посмотреть?"
+        old = target.gigachat
+        target.gigachat = ProductHallucinator()
+        try:
+            answer = target.generate_phase_reply(
+                [],
+                "Пыталась создать курс для подростков, но не получилось.",
+                target.EXPERT_PROFILES["marketer"]["profile_context"],
+                target.EXPERT_PROFILES["marketer"],
+                "explain_solution",
+            )
+        finally:
+            target.gigachat = old
+        self.assertIsNone(answer)
+
+    def test_confusion_is_a_separate_client_intent(self):
+        class ConfusionClassifier:
+            def reply(self, messages):
+                return '{"intent":"confusion","subject":"solution","confidence":"high"}'
+        old = target.gigachat
+        target.gigachat = ConfusionClassifier()
+        try:
+            move = target.classify_client_move(
+                [{"role": "assistant", "content": "Предыдущее объяснение решения."}],
+                "Ничего не поняла.",
+            )
+        finally:
+            target.gigachat = old
+        self.assertEqual(move["intent"], "confusion")
+        state = dict(identity=True, task=True, ai_experience=True, solution_explained=True, solution_interest=False)
+        self.assertEqual(
+            target.discovery_action(state, target.EXPERT_PROFILES["marketer"], "Ничего не поняла.", move),
+            "answer_information",
+        )
 
     def test_shared_quality_filter_rejects_team_voice_and_invented_specialization(self):
         issues = target.quality_issues(
