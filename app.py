@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.4-answer-before-offer"
+APP_VERSION = "v10.4.1-contextual-refusal"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -315,7 +315,7 @@ def chat_booking_answer(text):
             return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Для записи пришлите, пожалуйста, одним сообщением ваше имя, телефон и email."
 
     booking_intent = bool(re.search(r"(запис|встреч|консультац|подойд[её]т|удобно|свободно)", text.lower()))
-    if not session.get("consultation_offered") and not booking_intent:
+    if not consultation_offer_active() and not booking_intent:
         return None
 
     start = parse_requested_slot(text)
@@ -371,7 +371,7 @@ def direct_booking_answer(text):
     return "На какую встречу хотите записаться: на бесплатную первичную или на регулярную?"
 
 def accepted_consultation_answer(text):
-    if not session.get("consultation_offered") or "?" in text:
+    if not consultation_offer_active() or "?" in text:
         return None
     accepted = bool(re.fullmatch(
         r"\s*(да|давайте|хочу|можно|хорошо|согласен|согласна|попробуем|записывайте)[.!\s]*",
@@ -407,7 +407,7 @@ def consultation_stage_answer(text, history):
         return None
     assistant_messages = [x["content"].lower() for x in history if x["role"] == "assistant"]
     last_assistant = assistant_messages[-1] if assistant_messages else ""
-    offered = bool(session.get("consultation_offered")) or any(
+    offered = consultation_offer_active() or any(
         "консультац" in x and re.search(r"(предлаг|предлож|запис|встреч|обсудить подробнее)", x)
         for x in assistant_messages
     )
@@ -480,6 +480,22 @@ def consultation_refusal(text):
         r"я уже (сказал|сказала).{0,12}нет|не записывайте|не настаивайте)\b",
         low,
     ))
+
+def consultation_offer_active():
+    """An offer flag is valid only inside the dialog that created it."""
+    return bool(
+        session.get("consultation_offered")
+        and session.get("consultation_offered_sid") == session.get("sid")
+    )
+
+def last_assistant_offered_consultation(history):
+    """A refusal is actionable only as a direct reply to an actual invitation."""
+    last = next((row["content"] for row in reversed(history) if row["role"] == "assistant"), "")
+    low = last.lower()
+    return bool(
+        re.search(r"(консультац|встреч|запис)", low)
+        and re.search(r"(хотите|предлаг|приглаш|записаться|подходит ли|готовы)", low)
+    )
 
 def solution_was_explained(answer, profile):
     if profile.get("solution_mode") == "expert_service":
@@ -1184,12 +1200,13 @@ def chat():
     if accepted_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=accepted_answer)
-    if consultation_refusal(text) and session.get("consultation_offered"):
+    if consultation_refusal(text) and consultation_offer_active() and last_assistant_offered_consultation(history):
         session["consultation_declined"] = True
+        session["consultation_declined_sid"] = sid
         declined_answer = "Хорошо, не буду настаивать."
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=declined_answer)
-    if session.get("consultation_declined") and not is_informational_question(text):
+    if session.get("consultation_declined") and session.get("consultation_declined_sid") == sid and not is_informational_question(text):
         declined_answer = "Хорошо, предложение закрыто."
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",declined_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=declined_answer)
@@ -1206,12 +1223,14 @@ def chat():
             session["discovery_state"] = discovery_state
         if action == "offer_consultation" and "консультац" in phase_answer.lower():
             session["consultation_offered"] = True
+            session["consultation_offered_sid"] = sid
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",phase_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=phase_answer)
     stage_answer = consultation_stage_answer(text, history)
     if stage_answer:
         if "консультац" in stage_answer.lower():
             session["consultation_offered"] = True
+            session["consultation_offered_sid"] = sid
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",stage_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=stage_answer)
     free_title, free_duration = booking_config("free")
@@ -1238,6 +1257,7 @@ def chat():
         answer = answer.replace("[[BOOK_REGULAR]]", "")
     if "консультац" in answer.lower() and re.search(r"(предлаг|предлож|запис|встреч|хотите)", answer.lower()):
         session["consultation_offered"] = True
+        session["consultation_offered_sid"] = sid
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
     return jsonify(answer=answer)
 
