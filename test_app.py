@@ -197,9 +197,8 @@ class TestBot(unittest.TestCase):
             response = self.client.post("/api/chat", json={"message":"Я репетитор английского, работаю с детьми и взрослыми"})
         finally:
             target.gigachat = old
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("консультац", response.json["answer"].lower())
-        self.assertEqual(response.json["answer"], target.safe_phase_reply("explore_task", target.EXPERT_PROFILES["marketer"]))
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("Не удалось сформировать корректный ответ", response.json["error"])
 
     def test_state_machine_accepts_need_only_from_client_words(self):
         profile = target.EXPERT_PROFILES["marketer"]
@@ -339,25 +338,6 @@ class TestBot(unittest.TestCase):
             profile,
         ))
 
-    def test_safe_information_reply_answers_solution_type_question(self):
-        answer = target.safe_phase_reply(
-            "answer_information",
-            target.EXPERT_PROFILES["marketer"],
-            "Вы имеете в виду ассистента, приложение или чат-бота?",
-        )
-        self.assertIn("ИИ-ассистента", answer)
-        self.assertIn("приложение", answer)
-        self.assertNotIn("Хотите", answer)
-
-    def test_safe_information_reply_answers_platform_question(self):
-        answer = target.safe_phase_reply(
-            "answer_information",
-            target.EXPERT_PROFILES["marketer"],
-            "Я понимаю, это в ChatGPT?",
-        )
-        self.assertIn("Не обязательно в ChatGPT", answer)
-        self.assertNotIn("Хотите", answer)
-
     def test_quality_filter_detects_result_promises(self):
         issues = target.quality_issues("Вы быстро получите качественные материалы и сэкономите время.")
         self.assertIn("неподтверждённое обещание результата", issues)
@@ -387,12 +367,6 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
 
-    def test_safe_fallback_for_task_does_not_assume_ai_usage(self):
-        answer = target.safe_phase_reply("explore_task")
-        self.assertNotIn("нейросет", answer.lower())
-        self.assertNotIn("вы уже", answer.lower())
-        self.assertEqual(answer.count("?"), 1)
-
     def test_invalid_last_generation_cannot_reach_dialog(self):
         profile = target.EXPERT_PROFILES["marketer"]
         class AlwaysInvalid:
@@ -404,7 +378,7 @@ class TestBot(unittest.TestCase):
             answer = target.generate_phase_reply([], "Я репетитор", "", profile, "explore_task")
         finally:
             target.gigachat = old
-        self.assertEqual(answer, target.safe_phase_reply("explore_task"))
+        self.assertIsNone(answer)
 
     def test_semantic_review_allows_only_interest_question_after_solution(self):
         valid = target.phase_review_issues({
@@ -558,14 +532,32 @@ class TestBot(unittest.TestCase):
             target.gigachat = old
         self.assertEqual(move["intent"], "other")
 
-    def test_safe_reply_acknowledges_specific_client_difficulty(self):
-        answer = target.safe_phase_reply(
-            "explain_solution",
-            target.EXPERT_PROFILES["marketer"],
-            "Пробовала, но всё равно многое приходится переделывать вручную.",
+    def test_semantic_booking_request_skips_repeated_consultation_offer(self):
+        class BookingClassifier:
+            def reply(self, messages):
+                prompt = messages[0]["content"]
+                if "Определите функцию последней реплики клиента" in prompt:
+                    return '{"intent":"booking_request","subject":"booking","confidence":"high"}'
+                return "Могу показать это на бесплатной консультации. Хотите записаться?"
+        con = target.db()
+        con.execute(
+            "insert into messages(session_id,role,content,created_at) values(?,?,?,?)",
+            ("booking-intent", "assistant", "Могу показать это на бесплатной консультации. Хотите записаться?", 1),
         )
-        self.assertIn("переделывать вручную", answer)
-        self.assertIn("экономия времени", answer)
+        con.commit()
+        with self.client.session_transaction() as session:
+            session["expert_slug"] = "marketer"
+            session["sid"] = "booking-intent"
+            session["consultation_offered"] = True
+            session["consultation_offered_sid"] = "booking-intent"
+        old = target.gigachat
+        target.gigachat = BookingClassifier()
+        try:
+            response = self.client.post("/api/chat", json={"message": "Давайте. Когда?"})
+        finally:
+            target.gigachat = old
+        self.assertEqual(response.json["answer"], "Назовите удобные дату и время — я сразу проверю их в календаре.")
+        self.assertNotIn("Хотите записаться", response.json["answer"])
 
     def test_when_can_i_book_stays_in_chat_without_form(self):
         with target.app.test_request_context("/"):
