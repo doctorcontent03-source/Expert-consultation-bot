@@ -404,7 +404,7 @@ class TestBot(unittest.TestCase):
             target.gigachat = old
         self.assertEqual(answer, "Что в вашей работе хотелось бы изменить в первую очередь?")
 
-    def test_structured_discovery_returns_safe_model_wording_instead_of_error(self):
+    def test_structured_discovery_rejects_repeated_invalid_wording(self):
         class AlwaysClosed:
             def reply(self, messages):
                 return '{"reaction":"","question":"Вам трудно готовить материалы для разных учеников?"}'
@@ -419,10 +419,9 @@ class TestBot(unittest.TestCase):
             )
         finally:
             target.gigachat = old
-        self.assertEqual(answer, "Вам трудно готовить материалы для разных учеников?")
-        self.assertNotIn("консультац", answer.lower())
+        self.assertIsNone(answer)
 
-    def test_safe_imperfect_last_generation_reaches_dialog(self):
+    def test_invalid_last_generation_cannot_reach_dialog(self):
         profile = target.EXPERT_PROFILES["marketer"]
         class AlwaysInvalid:
             def reply(self, messages):
@@ -433,7 +432,7 @@ class TestBot(unittest.TestCase):
             answer = target.generate_phase_reply([], "Я репетитор", "", profile, "explore_task")
         finally:
             target.gigachat = old
-        self.assertEqual(answer, "Здорово, что вы уже используете нейросети?")
+        self.assertIsNone(answer)
 
     def test_semantic_review_allows_only_interest_question_after_solution(self):
         valid = target.phase_review_issues({
@@ -834,6 +833,24 @@ class TestBot(unittest.TestCase):
             [],
         )
         self.assertIn("вопрос заранее приписывает клиенту проблему", issues)
+
+    def test_discovery_rejects_internal_commentary_and_professional_smalltalk(self):
+        issues = target.phase_reply_issues(
+            "Похоже, клиент уверен в своей компетенции, однако стоит уточнить детали работы. Какой аспект вашей работы приносит наибольшее удовлетворение?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("наружу выведено служебное рассуждение о клиенте", issues)
+        self.assertIn("вопрос ушёл от рабочей задачи к общему разговору о профессии", issues)
+        self.assertTrue(target.blocking_reply_issues(issues))
+
+    def test_two_discovery_questions_are_blocking(self):
+        issues = target.phase_reply_issues(
+            "Какую трудность вы испытываете? Какие сложности возникают во время занятий?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("больше одного вопроса", target.blocking_reply_issues(issues))
 
     def test_denial_of_suggested_problem_does_not_complete_need_stage(self):
         class MisleadingExtractor:
