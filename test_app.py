@@ -404,6 +404,23 @@ class TestBot(unittest.TestCase):
         issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
         self.assertIn("шаблонная или канцелярская формулировка", issues)
 
+    def test_style_issue_is_not_allowed_to_break_dialog(self):
+        self.assertEqual(
+            target.blocking_reply_issues(["шаблонная или канцелярская формулировка"]),
+            [],
+        )
+        self.assertEqual(
+            target.blocking_reply_issues(["не удалось проверить смысл реплики"]),
+            [],
+        )
+
+    def test_state_machine_violation_still_blocks_reply(self):
+        issues = target.blocking_reply_issues([
+            "шаблонная или канцелярская формулировка",
+            "догадка о задаче клиента вместо открытого вопроса",
+        ])
+        self.assertEqual(issues, ["догадка о задаче клиента вместо открытого вопроса"])
+
     def test_shared_quality_filter_rejects_team_voice_and_invented_specialization(self):
         issues = target.quality_issues(
             "Мы можем показать генератор, специально разработанный для преподавателей английского."
