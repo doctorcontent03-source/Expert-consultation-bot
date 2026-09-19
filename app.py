@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.3-hard-vs-soft-validation"
+APP_VERSION = "v11.4-deterministic-final-gate"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -871,15 +871,13 @@ def generate_phase_reply(history, text, context, profile, action):
                 answer = revised
         except Exception:
             app.logger.exception("Strict phase reply retry failed")
-    final_issues = phase_reply_issues(answer, action, history)
-    final_issues.extend(semantic_phase_issues(answer, action, task, transcript, text, context))
-    final_issues = list(dict.fromkeys(final_issues))
-    blocking = blocking_reply_issues(final_issues)
+    deterministic_issues = list(dict.fromkeys(phase_reply_issues(answer, action, history)))
+    blocking = blocking_reply_issues(deterministic_issues)
     if blocking:
         app.logger.warning("Rejected final phase reply for %s: %s", action, blocking)
         return None
-    if final_issues:
-        app.logger.info("Accepted phase reply with non-blocking style issues for %s: %s", action, final_issues)
+    if deterministic_issues:
+        app.logger.info("Accepted phase reply with non-blocking style issues for %s: %s", action, deterministic_issues)
     answer = remove_unverified_promises(answer)
     answer = re.sub(r"^\s*(?:Екатерина|Эксперт|Психолог)\s*:\s*", "", answer, flags=re.I)
     return keep_one_question(answer)
