@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11-semantic-dialog-controller"
+APP_VERSION = "v11.2-no-scripted-fallbacks"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -775,45 +775,6 @@ def phase_prompt(action, profile):
         return """Клиент явно заинтересован в решении. Теперь можно один раз предложить бесплатную консультацию и кратко связать её содержание с его задачей. Не повторяйте уже сказанные объяснения."""
     return "Ответьте прямо и содержательно только на информационный вопрос клиента, используя факты из базы знаний и разговора. Если клиент спрашивает о предложенном решении, ясно отделите возможное направление от реально существующего продукта. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
 
-def contextual_acknowledgement(text):
-    low = str(text or "").lower()
-    if re.search(r"(передел|додел|исправ).{0,45}(вручн|сам|сама)|вручн.{0,45}(передел|додел|исправ)", low):
-        return "Если результат всё равно приходится переделывать вручную, экономия времени действительно получается сомнительной."
-    if re.search(r"(много|слишком много|целый день).{0,25}времен|времен.{0,25}(много|не хватает|занимает)", low):
-        return "Когда подготовка отнимает столько времени, это уже отдельная рабочая проблема."
-    if re.search(r"(не подходит|не подходят|не устраива|не получилось|не понравил)", low):
-        return "Да, готовый вариант здесь явно не закрыл вашу задачу."
-    return ""
-
-def safe_phase_reply(action, profile=None, text=""):
-    """Last-resort output used only when generated variants still violate the phase."""
-    replies = {
-        "explore_identity": "Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
-        "repair_identity": "Я неудачно сформулировала вопрос. Расскажите, пожалуйста, чем вы занимаетесь и с кем работаете?",
-        "explore_task": "А что в вашей работе сейчас хотелось бы упростить или изменить?",
-        "repair_task": "Я неудачно сформулировала вопрос и начала угадывать за вас. Что в вашей работе сейчас хотелось бы изменить?",
-        "explore_ai_experience": "Пробовали уже решать эту задачу с помощью нейросетей? Что получилось?",
-        "repair_ai_experience": "Я неудачно спросила. Пробовали ли вы решать именно эту задачу с помощью нейросетей и что получилось?",
-        "explain_solution": "Возможное направление здесь — персональный ИИ-помощник для подготовки материалов. Ему можно задать правила работы и дать примеры, на которые он будет ориентироваться. Хотите посмотреть, как такой помощник может работать в вашей ситуации?",
-        "handle_solution_interest": "Хотите посмотреть, как такое решение может работать в вашей ситуации?",
-        "offer_consultation": "Могу показать это на бесплатной консультации. Хотите записаться?",
-        "answer_information": "Не хочу придумывать детали: в материалах эксперта нет точного ответа на этот вопрос.",
-    }
-    if action == "explain_solution" and profile and profile.get("solution_mode") == "expert_service":
-        return "Такую ситуацию лучше подробно разбирать на встрече с экспертом. Подходит ли вам такой следующий шаг?"
-    if action == "answer_information" and profile and profile.get("solution_mode") == "ai_solution" and re.search(r"(какое.{0,15}решени|ассистент|приложен|чат-?бот|помощник)", text.lower()):
-        return "Я имею в виду возможный формат ИИ-решения, а не уже выбранный за вас продукт. Для такой задачи можно рассматривать персонального ИИ-ассистента для подготовки материалов; чат-бот или отдельное приложение нужны, только если потребуется другой способ работы с ним."
-    if action == "answer_information" and profile and profile.get("solution_mode") == "ai_solution" and re.search(r"(chatgpt|gpt|гигач|где.{0,20}(работает|находится|открывать))", text.lower()):
-        return "Не обязательно в ChatGPT. ИИ-ассистент может работать внутри нейросетевого сервиса, в чат-боте или в отдельном приложении — формат выбирают под задачу и удобный для клиента способ работы."
-    acknowledgement = contextual_acknowledgement(text)
-    if action in {"explore_ai_experience", "explain_solution"} and acknowledgement:
-        return acknowledgement + " " + replies[action]
-    if action in replies:
-        return replies[action]
-    if action.startswith(("explore_", "repair_")):
-        return "Расскажите, пожалуйста, об этом немного подробнее."
-    return replies.get(action, "Уточните, пожалуйста, ваш вопрос.")
-
 def semantic_phase_issues(answer, action, task, transcript, text, context):
     review_prompt = f"""Определите функцию реплики чат-бота, не оценивая её по отдельным словам. Верните только JSON:
 {{"question_purpose":"none","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"claims_unverified_product":false,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}}
@@ -904,7 +865,7 @@ def generate_phase_reply(history, text, context, profile, action):
     final_issues = list(dict.fromkeys(final_issues))
     if final_issues:
         app.logger.warning("Rejected final phase reply for %s: %s", action, final_issues)
-        answer = safe_phase_reply(action, profile, text)
+        return None
     answer = remove_unverified_promises(answer)
     answer = re.sub(r"^\s*(?:Екатерина|Эксперт|Психолог)\s*:\s*", "", answer, flags=re.I)
     return keep_one_question(answer)
@@ -1270,6 +1231,16 @@ def chat():
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
     client_move = classify_client_move(history, text)
+    if client_move.get("intent") == "booking_request" and (
+        consultation_offer_active() or last_assistant_offered_consultation(history)
+    ):
+        if profile["regular_enabled"] and client_move.get("subject") == "booking" and re.search(r"(регуляр|повторн|платн|сесси)", text.lower()):
+            session["requested_booking_type"] = "regular"
+        else:
+            session["requested_booking_type"] = "free"
+        booking_prompt = "Назовите удобные дату и время — я сразу проверю их в календаре."
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",booking_prompt,int(time.time()*1000))); con.commit()
+        return jsonify(answer=booking_prompt)
     accepted_answer = accepted_consultation_answer(text)
     if accepted_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
@@ -1303,7 +1274,7 @@ def chat():
     phase_answer = generate_phase_reply(history, text, context, profile, action)
     if action:
         if not phase_answer:
-            phase_answer = safe_phase_reply(action, profile, text)
+            return jsonify(error="Не удалось сформировать корректный ответ. Попробуйте отправить сообщение ещё раз."), 502
         if action == "explain_solution" and solution_was_explained(phase_answer, profile):
             discovery_state = dict(discovery_state or {})
             discovery_state["solution_explained"] = True
