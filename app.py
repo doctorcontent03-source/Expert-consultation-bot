@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.8-strict-discovery-function"
+APP_VERSION = "v12-stage-bound-discovery"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -589,6 +589,23 @@ def has_direct_stage_evidence(stage_type, text, client_text, history):
         return False
     return evidence_is_grounded(stage_type, text, client_text, text, history)
 
+def is_substantive_stage_reply(stage_type, text, client_move=None):
+    """Treat a reply as an answer to the stage that was actually asked."""
+    low = str(text or "").lower().strip()
+    intent = client_move.get("intent") if isinstance(client_move, dict) else "other"
+    if intent in {"confusion", "refusal", "information_question"} or "?" in low:
+        return False
+    if re.search(r"(не хочу.{0,20}отвечать|расхотелось.{0,20}отвечать|не буду.{0,20}отвечать|"
+                 r"вы странно.{0,20}(говор|вед)|с этого.{0,15}надо.{0,15}начинать|"
+                 r"я же.{0,20}(ответил|ответила|сказал|сказала))", low):
+        return False
+    if stage_type == "need" and re.search(r"\b(никаких|ничего|нет сложност|сложност.{0,15}нет|не знаю|неважно)\b", low):
+        return False
+    words = normalized_text(low).split()
+    if stage_type == "prior_attempts":
+        return bool(re.search(r"\b(да|нет|пробовал|пробовала|пытаюсь|пытался|пыталась|пользуюсь|не пользовал)\b", low))
+    return len(words) >= 3
+
 def assess_discovery(history, text, profile, client_move=None):
     stages = profile.get("discovery_stages")
     if not stages:
@@ -631,6 +648,15 @@ def assess_discovery(history, text, profile, client_move=None):
             state[key] = True
         if not state[key] and has_direct_stage_evidence(stage_types.get(key, key), text, client_text, history):
             state[key] = True
+    pending_stage = session.get("pending_discovery_stage") if session.get("pending_discovery_sid") == sid else None
+    if pending_stage in stages and not state.get(pending_stage):
+        if is_substantive_stage_reply(stage_types.get(pending_stage, pending_stage), text, client_move):
+            state[pending_stage] = True
+            session.pop("pending_discovery_stage", None)
+            session.pop("pending_discovery_sid", None)
+    if pending_stage in stages and state.get(pending_stage):
+        session.pop("pending_discovery_stage", None)
+        session.pop("pending_discovery_sid", None)
     # The first marketer prompt explicitly asks for the client's occupation and
     # audience. A substantive direct answer closes that stage even if the model
     # fails to copy an exact evidence quote.
@@ -673,13 +699,18 @@ def discovery_action(state, profile, text, client_move=None):
     """Choose the next conversational job; wording remains the model's job."""
     if state is None:
         return None
-    if (isinstance(client_move, dict) and client_move.get("intent") in {"information_question", "confusion"}) or is_informational_question(text):
-        return "answer_information"
-    if re.search(r"(не понял(?:а)?|не понимаю|в смысле|что вы имеете в виду|вы издеваетесь|какое отношение|странн(?:ый|ая|ое).{0,20}(вопрос|бесед))", text.lower()):
+    missing = [key for key in profile.get("discovery_stages", {}) if not state.get(key)]
+    if re.search(r"(не хочу.{0,20}отвечать|расхотелось.{0,20}отвечать|не буду.{0,20}отвечать|хватит.{0,20}вопрос)", text.lower()):
+        return "pause_discovery"
+    confused = (
+        isinstance(client_move, dict) and client_move.get("intent") == "confusion"
+    ) or bool(re.search(r"(не понял(?:а)?|не понимаю|в смысле|что вы имеете в виду|вы издеваетесь|какое отношение|странн(?:ый|ая|ое).{0,20}(вопрос|бесед))", text.lower()))
+    if confused:
         stage_keys = tuple(profile.get("discovery_stages", {}))
         missing = next((key for key in stage_keys if not state.get(key)), None)
         return "repair_" + missing if missing else "answer_information"
-    missing = [key for key in profile.get("discovery_stages", {}) if not state.get(key)]
+    if is_informational_question(text):
+        return "answer_information"
     if missing:
         return "explore_" + missing[0]
     if not state.get("solution_explained"):
@@ -697,6 +728,10 @@ def phase_reply_issues(answer, action, history):
     low = answer.lower()
     if not answer.strip():
         issues.append("пустой ответ")
+    if action.startswith(("explore_", "repair_")) and answer.count("?") != 1:
+        issues.append("диагностическая реплика должна содержать ровно один вопрос")
+    if action == "pause_discovery" and "?" in answer:
+        issues.append("после отказа отвечать бот снова задаёт вопрос")
     if re.search(r"\b(клиент|пользователь)\s+(?:испытыва|говорит|считает|хочет|уверен|сообщил)|\bстоит уточнить\b", low):
         issues.append("наружу выведено служебное рассуждение о клиенте")
     if (action.startswith("explore_") or action.startswith("repair_")) and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
@@ -705,7 +740,7 @@ def phase_reply_issues(answer, action, history):
         if re.search(r"((вам|вы)\s+(сложно|трудно|нужно|не хватает|хочется|хотите|планируете|пытаетесь|ищете)|\bвы уже\b|планируете ли|что думаете попробовать|какие конкретно|какой тип)", low):
             issues.append("догадка о задаче клиента вместо открытого вопроса")
         question = answer.rsplit("?", 1)[0] if "?" in answer else answer
-        if " или " in question.lower():
+        if re.search(r"\bили\b", question.lower()):
             issues.append("варианты ответа внутри вопроса")
         if re.search(r"(какие|какого рода).{0,25}(сложност|проблем|трудност).{0,50}(при|с|из-за)", low):
             issues.append("проблема выведена из профессии или аудитории клиента")
@@ -720,10 +755,14 @@ def phase_reply_issues(answer, action, history):
             issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
         if re.search(r"(вам приходится|вы сталкиваетесь|вам важно|выходит,? вам|значит,? вам)", low):
             issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
+        if re.search(r"(вызыва(?:ют|ет).{0,30}(сложност|проблем|трудност))", low):
+            issues.append("вопрос заранее приписывает клиенту проблему")
         if re.search(r"(приносит.{0,30}удовлетворен|нравится.{0,30}(работ|професси)|любите.{0,30}(работ|професси)|сильн(?:ая|ые).{0,20}сторон)", low):
             issues.append("вопрос ушёл от рабочей задачи к общему разговору о профессии")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
+    if action == "pause_discovery" and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
+        issues.append("после отказа отвечать бот продолжает продажу")
     if action in {"explain_solution", "handle_solution_interest", "offer_consultation"} and re.search(
         r"(поделитесь|пришлите|покажите|приведите).{0,60}(пример|задани|тем|материал|документ)|"
         r"(какие|какими|с какими).{0,50}(задани|тем|материал|документ)",
@@ -793,6 +832,8 @@ def blocking_reply_issues(issues):
     return [issue for issue in issues if issue not in non_blocking]
 
 def phase_prompt(action, profile):
+    if action == "pause_discovery":
+        return """Клиент прямо сказал, что больше не хочет отвечать на вопросы. Коротко признайте это и остановите расспрос. Не задавайте новый вопрос, не оправдывайтесь, не предлагайте решение, продукт, консультацию или запись."""
     if action.startswith("repair_"):
         key = action.removeprefix("repair_")
         return f"""Клиент не понял вопрос или возмутился. Коротко признайте, что вопрос был неудачным, и объясните, зачем вам нужна только эта информация: {profile['discovery_stages'][key]}. Затем сформулируйте один простой вопрос заново. Не защищайте прежний вопрос, не делайте предположений о задаче клиента и не предлагайте варианты ответа."""
@@ -889,6 +930,24 @@ question — один открытый вопрос, на который нел�
         if not blocking_reply_issues(phase_reply_issues(answer, action, history)):
             return answer
         prompt += "\nПредыдущий вариант не прошёл проверку открытого вопроса. Создайте другой вариант, сохранив только указанную смысловую цель."
+    batch_prompt = prompt + """
+
+Предыдущие попытки не подошли. Верните JSON с пятью разными вариантами:
+{"candidates":[{"reaction":"","question":""}]}
+Каждый вариант должен самостоятельно выполнять только смысловую цель и содержать ровно один нейтральный открытый вопрос."""
+    try:
+        parsed = parse_json_object(gigachat.reply([{"role": "system", "content": batch_prompt}]))
+        candidates = parsed.get("candidates", []) if isinstance(parsed, dict) else []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            reaction = str(item.get("reaction", "")).strip()
+            question = str(item.get("question", "")).strip()
+            answer = " ".join(part for part in (reaction, question) if part)
+            if answer and not blocking_reply_issues(phase_reply_issues(answer, action, history)):
+                return answer
+    except Exception:
+        app.logger.exception("Structured discovery batch generation failed")
     return None
 
 def generate_phase_reply(history, text, context, profile, action):
@@ -1380,6 +1439,12 @@ def chat():
     if action:
         if not phase_answer:
             return jsonify(error="Не удалось сформировать корректный ответ. Попробуйте отправить сообщение ещё раз."), 502
+        if action.startswith(("explore_", "repair_")):
+            session["pending_discovery_stage"] = action.removeprefix("explore_").removeprefix("repair_")
+            session["pending_discovery_sid"] = sid
+        elif action == "pause_discovery":
+            session.pop("pending_discovery_stage", None)
+            session.pop("pending_discovery_sid", None)
         if action == "explain_solution" and solution_was_explained(phase_answer, profile):
             discovery_state = dict(discovery_state or {})
             discovery_state["solution_explained"] = True
