@@ -852,6 +852,49 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("больше одного вопроса", target.blocking_reply_issues(issues))
 
+    def test_task_question_cannot_offer_answer_variants(self):
+        issues = target.phase_reply_issues(
+            "Что вам хотелось бы улучшить — сделать уроки интереснее, проще объяснять материал или найти новые методики?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("варианты ответа внутри вопроса", issues)
+
+    def test_reply_to_pending_task_advances_without_keyword_guessing(self):
+        class EmptyExtractor:
+            def reply(self, messages):
+                return '{"stages":{}}'
+        old = target.gigachat
+        target.gigachat = EmptyExtractor()
+        profile = target.EXPERT_PROFILES["marketer"]
+        try:
+            with target.app.test_request_context("/"):
+                target.session["sid"] = "pending-task"
+                target.session["discovery_sid"] = "pending-task"
+                target.session["discovery_state"] = {"identity": True, "task": False, "ai_experience": False}
+                target.session["pending_discovery_sid"] = "pending-task"
+                target.session["pending_discovery_stage"] = "task"
+                history = [
+                    {"role": "user", "content": "Я репетитор английского."},
+                    {"role": "assistant", "content": "Что в работе вы хотели бы изменить?"},
+                ]
+                text = "Быстрее готовиться к урокам и делать их актуальнее для подростков."
+                state = target.assess_discovery(history, text, profile, {"intent": "other", "subject": "other"})
+                self.assertTrue(state["task"])
+                self.assertEqual(target.discovery_action(state, profile, text), "explore_ai_experience")
+        finally:
+            target.gigachat = old
+
+    def test_refusal_to_answer_pauses_discovery(self):
+        state = {"identity": True, "task": True, "ai_experience": False, "solution_explained": False, "solution_interest": False}
+        action = target.discovery_action(
+            state,
+            target.EXPERT_PROFILES["marketer"],
+            "Мне уже расхотелось отвечать на вопросы.",
+            {"intent": "refusal", "subject": "other"},
+        )
+        self.assertEqual(action, "pause_discovery")
+
     def test_denial_of_suggested_problem_does_not_complete_need_stage(self):
         class MisleadingExtractor:
             def reply(self, messages):
