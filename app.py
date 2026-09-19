@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.7-semantic-dialog-controller"
+APP_VERSION = "v9.8-phase-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -449,6 +449,98 @@ def discovery_instruction(state, profile):
 КОНТРОЛЛЕР ЭТАПОВ: направление решения уже объяснено, но клиент ещё не выразил явного интереса к нему. Ответьте на его вопрос или сомнение. Можно уточнить, хочет ли он рассмотреть это решение, но пока нельзя приглашать на консультацию или предлагать запись.""", None
     return "\nКОНТРОЛЛЕР ЭТАПОВ: клиент явно заинтересовался объяснённым решением. Теперь при уместности можно один раз предложить консультацию.", None
 
+def discovery_action(state, profile, text):
+    """Choose the next conversational job; wording remains the model's job."""
+    if state is None:
+        return None
+    if is_informational_question(text):
+        return "answer_information"
+    missing = [key for key in DISCOVERY_KEYS if not state.get(key)]
+    followups = int(session.get("discovery_followups", 0))
+    if missing and followups < 2:
+        return "explore_" + missing[0]
+    if missing or not state.get("solution_explained"):
+        return "explain_solution"
+    if not state.get("solution_interest"):
+        return "handle_solution_interest"
+    return "offer_consultation"
+
+def normalized_opening(value, words=2):
+    tokens = re.findall(r"[а-яёa-z]+", str(value or "").lower())
+    return " ".join(tokens[:words])
+
+def phase_reply_issues(answer, action, history):
+    issues = quality_issues(answer)
+    low = answer.lower()
+    if not answer.strip():
+        issues.append("пустой ответ")
+    if action.startswith("explore_") and re.search(r"(консультац|встреч|запис|продукт|решени[ея])", low):
+        issues.append("преждевременный переход к решению или встрече")
+    if action == "explain_solution" and "?" in answer and re.search(r"(поделитесь|расскажите|что именно|какие именно|как именно)", low):
+        issues.append("продолжение диагностики после собранной информации")
+    if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
+        issues.append("преждевременное приглашение на консультацию")
+    opening = normalized_opening(answer)
+    recent = [normalized_opening(row["content"]) for row in history if row["role"] == "assistant"][-3:]
+    if opening and opening in recent:
+        issues.append("повтор того же начала реплики")
+    return list(dict.fromkeys(issues))
+
+def phase_prompt(action, profile):
+    if action.startswith("explore_"):
+        key = action.removeprefix("explore_")
+        return f"""Получите только недостающую информацию: {profile['discovery_stages'][key]}.
+Коротко откликнитесь на одну конкретную деталь клиента и задайте один понятный вопрос. Не пересказывайте его ответ и не просите ещё деталей о том, что он уже объяснил. Не обсуждайте решение, продукт или встречу."""
+    if action == "explain_solution":
+        return """Диагностика закончена. Больше ничего не выясняйте. Коротко назовите выявленный разрыв и объясните одно конкретное направление ИИ-решения из базы знаний. Не проектируйте решение прямо в чате. В конце одним простым вопросом проверьте, хочется ли клиенту увидеть это на своём примере. Не приглашайте на консультацию."""
+    if action == "handle_solution_interest":
+        return """Ответьте на вопрос или сомнение клиента о предложенном направлении решения. Не возвращайтесь к диагностике и пока не приглашайте на консультацию. Если вопроса нет, одним коротким вопросом проверьте интерес к демонстрации решения на его примере."""
+    if action == "offer_consultation":
+        return """Клиент явно заинтересован в решении. Теперь можно один раз предложить бесплатную консультацию и кратко связать её содержание с его задачей. Не повторяйте уже сказанные объяснения."""
+    return "Ответьте только на информационный вопрос клиента. Не добавляйте диагностический вопрос и не приглашайте на консультацию."
+
+def generate_phase_reply(history, text, context, profile, action):
+    if not action:
+        return None
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-10:]
+    )
+    task = phase_prompt(action, profile)
+    prompt = f"""Напишите одну следующую реплику эксперта в диалоге.
+ТЕКУЩЕЕ ДЕЙСТВИЕ КОНТРОЛЛЕРА: {task}
+
+Правила: разговорный и лёгкий русский язык; 1–3 коротких предложения; не более одного вопроса. Не начинайте так же, как недавние реплики эксперта. Не используйте пустые вводные вроде «Похоже», «Понятно», «Понимаю вас». Не повторяйте слова клиента официальным языком. Не придумывайте факты. Не консультируйте по профессиональной задаче клиента: бот только выявляет потребность, объясняет направление решения и ведёт к встрече с живым экспертом.
+{BASE_STYLE_RULES}
+{profile.get('style_rules', '')}
+
+БАЗА ЗНАНИЙ:
+{context[-8000:]}
+
+ДИАЛОГ:
+{transcript[-6000:]}
+Клиент: {text}
+
+Верните только реплику эксперта."""
+    try:
+        answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
+    except Exception:
+        app.logger.exception("Phase reply generation failed")
+        return None
+    issues = phase_reply_issues(answer, action, history)
+    if issues:
+        retry = prompt + f"""
+
+Первый вариант отклонён: {', '.join(issues)}. Напишите новый вариант, устранив все эти проблемы. Не объясняйте правки."""
+        try:
+            revised = str(gigachat.reply([{"role": "system", "content": retry}])).strip()
+            if revised:
+                answer = revised
+        except Exception:
+            app.logger.exception("Phase reply retry failed")
+    answer = remove_unverified_promises(answer)
+    return keep_one_question(answer)
+
 def guard_discovery_answer(answer, state, missing_stage, user_text):
     if state is None:
         return answer
@@ -805,10 +897,19 @@ def chat():
         return jsonify(answer=direct_answer)
     discovery_state = assess_discovery(history, text, profile)
     controller_rule, missing_stage = discovery_instruction(discovery_state, profile)
-    focused_answer = generate_discovery_reply(history, text, context, profile, missing_stage)
-    if focused_answer:
-        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",focused_answer,int(time.time()*1000))); con.commit()
-        return jsonify(answer=focused_answer)
+    action = discovery_action(discovery_state, profile, text)
+    phase_answer = generate_phase_reply(history, text, context, profile, action)
+    if phase_answer:
+        if action and action.startswith("explore_"):
+            session["discovery_followups"] = int(session.get("discovery_followups", 0)) + 1
+        elif action == "explain_solution":
+            discovery_state = dict(discovery_state or {})
+            discovery_state["solution_explained"] = True
+            session["discovery_state"] = discovery_state
+        if action == "offer_consultation" and "консультац" in phase_answer.lower():
+            session["consultation_offered"] = True
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",phase_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=phase_answer)
     stage_answer = consultation_stage_answer(text, history)
     if stage_answer:
         if "консультац" in stage_answer.lower():
