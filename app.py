@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.0.3-state-bound-to-dialog"
+APP_VERSION = "v10.1-direct-stage-transitions"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -459,6 +459,13 @@ def explicit_solution_interest(text):
         text.lower().strip(),
     ))
 
+def is_substantive_identity_answer(text):
+    """Recognize a direct answer to the profile's opening question without AI judgment."""
+    low = str(text or "").lower().strip()
+    if "?" in low or re.search(r"(не понял|не понимаю|в смысле|зачем|не хочу отвечать|не буду отвечать|неважно|не имеет значения|не так.{0,20}вопрос)", low):
+        return False
+    return len(normalized_text(low).split()) >= 4
+
 def assess_discovery(history, text, profile):
     stages = profile.get("discovery_stages")
     if not stages:
@@ -499,6 +506,12 @@ def assess_discovery(history, text, profile):
         evidence = item.get("evidence", "") if isinstance(item, dict) else ""
         if item.get("complete") is True and evidence_is_grounded(stage_types.get(key, key), evidence, client_text, text, history):
             state[key] = True
+    # The first marketer prompt explicitly asks for the client's occupation and
+    # audience. A substantive direct answer closes that stage even if the model
+    # fails to copy an exact evidence quote.
+    first_stage = next(iter(stages), None)
+    if not history and first_stage and stage_types.get(first_stage) == "identity" and is_substantive_identity_answer(text):
+        state[first_stage] = True
     state["solution_explained"] = bool(previous.get("solution_explained"))
     state["solution_interest"] = bool(previous.get("solution_interest")) or (
         state["solution_explained"] and explicit_solution_interest(text)
@@ -566,6 +579,8 @@ def phase_reply_issues(answer, action, history):
         question = answer.rsplit("?", 1)[0] if "?" in answer else answer
         if " или " in question.lower():
             issues.append("варианты ответа внутри вопроса")
+        if re.search(r"(какие|какого рода).{0,25}(сложност|проблем|трудност).{0,50}(при|с|из-за)", low):
+            issues.append("проблема выведена из профессии или аудитории клиента")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
     opening = normalized_opening(answer)
