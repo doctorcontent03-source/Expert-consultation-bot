@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.5-respect-any-sales-refusal"
+APP_VERSION = "v10.6-no-deliverable-interrogation"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -469,16 +469,24 @@ def evidence_is_grounded(stage_type, evidence, client_text, text, history):
 def explicit_solution_interest(text):
     return bool(re.search(
         r"(^|\b)(да|интересно|хочу(?:\s+(увидеть|посмотреть|попробовать|узнать))?|"
-        r"покажите|давайте посмотрим|подходит|мне подходит|можно)(\b|[.!])",
+        r"покажите|давайте посмотрим|подходит|мне подходит|можно|"
+        r"может.{0,20}(помог|подош|сработ|пригод))(\b|[.!])",
         text.lower().strip(),
-    ))
+    )) or bool(re.search(r"может.{0,25}(помог|подош|сработ|пригод)", text.lower()))
 
 def consultation_refusal(text):
     low = str(text or "").lower().strip()
     return bool(re.search(
         r"\b(нет[, ]+спасибо|не хочу|не интересно|не надо|не буду|отказываюсь|"
-        r"я уже (сказал|сказала).{0,12}нет|не записывайте|не настаивайте)\b",
+        r"я уже (сказал|сказала).{0,12}нет|не записывайте|не настаивайте|"
+        r"да ну вас|оставьте меня|хватит)\b",
         low,
+    ))
+
+def sales_hesitation(text):
+    return bool(re.fullmatch(
+        r"\s*(ну\s+)?(не знаю|не уверен|не уверена|надо подумать|я подумаю|может быть)[.!\s]*",
+        str(text or "").lower(),
     ))
 
 def consultation_offer_active():
@@ -644,6 +652,14 @@ def phase_reply_issues(answer, action, history):
             issues.append("проблема выведена из профессии или аудитории клиента")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
+    if action in {"explain_solution", "handle_solution_interest", "offer_consultation"} and re.search(
+        r"(поделитесь|пришлите|покажите|приведите).{0,60}(пример|задани|тем|материал|документ)|"
+        r"(какие|какими|с какими).{0,50}(задани|тем|материал|документ)",
+        low,
+    ):
+        issues.append("бот запрашивает материалы для выполнения работы эксперта")
+    if action == "offer_consultation" and not re.search(r"(консультац|встреч|созвон|телемост|запис)", low):
+        issues.append("вместо предложения встречи бот выполняет другую задачу")
     if action == "answer_information" and re.search(r"(хотите.{0,40}(запис|встреч|консультац)|давайте.{0,30}(запиш|встретим)|записаться)", low):
         issues.append("вместо ответа бот снова предлагает консультацию")
     if re.search(r"(прямо (здесь|сейчас)|здесь и сейчас|давайте начн[её]м|запущу|попробуем на практике|покажу.{0,40}(материал|задани|пример))", low):
@@ -1210,9 +1226,18 @@ def chat():
     if accepted_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",accepted_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=accepted_answer)
+    if sales_hesitation(text) and last_assistant_asked_sales_interest(history):
+        session["sales_paused"] = True
+        session["sales_paused_sid"] = sid
+        paused_answer = "Конечно, решать прямо сейчас не обязательно. Можно спокойно подумать."
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",paused_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=paused_answer)
+    strong_stop = bool(re.search(r"\b(да ну вас|оставьте меня|хватит|не настаивайте)\b", text.lower()))
     refusal_in_context = consultation_refusal(text) and (
         (consultation_offer_active() and last_assistant_offered_consultation(history))
         or last_assistant_asked_sales_interest(history)
+        or (session.get("sales_paused") and session.get("sales_paused_sid") == sid)
+        or strong_stop
     )
     if refusal_in_context:
         session["sales_declined"] = True
