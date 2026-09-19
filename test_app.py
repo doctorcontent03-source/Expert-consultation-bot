@@ -412,6 +412,37 @@ class TestBot(unittest.TestCase):
         self.assertIn("свободно", chosen.json["answer"])
         self.assertIn("имя, телефон и email", chosen.json["answer"])
 
+    def test_home_restores_history_without_erasing_intro(self):
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn("fetch('/api/history')", page)
+        self.assertIn("(data.messages||[]).forEach", page)
+        self.assertNotIn("chat.innerHTML=''", page)
+        self.assertIn("[[BOOK_FREE]]", page)
+
+    def test_reset_clears_dialog_state_and_messages(self):
+        con = target.db()
+        con.execute(
+            "insert into messages(session_id,role,content,created_at) values(?,?,?,?)",
+            ("old-dialog", "user", "Старое сообщение", 1),
+        )
+        con.commit()
+        with self.client.session_transaction() as session:
+            session["expert_slug"] = "marketer"
+            session["sid"] = "old-dialog"
+            session["discovery_state"] = {"identity": True, "task": True}
+            session["consultation_offered"] = True
+        response = self.client.post("/api/reset")
+        self.assertEqual(response.status_code, 200)
+        with self.client.session_transaction() as session:
+            self.assertEqual(session.get("expert_slug"), "marketer")
+            self.assertNotIn("sid", session)
+            self.assertNotIn("discovery_state", session)
+            self.assertNotIn("consultation_offered", session)
+        self.assertEqual(
+            con.execute("select count(*) from messages where session_id=?", ("old-dialog",)).fetchone()[0],
+            0,
+        )
+
     def test_upload_and_chat(self):
         headers = {"X-Admin-Password": "admin123"}
         uploaded = self.client.post(
