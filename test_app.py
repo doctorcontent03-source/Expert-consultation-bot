@@ -81,8 +81,9 @@ class TestBot(unittest.TestCase):
             target.session["expert_slug"] = "marketer"
             target.session["consultation_offered"] = True
             answer = target.accepted_consultation_answer("Хочу")
-        self.assertIn("[[BOOK_FREE]]", answer)
-        self.assertNotIn("[[BOOK_REGULAR]]", answer)
+            self.assertIn("дату и время", answer)
+            self.assertNotIn("[[BOOK_", answer)
+            self.assertEqual(target.session.get("requested_booking_type"), "free")
 
     def test_discovery_guard_blocks_early_offer(self):
         state = {key: False for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
@@ -387,6 +388,30 @@ class TestBot(unittest.TestCase):
     def test_shared_quality_filter_detects_cliches(self):
         issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
         self.assertIn("шаблонная или канцелярская формулировка", issues)
+
+    def test_shared_quality_filter_rejects_team_voice_and_invented_specialization(self):
+        issues = target.quality_issues(
+            "Мы можем показать генератор, специально разработанный для преподавателей английского."
+        )
+        self.assertIn("эксперт говорит от имени команды, а не от первого лица", issues)
+        self.assertIn("придумана неподтверждённая специализация продукта", issues)
+
+    def test_safe_reply_acknowledges_specific_client_difficulty(self):
+        answer = target.safe_phase_reply(
+            "explain_solution",
+            target.EXPERT_PROFILES["marketer"],
+            "Пробовала, но всё равно многое приходится переделывать вручную.",
+        )
+        self.assertIn("переделывать вручную", answer)
+        self.assertIn("экономия времени", answer)
+
+    def test_when_can_i_book_stays_in_chat_without_form(self):
+        with target.app.test_request_context("/"):
+            target.session["expert_slug"] = "marketer"
+            answer = target.direct_booking_answer("И когда можно?")
+            self.assertIn("Назовите удобные дату и время", answer)
+            self.assertNotIn("[[BOOK_", answer)
+            self.assertNotIn("форм", answer.lower())
 
     def test_shared_quality_filter_keeps_one_question(self):
         answer = target.keep_one_question("Как сейчас устроена работа? Используете ли вы нейросети? Расскажите подробнее.")
