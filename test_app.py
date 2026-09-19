@@ -204,6 +204,33 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
 
+    def test_phase_validation_rejects_closed_problem_hypothesis(self):
+        issues = target.phase_reply_issues(
+            "Вам сложно подобрать подходящий способ работы с разными клиентами?",
+            "explore_task",
+            [],
+        )
+        self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
+
+    def test_safe_fallback_for_task_does_not_assume_ai_usage(self):
+        answer = target.safe_phase_reply("explore_task")
+        self.assertNotIn("нейросет", answer.lower())
+        self.assertNotIn("вы уже", answer.lower())
+        self.assertEqual(answer.count("?"), 1)
+
+    def test_invalid_last_generation_cannot_reach_dialog(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        class AlwaysInvalid:
+            def reply(self, messages):
+                return "Здорово, что вы уже используете нейросети?"
+        old = target.gigachat
+        target.gigachat = AlwaysInvalid()
+        try:
+            answer = target.generate_phase_reply([], "Я репетитор", "", profile, "explore_task")
+        finally:
+            target.gigachat = old
+        self.assertEqual(answer, target.safe_phase_reply("explore_task"))
+
     def test_semantic_review_allows_only_interest_question_after_solution(self):
         valid = target.phase_review_issues({
             "question_purpose": "check_solution_interest",
