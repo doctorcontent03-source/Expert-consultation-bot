@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v11.4-deterministic-final-gate"
+APP_VERSION = "v11.5-grounded-open-dialog"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -62,7 +62,7 @@ EXPERT_PROFILES = {
         "lead_duration": 60,
         "lead_duration_text": "30–60 минут",
         "regular_enabled": False,
-        "profile_context": """Эксперт — Екатерина Алексеева, контент-маркетолог и специалист по нейросетям. Она создаёт для экспертов и бизнеса ИИ-ассистентов, чат-ботов и приложения: готовые решения и решения под заказ. Бесплатная онлайн-консультация занимает от 30 до 60 минут и проходит через Телемост. На встрече: знакомство, выявление опыта использования нейросетей, диагностика текущей потребности, демонстрация подходящего продукта и предложение готового ИИ-решения или разработки под заказ. Для календаря резервируется 60 минут.""",
+        "profile_context": """Эксперт — Екатерина Алексеева, контент-маркетолог и специалист по нейросетям. Она создаёт для экспертов и бизнеса ИИ-ассистентов, чат-ботов и приложения: готовые решения и решения под заказ. Для задач разработки необычных или индивидуальных учебных курсов доступны два направления: готовый ассистент по созданию нестандартных курсов или услуга разработки персонального ассистента под задачу клиента. Нет сведений о готовых методичках и пособиях для геймеров, ассистенте по разработке игр или функции анализа популярных игр; такие предложения делать нельзя. Бесплатная онлайн-консультация занимает от 30 до 60 минут и проходит через Телемост. На встрече: знакомство, выявление опыта использования нейросетей, диагностика текущей потребности, демонстрация подходящего продукта и предложение готового ИИ-решения или разработки под заказ. Для календаря резервируется 60 минут.""",
         "strategy_rules": """СТРАТЕГИЯ ДИАГНОСТИЧЕСКОЙ ПРОДАЖИ ДЛЯ ХОЛОДНОГО КЛИЕНТА.
 Не ведите человека к записи, пока потребность в ИИ-решении ещё не сформирована.
 За 2–3 содержательных вопроса выясните: кто клиент и с кем работает; с какой конкретной задачей пришёл; пробовал ли решать её с помощью нейросетей и что не получилось. Из одного развёрнутого ответа извлекайте сразу все содержащиеся в нём сведения. Не растягивайте диагностику ради прохождения формального списка и не задавайте вопрос повторно, если ответ уже дан.
@@ -446,7 +446,7 @@ def evidence_is_grounded(stage_type, evidence, client_text, text, history):
     if stage_type == "need":
         return bool(re.search(
             r"(хочу|хотел|хотелось|нужно|надо|сложн|трудн|не получ|не уме|не знаю|"
-            r"меша|проблем|плохо|долго|времени|приходится|не устраива|изменить|"
+            r"меша|проблем|беда|плохо|долго|времени|приходится|не устраива|не подход|изменить|"
             r"улучшить|упростить|ускорить|сократить)", client_text.lower()
         ))
     if stage_type == "prior_attempts":
@@ -499,10 +499,11 @@ def classify_client_move(history, text):
 Верните только JSON:
 {{"intent":"other","subject":"other","confidence":"high"}}
 
-intent — одно из: information_question, interest, hesitation, refusal, booking_request, other.
+intent — одно из: information_question, confusion, interest, hesitation, refusal, booking_request, other.
 subject — одно из: solution, consultation, booking, other.
 
 information_question: клиент просит объяснить факт, формат, платформу, тип или принцип работы.
+confusion: клиент сообщает, что не понял предыдущий ответ, и ожидает более ясного объяснения.
 interest: клиент положительно или осторожно-положительно оценивает предложенное решение или следующий шаг.
 hesitation: клиент не отказывается, но пока не готов решить.
 refusal: клиент отвергает предложенное решение, демонстрацию, встречу или просит прекратить обсуждение.
@@ -517,7 +518,7 @@ booking_request: клиент хочет выбрать или проверит�
     except Exception:
         app.logger.exception("Client move classification failed")
         parsed = None
-    allowed_intents = {"information_question", "interest", "hesitation", "refusal", "booking_request", "other"}
+    allowed_intents = {"information_question", "confusion", "interest", "hesitation", "refusal", "booking_request", "other"}
     allowed_subjects = {"solution", "consultation", "booking", "other"}
     if isinstance(parsed, dict) and parsed.get("intent") in allowed_intents:
         return {
@@ -525,6 +526,8 @@ booking_request: клиент хочет выбрать или проверит�
             "subject": parsed.get("subject") if parsed.get("subject") in allowed_subjects else "other",
         }
     # Safety fallback only when semantic classification is unavailable.
+    if re.search(r"(не понял(?:а)?|не понимаю|ничего не понял(?:а)?|что это значит|перефразируйте)", text.lower()):
+        return {"intent": "confusion", "subject": "other"}
     if is_informational_question(text):
         return {"intent": "information_question", "subject": "solution"}
     if consultation_refusal(text):
@@ -556,7 +559,7 @@ def last_assistant_asked_sales_interest(history):
     low = last.lower()
     asks_interest = bool(re.search(r"(хотите|интересно|готовы|согласны|как вам.{0,15}идея|давайте.{0,20}(посмотр|попроб))", low))
     sales_subject = bool(re.search(r"(решени|ассистент|помощник|продукт|демонстрац|показать|консультац|встреч|запис)", low))
-    return asks_interest and sales_subject
+    return "?" in last and asks_interest and sales_subject
 
 def solution_was_explained(answer, profile):
     if profile.get("solution_mode") == "expert_service":
@@ -663,7 +666,7 @@ def discovery_action(state, profile, text, client_move=None):
     """Choose the next conversational job; wording remains the model's job."""
     if state is None:
         return None
-    if (isinstance(client_move, dict) and client_move.get("intent") == "information_question") or is_informational_question(text):
+    if (isinstance(client_move, dict) and client_move.get("intent") in {"information_question", "confusion"}) or is_informational_question(text):
         return "answer_information"
     if re.search(r"(не понял(?:а)?|не понимаю|в смысле|что вы имеете в виду|вы издеваетесь|какое отношение|странн(?:ый|ая|ое).{0,20}(вопрос|бесед))", text.lower()):
         stage_keys = tuple(profile.get("discovery_stages", {}))
@@ -697,6 +700,10 @@ def phase_reply_issues(answer, action, history):
             issues.append("варианты ответа внутри вопроса")
         if re.search(r"(какие|какого рода).{0,25}(сложност|проблем|трудност).{0,50}(при|с|из-за)", low):
             issues.append("проблема выведена из профессии или аудитории клиента")
+        if not re.search(r"\b(что|какая|какие|какой|где|с чем|из-за чего|почему)\b", low):
+            issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
+        if re.search(r"(вам приходится|вы сталкиваетесь|вам важно|выходит,? вам|значит,? вам)", low):
+            issues.append("закрытый или наводящий вопрос вместо открытого выяснения задачи")
     if action in {"explain_solution", "handle_solution_interest"} and re.search(r"(запис|консультац|встреч)", low):
         issues.append("преждевременное приглашение на консультацию")
     if action in {"explain_solution", "handle_solution_interest", "offer_consultation"} and re.search(
@@ -873,6 +880,15 @@ def generate_phase_reply(history, text, context, profile, action):
             app.logger.exception("Strict phase reply retry failed")
     deterministic_issues = list(dict.fromkeys(phase_reply_issues(answer, action, history)))
     blocking = blocking_reply_issues(deterministic_issues)
+    semantic_final = semantic_phase_issues(answer, action, task, transcript, text, context)
+    factual_safety_issues = {
+        "бот начинает выполнять работу живого эксперта",
+        "бот собирает данные для создания результата вместо продажи решения",
+        "бот выдаёт возможное направление решения за существующий продукт",
+        "бот обещает неподтверждённый результат",
+    }
+    blocking.extend(issue for issue in semantic_final if issue in factual_safety_issues)
+    blocking = list(dict.fromkeys(blocking))
     if blocking:
         app.logger.warning("Rejected final phase reply for %s: %s", action, blocking)
         return None
