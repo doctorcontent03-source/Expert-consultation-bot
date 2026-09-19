@@ -147,6 +147,37 @@ class TestBot(unittest.TestCase):
         self.assertTrue(parsed["identity"])
         self.assertFalse(parsed["goal"])
 
+    def test_phase_controller_stops_diagnosis_after_two_followups(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        state = dict(identity=True, task=True, ai_experience=False, solution_explained=False, solution_interest=False)
+        with target.app.test_request_context("/"):
+            target.session["discovery_followups"] = 2
+            self.assertEqual(target.discovery_action(state, profile, "Нейросеть всё время теряет логику курса"), "explain_solution")
+
+    def test_phase_controller_explains_solution_when_discovery_complete(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        state = dict(identity=True, task=True, ai_experience=True, solution_explained=False, solution_interest=False)
+        with target.app.test_request_context("/"):
+            self.assertEqual(target.discovery_action(state, profile, "Не знаю, можно ли это исправить"), "explain_solution")
+
+    def test_phase_validation_detects_repeated_opening_and_more_diagnosis(self):
+        history = [{"role": "assistant", "content": "Похоже, здесь теряется логика курса."}]
+        issues = target.phase_reply_issues(
+            "Похоже, здесь мало контекста. Расскажите подробнее, что именно не получилось?",
+            "explain_solution",
+            history,
+        )
+        self.assertIn("повтор того же начала реплики", issues)
+        self.assertIn("продолжение диагностики после собранной информации", issues)
+
+    def test_phase_validation_blocks_consulting_in_chat(self):
+        issues = target.phase_reply_issues(
+            "Давайте вместе составим структуру курса и подберём темы?",
+            "explain_solution",
+            [],
+        )
+        self.assertIn("попытка консультировать клиента внутри чата вместо выявления потребности", issues)
+
     def test_shared_quality_filter_detects_cliches(self):
         issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
         self.assertIn("шаблонная или канцелярская формулировка", issues)
