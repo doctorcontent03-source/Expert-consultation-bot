@@ -178,6 +178,24 @@ class TestBot(unittest.TestCase):
         self.assertFalse(state["solution_explained"])
         self.assertFalse(state["solution_interest"])
 
+    def test_generation_failure_cannot_escape_state_machine(self):
+        class BreakAfterAssessment:
+            def reply(self, messages):
+                if "Извлеките из собственных слов клиента" in messages[0]["content"]:
+                    return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор английского"},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
+                raise RuntimeError("generation unavailable")
+        old = target.gigachat
+        target.gigachat = BreakAfterAssessment()
+        try:
+            with self.client.session_transaction() as session:
+                session["expert_slug"] = "marketer"
+            response = self.client.post("/api/chat", json={"message":"Я репетитор английского, работаю с детьми и взрослыми"})
+        finally:
+            target.gigachat = old
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("консультац", response.json["answer"].lower())
+        self.assertEqual(response.json["answer"], target.safe_phase_reply("explore_task", target.EXPERT_PROFILES["marketer"]))
+
     def test_state_machine_accepts_need_only_from_client_words(self):
         profile = target.EXPERT_PROFILES["marketer"]
         class Extractor:
