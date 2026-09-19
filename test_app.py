@@ -326,6 +326,7 @@ class TestBot(unittest.TestCase):
 
     def test_question_does_not_cancel_explicit_solution_interest(self):
         self.assertTrue(target.explicit_solution_interest("Хочу. Вы имеете в виду какое решение?"))
+        self.assertTrue(target.explicit_solution_interest("Ясно. Ну, может, это и помогло бы."))
 
     def test_generic_solution_does_not_close_explanation_stage(self):
         profile = target.EXPERT_PROFILES["marketer"]
@@ -444,6 +445,15 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("бот пытается провести демонстрацию или работу эксперта внутри чата", issues)
 
+    def test_sales_phase_cannot_request_client_deliverables(self):
+        issues = target.phase_reply_issues(
+            "Поделитесь типичными примерами заданий или тем, которые приходится готовить.",
+            "offer_consultation",
+            [],
+        )
+        self.assertIn("бот запрашивает материалы для выполнения работы эксперта", issues)
+        self.assertIn("вместо предложения встречи бот выполняет другую задачу", issues)
+
     def test_refusal_stops_consultation_pressure(self):
         con = target.db()
         con.execute(
@@ -477,6 +487,24 @@ class TestBot(unittest.TestCase):
         second = self.client.post("/api/chat", json={"message": "Я уже сказала, что нет."})
         self.assertEqual(second.json["answer"], "Хорошо, не буду возвращаться к этому предложению.")
         self.assertNotIn("решени", second.json["answer"].lower())
+
+    def test_hesitation_after_offer_pauses_instead_of_repeating_offer(self):
+        con = target.db()
+        con.execute(
+            "insert into messages(session_id,role,content,created_at) values(?,?,?,?)",
+            ("hesitation-dialog", "assistant", "Могу показать это на бесплатной консультации. Хотите записаться?", 1),
+        )
+        con.commit()
+        with self.client.session_transaction() as session:
+            session["expert_slug"] = "marketer"
+            session["sid"] = "hesitation-dialog"
+            session["consultation_offered"] = True
+            session["consultation_offered_sid"] = "hesitation-dialog"
+        answer = self.client.post("/api/chat", json={"message": "Ну не знаю"}).json["answer"]
+        self.assertIn("решать прямо сейчас не обязательно", answer)
+        self.assertNotIn("Хотите записаться", answer)
+        refusal = self.client.post("/api/chat", json={"message": "Теперь точно нет, спасибо."}).json["answer"]
+        self.assertEqual(refusal, "Хорошо, не буду настаивать.")
 
     def test_not_interesting_inside_problem_description_is_not_refusal(self):
         history = [{
