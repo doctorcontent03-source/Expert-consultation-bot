@@ -322,6 +322,7 @@ class TestBot(unittest.TestCase):
         self.assertTrue(target.is_informational_question("А как он работает?"))
         self.assertTrue(target.is_informational_question("Хочу. Вы имеете в виду какое решение?"))
         self.assertTrue(target.is_informational_question("Ассистента, приложение или чат-бота?"))
+        self.assertTrue(target.is_informational_question("Я понимаю, это в ChatGPT?"))
 
     def test_question_does_not_cancel_explicit_solution_interest(self):
         self.assertTrue(target.explicit_solution_interest("Хочу. Вы имеете в виду какое решение?"))
@@ -345,6 +346,15 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("ИИ-ассистента", answer)
         self.assertIn("приложение", answer)
+        self.assertNotIn("Хотите", answer)
+
+    def test_safe_information_reply_answers_platform_question(self):
+        answer = target.safe_phase_reply(
+            "answer_information",
+            target.EXPERT_PROFILES["marketer"],
+            "Я понимаю, это в ChatGPT?",
+        )
+        self.assertIn("Не обязательно в ChatGPT", answer)
         self.assertNotIn("Хотите", answer)
 
     def test_quality_filter_detects_result_promises(self):
@@ -451,6 +461,22 @@ class TestBot(unittest.TestCase):
         second = self.client.post("/api/chat", json={"message": "Я уже сказала, нет."})
         self.assertNotIn("консультац", second.json["answer"].lower())
         self.assertNotIn("встреч", second.json["answer"].lower())
+
+    def test_refusal_after_solution_interest_question_stops_sales_path(self):
+        con = target.db()
+        con.execute(
+            "insert into messages(session_id,role,content,created_at) values(?,?,?,?)",
+            ("solution-refusal", "assistant", "Хотите посмотреть, как такой помощник может работать в вашей ситуации?", 1),
+        )
+        con.commit()
+        with self.client.session_transaction() as session:
+            session["expert_slug"] = "marketer"
+            session["sid"] = "solution-refusal"
+        first = self.client.post("/api/chat", json={"message": "Нет, спасибо."})
+        self.assertEqual(first.json["answer"], "Хорошо, не буду настаивать.")
+        second = self.client.post("/api/chat", json={"message": "Я уже сказала, что нет."})
+        self.assertEqual(second.json["answer"], "Хорошо, не буду возвращаться к этому предложению.")
+        self.assertNotIn("решени", second.json["answer"].lower())
 
     def test_not_interesting_inside_problem_description_is_not_refusal(self):
         history = [{
