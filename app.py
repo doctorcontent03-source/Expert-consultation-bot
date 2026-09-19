@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.1-direct-stage-transitions"
+APP_VERSION = "v10.2-deterministic-discovery"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -466,6 +466,12 @@ def is_substantive_identity_answer(text):
         return False
     return len(normalized_text(low).split()) >= 4
 
+def has_direct_stage_evidence(stage_type, text, client_text, history):
+    """Close objective discovery stages from the client's words, not model judgment."""
+    if stage_type not in {"need", "prior_attempts"}:
+        return False
+    return evidence_is_grounded(stage_type, text, client_text, text, history)
+
 def assess_discovery(history, text, profile):
     stages = profile.get("discovery_stages")
     if not stages:
@@ -505,6 +511,8 @@ def assess_discovery(history, text, profile):
         item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
         evidence = item.get("evidence", "") if isinstance(item, dict) else ""
         if item.get("complete") is True and evidence_is_grounded(stage_types.get(key, key), evidence, client_text, text, history):
+            state[key] = True
+        if not state[key] and has_direct_stage_evidence(stage_types.get(key, key), text, client_text, history):
             state[key] = True
     # The first marketer prompt explicitly asks for the client's occupation and
     # audience. A substantive direct answer closes that stage even if the model
