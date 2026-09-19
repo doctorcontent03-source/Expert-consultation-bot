@@ -316,6 +316,32 @@ class TestBot(unittest.TestCase):
     def test_solution_question_is_recognized_as_informational(self):
         self.assertTrue(target.is_informational_question("Что за помощник?"))
         self.assertTrue(target.is_informational_question("А как он работает?"))
+        self.assertTrue(target.is_informational_question("Хочу. Вы имеете в виду какое решение?"))
+        self.assertTrue(target.is_informational_question("Ассистента, приложение или чат-бота?"))
+
+    def test_question_does_not_cancel_explicit_solution_interest(self):
+        self.assertTrue(target.explicit_solution_interest("Хочу. Вы имеете в виду какое решение?"))
+
+    def test_generic_solution_does_not_close_explanation_stage(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        self.assertFalse(target.solution_was_explained(
+            "Здесь может подойти ИИ-решение, настроенное под ваш рабочий процесс.",
+            profile,
+        ))
+        self.assertTrue(target.solution_was_explained(
+            "Возможное направление — ИИ-помощник для подготовки материалов.",
+            profile,
+        ))
+
+    def test_safe_information_reply_answers_solution_type_question(self):
+        answer = target.safe_phase_reply(
+            "answer_information",
+            target.EXPERT_PROFILES["marketer"],
+            "Вы имеете в виду ассистента, приложение или чат-бота?",
+        )
+        self.assertIn("ИИ-ассистента", answer)
+        self.assertIn("приложение", answer)
+        self.assertNotIn("Хотите", answer)
 
     def test_quality_filter_detects_result_promises(self):
         issues = target.quality_issues("Вы быстро получите качественные материалы и сэкономите время.")
@@ -395,6 +421,24 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("эксперт говорит от имени команды, а не от первого лица", issues)
         self.assertIn("придумана неподтверждённая специализация продукта", issues)
+
+    def test_bot_cannot_start_demo_inside_chat(self):
+        issues = target.phase_reply_issues(
+            "Я запущу помощника прямо здесь и сейчас и покажу пример задания.",
+            "handle_solution_interest",
+            [],
+        )
+        self.assertIn("бот пытается провести демонстрацию или работу эксперта внутри чата", issues)
+
+    def test_refusal_stops_consultation_pressure(self):
+        with self.client.session_transaction() as session:
+            session["expert_slug"] = "marketer"
+            session["consultation_offered"] = True
+        first = self.client.post("/api/chat", json={"message": "Нет, спасибо."})
+        self.assertEqual(first.json["answer"], "Хорошо, не буду настаивать.")
+        second = self.client.post("/api/chat", json={"message": "Я уже сказала, нет."})
+        self.assertNotIn("консультац", second.json["answer"].lower())
+        self.assertNotIn("встреч", second.json["answer"].lower())
 
     def test_safe_reply_acknowledges_specific_client_difficulty(self):
         answer = target.safe_phase_reply(
