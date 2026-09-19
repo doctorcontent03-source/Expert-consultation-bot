@@ -147,12 +147,18 @@ class TestBot(unittest.TestCase):
         self.assertTrue(parsed["identity"])
         self.assertFalse(parsed["goal"])
 
-    def test_phase_controller_stops_diagnosis_after_two_followups(self):
+    def test_phase_controller_never_explains_solution_without_task(self):
         profile = target.EXPERT_PROFILES["marketer"]
         state = dict(identity=True, task=True, ai_experience=False, solution_explained=False, solution_interest=False)
         with target.app.test_request_context("/"):
-            target.session["discovery_followups"] = 2
-            self.assertEqual(target.discovery_action(state, profile, "Нейросеть всё время теряет логику курса"), "explain_solution")
+            self.assertEqual(target.discovery_action(state, profile, "Нейросеть всё время теряет логику курса"), "explore_ai_experience")
+
+    def test_phase_controller_repairs_misunderstood_question(self):
+        profile = target.EXPERT_PROFILES["marketer"]
+        state = dict(identity=True, task=False, ai_experience=False, solution_explained=False, solution_interest=False)
+        with target.app.test_request_context("/"):
+            self.assertEqual(target.discovery_action(state, profile, "Не поняла вопрос"), "repair_task")
+            self.assertEqual(target.discovery_action(state, profile, "Вы издеваетесь? Какое отношение это имеет к вам?"), "repair_task")
 
     def test_phase_controller_explains_solution_when_discovery_complete(self):
         profile = target.EXPERT_PROFILES["marketer"]
