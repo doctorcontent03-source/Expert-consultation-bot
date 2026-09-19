@@ -399,7 +399,25 @@ class TestBot(unittest.TestCase):
             target.gigachat = old
         self.assertEqual(answer, "Что в вашей работе хотелось бы изменить в первую очередь?")
 
-    def test_invalid_last_generation_cannot_reach_dialog(self):
+    def test_structured_discovery_returns_safe_model_wording_instead_of_error(self):
+        class AlwaysClosed:
+            def reply(self, messages):
+                return '{"reaction":"","question":"Вам трудно готовить материалы для разных учеников?"}'
+        old = target.gigachat
+        target.gigachat = AlwaysClosed()
+        try:
+            answer = target.generate_structured_discovery_reply(
+                [],
+                "Я репетитор английского языка.",
+                target.EXPERT_PROFILES["marketer"],
+                "explore_task",
+            )
+        finally:
+            target.gigachat = old
+        self.assertEqual(answer, "Вам трудно готовить материалы для разных учеников?")
+        self.assertNotIn("консультац", answer.lower())
+
+    def test_safe_imperfect_last_generation_reaches_dialog(self):
         profile = target.EXPERT_PROFILES["marketer"]
         class AlwaysInvalid:
             def reply(self, messages):
@@ -410,7 +428,7 @@ class TestBot(unittest.TestCase):
             answer = target.generate_phase_reply([], "Я репетитор", "", profile, "explore_task")
         finally:
             target.gigachat = old
-        self.assertIsNone(answer)
+        self.assertEqual(answer, "Здорово, что вы уже используете нейросети?")
 
     def test_semantic_review_allows_only_interest_question_after_solution(self):
         valid = target.phase_review_issues({
