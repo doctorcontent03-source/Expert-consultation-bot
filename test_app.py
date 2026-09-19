@@ -421,6 +421,27 @@ class TestBot(unittest.TestCase):
         ])
         self.assertEqual(issues, ["догадка о задаче клиента вместо открытого вопроса"])
 
+    def test_semantic_reviewer_cannot_veto_deterministically_valid_reply(self):
+        class WrongReviewer:
+            def reply(self, messages):
+                prompt = messages[0]["content"]
+                if "Определите функцию реплики чат-бота" in prompt:
+                    return '{"question_purpose":"other","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":true,"repeats_answered_question":false,"claims_unverified_product":false,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}'
+                return "Что в вашей работе сейчас отнимает больше всего времени?"
+        old = target.gigachat
+        target.gigachat = WrongReviewer()
+        try:
+            answer = target.generate_phase_reply(
+                [],
+                "Я репетитор английского языка.",
+                "",
+                target.EXPERT_PROFILES["marketer"],
+                "explore_task",
+            )
+        finally:
+            target.gigachat = old
+        self.assertEqual(answer, "Что в вашей работе сейчас отнимает больше всего времени?")
+
     def test_shared_quality_filter_rejects_team_voice_and_invented_specialization(self):
         issues = target.quality_issues(
             "Мы можем показать генератор, специально разработанный для преподавателей английского."
