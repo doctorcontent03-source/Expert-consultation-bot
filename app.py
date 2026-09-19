@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.0.2-history-sync"
+APP_VERSION = "v10.0.3-state-bound-to-dialog"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -463,7 +463,11 @@ def assess_discovery(history, text, profile):
     stages = profile.get("discovery_stages")
     if not stages:
         return None
-    previous = session.get("discovery_state", {})
+    # Discovery flags are meaningful only for the dialog that produced them.
+    # Render can restart with an empty ephemeral database while the browser keeps
+    # its signed session cookie; never carry the old final phase into a new chat.
+    sid = session.get("sid")
+    previous = session.get("discovery_state", {}) if session.get("discovery_sid") == sid and history else {}
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history
@@ -500,6 +504,7 @@ def assess_discovery(history, text, profile):
         state["solution_explained"] and explicit_solution_interest(text)
     )
     session["discovery_state"] = state
+    session["discovery_sid"] = sid
     return state
 
 def discovery_instruction(state, profile):
