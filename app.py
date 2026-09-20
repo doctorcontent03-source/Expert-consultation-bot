@@ -502,47 +502,109 @@ intent_evidence — точная цитата из последнего сооб
 {transcript[-7000:]}
 Клиент: {text}{correction}"""
 
+def plain_reply_from_model(raw):
+    cleaned = str(raw or "").strip()
+    payload = parse_controller_payload(cleaned)
+    if payload:
+        return payload["reply"]
+    fence = chr(96) * 3
+    if cleaned.startswith(fence):
+        cleaned = re.sub(r"^" + re.escape(fence) + r"(?:json)?\s*|\s*" + re.escape(fence) + r"$", "", cleaned, flags=re.I | re.S).strip()
+    return cleaned
+
+def fallback_action_instruction(action):
+    return {
+        "explore": "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации. Не завершайте разговор и не предлагайте встречу.",
+        "explain_solution": "Без вопроса кратко объясните от первого лица, чем встреча с вами может быть полезна в описанной ситуации. Не проводите консультацию в чате и не предлагайте запись.",
+        "check_interest": "Кратко выясните отношение клиента к уже объяснённому направлению помощи. Не предлагайте запись.",
+        "offer_consultation": "Один раз предложите подходящую консультацию от первого лица.",
+        "answer_information": "Прямо ответьте на последний вопрос клиента по базе знаний. Не заменяйте ответ приглашением.",
+        "respect_boundary": "Коротко примите обозначенную клиентом границу. Не задавайте вопрос, не анализируйте и не уговаривайте.",
+        "repair_interpretation": "Коротко признайте неверное понимание и исправьте его по словам клиента. Не задавайте новый диагностический вопрос.",
+        "end_dialog": "Коротко и спокойно попрощайтесь без вопроса, анализа и предложения консультации.",
+    }[action]
+
+def fallback_reply_is_usable(reply, action, state):
+    if not reply or len(re.findall(r"\S+", reply)) > 55 or reply.count("?") > 1:
+        return False
+    low = reply.lower()
+    if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
+        return False
+    if action == "explore":
+        question = question_from_reply(reply)
+        if not question or re.search(r"(запис|консультац|встреч|до встречи|всего доброго|обращайтесь)", low):
+            return False
+        if any(questions_are_similar(question, old) for old in state["asked_questions"]):
+            return False
+    if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"} and "?" in reply:
+        return False
+    if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
+        return False
+    return True
+
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
-    models = [
-        os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat",
-        os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max",
-    ]
-    last_error = None
-    retry_issues = None
-    for model in models:
-        prompt = controller_prompt(original_state, context, history, text, retry_issues)
-        try:
-            payload = parse_controller_payload(gigachat.reply([{"role": "system", "content": prompt}], model=model))
-        except Exception as exc:
-            last_error = exc
-            retry_issues = ["модель не вернула ответ"]
-            app.logger.exception("Dialog generation failed with model %s", model)
-            continue
+    primary_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
+    fallback_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
+    primary_issues = []
+    primary_error = None
+    state = dict(original_state)
+    expected = expected_dialog_action(state, "continue", "", text)
+    try:
+        raw = gigachat.reply([{"role": "system", "content": controller_prompt(original_state, context, history, text)}], model=primary_model)
+        payload = parse_controller_payload(raw)
         if payload is None:
-            retry_issues = ["ответ не соответствует JSON-схеме"]
-            continue
-        state = apply_grounded_observations(original_state, payload["observations"], text)
-        expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text)
-        issues = controller_reply_issues(payload, expected, original_state)
-        if issues:
-            retry_issues = issues
-            app.logger.warning("Dialog reply rejected from %s: %s", model, issues)
-            continue
-        if payload["action"] == "explore":
-            state["diagnostic_questions"] = min(3, state["diagnostic_questions"] + 1)
-            question = question_from_reply(payload["reply"])
-            if question:
-                state["asked_questions"] = (state["asked_questions"] + [question])[-3:]
-        elif payload["action"] == "explain_solution":
-            state["solution_explained"] = True
-        elif payload["action"] == "offer_consultation":
-            state["interest_confirmed"] = True
-            state["consultation_offered"] = True
-        return payload["reply"], payload["action"], state
-    if last_error and retry_issues == ["модель не вернула ответ"]:
-        raise last_error
-    raise RuntimeError("Обе модели не смогли создать ответ, соответствующий состоянию диалога")
+            primary_issues = ["ответ не соответствует JSON-схеме"]
+        else:
+            state = apply_grounded_observations(original_state, payload["observations"], text)
+            expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text)
+            payload["action"] = expected
+            primary_issues = controller_reply_issues(payload, expected, original_state)
+            if not primary_issues:
+                return payload["reply"], expected, advance_dialog_state(state, expected, payload["reply"])
+    except Exception as exc:
+        primary_error = exc
+        primary_issues = ["основная модель не вернула ответ"]
+        app.logger.exception("Primary dialog generation failed")
+
+    fallback_prompt = SYSTEM_RULES + f"""
+
+Создайте только следующую реплику эксперта, без JSON, пояснений и служебных комментариев.
+Назначенная функция реплики: {fallback_action_instruction(expected)}
+Учитывайте весь разговор. Не повторяйте уже заданный вопрос. Максимум 45 слов и один вопрос.
+
+БАЗА ЗНАНИЙ:
+{context[-10000:]}
+
+ДИАЛОГ:
+{chr(10).join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])[-7000:]}
+Клиент: {text}
+
+Первая попытка была отклонена: {"; ".join(primary_issues)}."""
+    try:
+        fallback_reply = plain_reply_from_model(gigachat.reply([{"role": "system", "content": fallback_prompt}], model=fallback_model))
+    except Exception:
+        app.logger.exception("Fallback dialog generation failed")
+        if primary_error:
+            raise primary_error
+        raise
+    if not fallback_reply_is_usable(fallback_reply, expected, original_state):
+        raise RuntimeError("Резервная модель не смогла создать допустимую реплику")
+    return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
+
+def advance_dialog_state(state, action, reply):
+    updated = dict(state)
+    if action == "explore":
+        question = question_from_reply(reply)
+        if question:
+            updated["diagnostic_questions"] = min(3, updated["diagnostic_questions"] + 1)
+            updated["asked_questions"] = (updated["asked_questions"] + [question])[-3:]
+    elif action == "explain_solution":
+        updated["solution_explained"] = True
+    elif action == "offer_consultation":
+        updated["interest_confirmed"] = True
+        updated["consultation_offered"] = True
+    return updated
 
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
@@ -746,7 +808,7 @@ def chat():
         answer, action, dialog_state = generate_stateful_dialog_reply(history, text, context)
     except Exception as exc:
         app.logger.exception("Stateful dialog generation failed")
-        return jsonify(error=f"GigaChat недоступен: {exc}"), 502
+        return jsonify(error="Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."), 502
     session["dialog_controller_state"] = dialog_state
     if action == "end_dialog":
         session["dialog_closed"] = True
