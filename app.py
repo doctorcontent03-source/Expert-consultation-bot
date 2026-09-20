@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.6-role-and-answer-review"
+APP_VERSION = "v9.7-single-boundary-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -311,7 +311,6 @@ def assess_psychologist_stages(history, text):
     control_schema = {
         "stages": schema,
         "sufficient_information": {"complete": False, "evidence": ""},
-        "declines_more_questions": {"complete": False, "evidence": ""},
     }
     prompt = f"""Проверьте состояние первичного диалога по собственным словам клиента.
 Верните только JSON: {json.dumps(control_schema, ensure_ascii=False)}
@@ -325,7 +324,7 @@ def assess_psychologist_stages(history, text):
 - один развёрнутый ответ может закрыть несколько этапов;
 - evidence — точная непрерывная цитата клиента;
 - sufficient_information=true, если уже понятно, с чем пришёл клиент, в чём его проблема и как она влияет на жизнь, а оставшиеся детали не нужны для связи запроса с услугой психолога;
-- declines_more_questions=true, если клиент прямо не хочет продолжать расспросы или углубляться;
+- эта проверка оценивает только содержание запроса и никогда не определяет желание клиента завершить разговор;
 - не используйте слова эксперта и не додумывайте."""
     parsed = None
     for attempt in range(3):
@@ -358,16 +357,11 @@ def assess_psychologist_stages(history, text):
             state["prior_experience"] = True
 
     state["sufficient_information"] = bool(previous.get("sufficient_information"))
-    state["declines_more_questions"] = False
-    if session.pop("forced_dialog_boundary", False):
-        state["declines_more_questions"] = True
+    state["declines_more_questions"] = bool(session.pop("forced_dialog_boundary", False))
     if parsed:
         enough = parsed.get("sufficient_information", {})
-        boundary = parsed.get("declines_more_questions", {})
         if isinstance(enough, dict) and enough.get("complete") is True and grounded_quote(enough.get("evidence"), client_text):
             state["sufficient_information"] = True
-        if isinstance(boundary, dict) and boundary.get("complete") is True and grounded_quote(boundary.get("evidence"), text):
-            state["declines_more_questions"] = True
     if state.get("client_context") and state.get("need") and state.get("prior_experience"):
         state["sufficient_information"] = True
     substantive_turns = sum(
