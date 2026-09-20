@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.7-single-boundary-controller"
+APP_VERSION = "v9.8-no-invalid-fallback"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -584,24 +584,14 @@ def generate_controlled_reply(history, text, context, action, stage):
             first_question = answer.find("?")
             if first_question >= 0:
                 return answer[:first_question + 1].strip()
-    app.logger.warning("Dialog controller could not fully validate reply for %s: %s", action, issues)
-    if not answer:
+    final_prompt = base_prompt + "\n\nЭто последняя проверка. Предыдущие варианты не выполнили функцию реплики: " + ", ".join(issues) + ". Верните только корректную реплику, без объяснений."
+    answer = str(gigachat.reply([{"role": "system", "content": final_prompt}])).strip()
+    final_issues = controller_issues(answer, action)
+    final_issues.extend(semantic_reply_issues(answer, action, text, history))
+    final_issues = list(dict.fromkeys(final_issues))
+    if final_issues:
+        app.logger.warning("Rejected final dialog reply for %s: %s", action, final_issues)
         return None
-    if action == "explore":
-        parts = [
-            part for part in re.split(r"(?<=[.!?])\s+", answer)
-            if not re.search(r"(консультац|запис|до встречи|всего доброго|хорошего дня|обращайтесь)", part.lower())
-        ]
-        cleaned = " ".join(parts).strip()
-        if cleaned and "?" in cleaned:
-            answer = cleaned[:cleaned.find("?") + 1].strip()
-    if len(re.findall(r"\S+", answer)) > 40:
-        shorten_prompt = f"""Сократите реплику до двух естественных предложений и не более 35 слов. Сохраните её текущую функцию и единственный вопрос, если он есть. Не добавляйте новых мыслей. Верните только сокращённую реплику.
-
-Реплика: {answer}"""
-        shortened = str(gigachat.reply([{"role": "system", "content": shorten_prompt}])).strip()
-        if shortened:
-            answer = shortened
     return answer
 
 def yandex_calendar():
