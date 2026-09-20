@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.3-bounded-discovery"
+APP_VERSION = "v9.4-semantic-boundary"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -359,6 +359,8 @@ def assess_psychologist_stages(history, text):
 
     state["sufficient_information"] = bool(previous.get("sufficient_information"))
     state["declines_more_questions"] = False
+    if session.pop("forced_dialog_boundary", False):
+        state["declines_more_questions"] = True
     if parsed:
         enough = parsed.get("sufficient_information", {})
         boundary = parsed.get("declines_more_questions", {})
@@ -407,6 +409,31 @@ def client_asks_information(text):
     except Exception:
         return True
 
+def classify_client_control(history, text):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-6:]
+    )
+    prompt = f"""Определите только намерение клиента относительно продолжения этого диалога.
+Верните JSON: {{"status":"continue|stop_questions|end_conversation","evidence":""}}.
+
+continue — клиент продолжает содержательный разговор.
+stop_questions — клиент не хочет дальнейших расспросов, возмущён повторением или просит не углубляться, но явно не завершает общение.
+end_conversation — клиент прямо прощается, отказывается продолжать именно с этим собеседником или завершает разговор.
+Не путайте описание отсутствия желаний в жизни с отказом от диалога. evidence — точная цитата клиента.
+
+ДИАЛОГ:
+{transcript}
+Клиент: {text}"""
+    for _ in range(3):
+        result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+        if result and result.get("status") in {"continue", "stop_questions", "end_conversation"}:
+            evidence = result.get("evidence", "")
+            if result["status"] == "continue" or grounded_quote(evidence, text):
+                return result["status"]
+        prompt += "\nВерните только корректный JSON без пояснений."
+    return "continue"
+
 def psychologist_action(state, text):
     if client_asks_information(text):
         return "answer_information", None
@@ -430,6 +457,8 @@ def psychologist_action(state, text):
     return "offer_consultation", None
 
 def controller_task(action, stage):
+    if action == "end_dialog":
+        return """Клиент завершает разговор. Коротко и спокойно попрощайтесь. Не задавайте вопросов, не анализируйте причины отказа, не уговаривайте и не предлагайте консультацию."""
     if action == "answer_information":
         return """Сначала ответьте по существу на прямой вопрос клиента, используя только базу знаний и подтверждённые факты. Не заменяйте ответ предложением консультации. Не повторяйте уже данную информацию."""
     if action == "explore":
@@ -456,6 +485,11 @@ def controller_issues(answer, action):
             issues.append("преждевременный переход к консультации")
         if re.search(r"(до встречи|всего доброго|хорошего дня|обращайтесь)", low):
             issues.append("преждевременное завершение")
+    if action == "end_dialog":
+        if "?" in low:
+            issues.append("при завершении задан вопрос")
+        if re.search(r"(консультац|запис|давайте продолж|может быть)", low):
+            issues.append("клиента уговаривают продолжить")
     if action == "respect_boundary" and "?" in low:
         issues.append("после обозначенной границы задан новый вопрос")
     if len(re.findall(r"\S+", answer)) > 40:
@@ -728,6 +762,16 @@ def chat():
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
     try:
+        control_intent = classify_client_control(history, text)
+        if control_intent == "end_conversation":
+            closing_answer = generate_controlled_reply(history, text, context, "end_dialog", None)
+            if not closing_answer:
+                return jsonify(error="GigaChat временно не смог обработать сообщение. Попробуйте ещё раз."), 502
+            session["dialog_closed"] = True
+            con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",closing_answer,int(time.time()*1000))); con.commit()
+            return jsonify(answer=closing_answer, closed=True)
+        if control_intent == "stop_questions":
+            session["forced_dialog_boundary"] = True
         dialog_state = assess_psychologist_stages(history, text)
         action, stage = psychologist_action(dialog_state, text)
         controlled_answer = generate_controlled_reply(history, text, context, action, stage)
