@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v10.0-nonblocking-review"
+APP_VERSION = "v11.0-simplified-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -648,6 +648,104 @@ def generate_controlled_reply(history, text, context, action, stage):
         return final_answer
     return answer or None
 
+def explicit_solution_interest(text):
+    low = text.lower().replace("ё", "е")
+    return bool(re.search(r"\b(да|давайте|хочу|хотела бы|хотел бы|интересно|готова|готов|можно|подойдет|подойдёт|помогло бы)\b", low))
+
+def simple_dialog_action(history, text):
+    if "?" in text:
+        return "answer_information"
+    state = session.get("simple_dialog_state") or {}
+    if state.get("solution_explained"):
+        return "offer_consultation" if explicit_solution_interest(text) else "check_interest"
+    substantive_turns = sum(1 for item in list(history) + [{"role": "user", "content": text}] if item["role"] == "user" and len(item["content"].strip()) >= 20)
+    return "explain_solution" if substantive_turns >= 2 else "explore"
+
+def simple_action_task(action):
+    return {
+        "explore": "Продолжите установление контакта и выявление потребности. Кратко отразите уже сказанное и задайте не более одного открытого вопроса только о действительно недостающей информации. Не предлагайте встречу и не начинайте психологическую консультацию в чате.",
+        "explain_solution": "Информации уже достаточно. Не задавайте новых диагностических вопросов. Кратко свяжите запрос клиента с тем, чем может быть полезна личная встреча с вами как с экспертом. Не проводите саму консультацию в чате и не обещайте результат.",
+        "check_interest": "Вы уже объяснили направление помощи. Ответьте на текущую реплику и естественно выясните, хочет ли клиент продолжить разговор об этом. Не повторяйте прежнее объяснение и не предлагайте запись без выраженного интереса.",
+        "offer_consultation": "Клиент проявил интерес после объяснения направления помощи. Один раз предложите подходящую встречу. Если клиент уже прямо просит записать его или спрашивает о времени, добавьте соответствующий маркер записи из общих правил.",
+        "answer_information": "Сначала прямо и полно ответьте на вопрос клиента, используя только базу знаний и контекст. Не подменяйте ответ приглашением и не повторяйте уже сказанное. Затем мягко вернитесь к ближайшему незавершённому этапу, только если это уместно.",
+    }[action]
+
+def parse_dialog_payload(raw):
+    cleaned = str(raw or "").strip()
+    fence = chr(96) * 3
+    if cleaned.startswith(fence):
+        cleaned = re.sub(r"^" + re.escape(fence) + r"(?:json)?\s*|\s*" + re.escape(fence) + r"$", "", cleaned, flags=re.I | re.S).strip()
+    try:
+        data = json.loads(cleaned)
+    except (TypeError, json.JSONDecodeError):
+        return {"reply": cleaned, "intent": "continue"}
+    reply = str(data.get("reply", "")).strip()
+    intent = str(data.get("intent", "continue")).strip().lower()
+    if intent not in {"continue", "interest", "question", "boundary", "end", "correction"}:
+        intent = "continue"
+    return {"reply": reply, "intent": intent}
+
+def simple_reply_issues(reply, action, intent):
+    issues = []
+    low = reply.lower()
+    if not reply:
+        issues.append("empty")
+    if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
+        issues.append("internal_comment")
+    if reply.count("?") > 1:
+        issues.append("multiple_questions")
+    if action == "explore" and re.search(r"(запис|консультац|встреч)", low):
+        issues.append("premature_offer")
+    if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
+        issues.append("unexpected_booking")
+    if intent in {"boundary", "end"} and re.search(r"(расскаж|поделит|уточн|давайте разбер)", low):
+        issues.append("pressure_after_boundary")
+    return issues
+
+def generate_simple_dialog_reply(history, text, context, action):
+    visible_history = [{"role": x["role"], "content": x["content"]} for x in history]
+    first_client_turn = not any(x["role"] == "user" for x in history)
+    task = simple_action_task(action)
+    system = SYSTEM_RULES + f"""
+
+ТЕКУЩАЯ ФУНКЦИЯ РЕПЛИКИ:
+{task}
+
+Сформулируйте одну короткую естественную реплику от имени эксперта. Учитывайте смысл всего разговора, не копируйте предыдущие ответы и не используйте служебные комментарии.
+Одновременно определите намерение последней реплики клиента: continue — продолжает разговор; interest — проявляет интерес к объяснённому решению или встрече; question — задаёт вопрос; boundary — поправляет собеседника, просит не углубляться или отказывается отвечать на текущий вопрос; end — однозначно завершает весь разговор; correction — исправляет неверное понимание без завершения разговора.
+Обычное описание проблемы, включая слова «ничего не хочу», не является завершением разговора.
+Верните только JSON: {{"reply":"текст ответа","intent":"continue|interest|question|boundary|end|correction"}}.
+
+БАЗА ЗНАНИЙ:
+{context}"""
+    messages = [{"role": "system", "content": system}] + visible_history + [{"role": "user", "content": text}]
+    models = [os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat", os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"]
+    best = None
+    last_error = None
+    for attempt, model in enumerate(models):
+        attempt_messages = list(messages)
+        if attempt:
+            attempt_messages[0] = {"role": "system", "content": system + "\nПредыдущая попытка нарушила структурные ограничения. Сформулируйте новый вариант без повторов, давления и преждевременной записи."}
+        try:
+            parsed = parse_dialog_payload(gigachat.reply(attempt_messages, model=model))
+        except Exception as exc:
+            last_error = exc
+            app.logger.exception("GigaChat dialog attempt failed with model %s", model)
+            continue
+        if first_client_turn and parsed["intent"] == "end":
+            parsed["intent"] = "continue"
+        issues = simple_reply_issues(parsed["reply"], action, parsed["intent"])
+        if parsed["reply"] and best is None:
+            best = parsed
+        if not issues:
+            return parsed
+        app.logger.warning("Dialog reply rejected from %s: %s", model, issues)
+    if best:
+        return best
+    if last_error:
+        raise last_error
+    raise RuntimeError("GigaChat returned an empty response")
+
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
         return DemoCalendar()
@@ -742,8 +840,9 @@ class GigaChat:
         if not r.ok:
             raise RuntimeError(f"OAuth GigaChat: HTTP {r.status_code}; {r.text[:500]}")
         payload=r.json(); self.token=payload["access_token"]; self.expires=payload.get("expires_at",int((time.time()+1500)*1000))/1000; return self.token
-    def reply(self, messages):
-        r=requests.post("https://gigachat.devices.sberbank.ru/api/v1/chat/completions",headers={"Authorization":f"Bearer {self.access_token()}","Content-Type":"application/json"},json={"model":os.getenv("GIGACHAT_MODEL","GigaChat"),"messages":messages,"temperature":0.25,"max_tokens":700},timeout=60,verify=os.getenv("GIGACHAT_VERIFY_SSL","true").lower()=="true")
+    def reply(self, messages, model=None):
+        payload = {"model": model or os.getenv("GIGACHAT_MODEL", "GigaChat"), "messages": messages, "temperature": 0.2, "max_tokens": 700}
+        r=requests.post("https://gigachat.devices.sberbank.ru/api/v1/chat/completions",headers={"Authorization":f"Bearer {self.access_token()}","Content-Type":"application/json"},json=payload,timeout=60,verify=os.getenv("GIGACHAT_VERIFY_SSL","true").lower()=="true")
         r.raise_for_status(); return r.json()["choices"][0]["message"]["content"]
 gigachat=GigaChat()
 
@@ -845,52 +944,25 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
+    action = simple_dialog_action(history, text)
     try:
-        control = classify_client_control(history, text)
-        control_intent = control["status"]
-        if control_intent == "end_conversation":
-            closing_answer = generate_controlled_reply(history, text, context, "end_dialog", None)
-            if not closing_answer:
-                return jsonify(error="GigaChat временно не смог обработать сообщение. Попробуйте ещё раз."), 502
-            session["dialog_closed"] = True
-            con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",closing_answer,int(time.time()*1000))); con.commit()
-            return jsonify(answer=closing_answer, closed=True)
-        if control_intent == "stop_questions":
-            session["forced_dialog_boundary"] = True
-        if control_intent == "correct_interpretation":
-            session["forced_interpretation_correction"] = True
-            if control.get("expresses_solution_interest"):
-                session["forced_solution_interest"] = True
-        dialog_state = assess_psychologist_stages(history, text)
-        action, stage = psychologist_action(dialog_state, text)
-        controlled_answer = generate_controlled_reply(history, text, context, action, stage)
-    except Exception:
-        app.logger.exception("Psychologist dialog controller failed")
-        return jsonify(error="GigaChat временно не смог обработать сообщение. Попробуйте отправить его ещё раз."), 502
-    if not controlled_answer:
-        return jsonify(error="Не удалось сформировать корректный ответ. Попробуйте отправить сообщение ещё раз."), 502
+        generated = generate_simple_dialog_reply(history, text, context, action)
+    except Exception as exc:
+        app.logger.exception("Simplified dialog generation failed")
+        return jsonify(error=f"GigaChat недоступен: {exc}"), 502
+    answer = generated["reply"]
+    observed_intent = generated["intent"]
+    if observed_intent == "end":
+        session["dialog_closed"] = True
+    state = session.get("simple_dialog_state") or {}
     if action == "explain_solution":
-        dialog_state["solution_explained"] = True
-        session["dialog_state"] = dialog_state
+        state["solution_explained"] = True
     if action == "offer_consultation":
+        state["consultation_offered"] = True
         session["consultation_offered"] = True
-    con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",controlled_answer,int(time.time()*1000))); con.commit()
-    return jsonify(answer=controlled_answer)
-    free_title, free_duration = booking_config("free")
-    regular_title, regular_duration = booking_config("regular")
-    booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nБесплатная встреча: {free_title}, {free_duration} минут. Регулярная встреча: {regular_title}, {regular_duration} минут."
-    user_turns = 1 + sum(1 for x in history if x["role"] == "user")
-    stage_rule = "\nНа текущем этапе запрещено предлагать консультацию: информации о ситуации ещё недостаточно." if user_turns < 3 else ""
-    messages=[{"role":"system","content":SYSTEM_RULES+booking_rules+stage_rule+"\n\nБАЗА ЗНАНИЙ:\n"+context}]+[{"role":x["role"],"content":x["content"]} for x in history]+[{"role":"user","content":text}]
-    try: answer=gigachat.reply(messages)
-    except Exception as e: return jsonify(error=f"GigaChat недоступен: {e}"),502
-    unavailable = re.search(r"(календар.{0,40}(не подключ|недоступ)|запис.{0,40}недоступ|не (могу|получается).{0,40}(запис|посмотр|провер)|нет доступ.{0,20}к календар)", answer.lower())
-    if unavailable:
-        answer = "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
-    if "консультац" in answer.lower() and re.search(r"(предлаг|предлож|запис|встреч|хотите)", answer.lower()):
-        session["consultation_offered"] = True
+    session["simple_dialog_state"] = state
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
-    return jsonify(answer=answer)
+    return jsonify(answer=answer, closed=bool(session.get("dialog_closed")))
 
 def check_admin(): return request.headers.get("X-Admin-Password")==ADMIN_PASSWORD
 @app.get("/api/admin")
