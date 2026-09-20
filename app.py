@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.2-sufficiency-boundary"
+APP_VERSION = "v9.3-bounded-discovery"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -368,6 +368,16 @@ def assess_psychologist_stages(history, text):
             state["declines_more_questions"] = True
     if state.get("client_context") and state.get("need") and state.get("prior_experience"):
         state["sufficient_information"] = True
+    substantive_turns = sum(
+        1 for row in history
+        if row["role"] == "user" and len(normalized_words(row["content"]).split()) >= 4
+    )
+    if len(normalized_words(text).split()) >= 4:
+        substantive_turns += 1
+    if substantive_turns >= 2:
+        state["sufficient_information"] = True
+        state["client_context"] = True
+        state["need"] = True
 
     state["solution_explained"] = bool(previous.get("solution_explained"))
     state["solution_interest"] = bool(previous.get("solution_interest"))
@@ -501,18 +511,24 @@ def generate_controlled_reply(history, text, context, action, stage):
             if first_question >= 0:
                 return answer[:first_question + 1].strip()
     app.logger.warning("Dialog controller could not fully validate reply for %s: %s", action, issues)
-    if answer:
-        if action == "explore":
-            parts = [
-                part for part in re.split(r"(?<=[.!?])\s+", answer)
-                if not re.search(r"(консультац|запис|до встречи|всего доброго|хорошего дня|обращайтесь)", part.lower())
-            ]
-            cleaned = " ".join(parts).strip()
-            if cleaned and "?" in cleaned:
-                first_question = cleaned.find("?")
-                return cleaned[:first_question + 1].strip()
-        return answer
-    return None
+    if not answer:
+        return None
+    if action == "explore":
+        parts = [
+            part for part in re.split(r"(?<=[.!?])\s+", answer)
+            if not re.search(r"(консультац|запис|до встречи|всего доброго|хорошего дня|обращайтесь)", part.lower())
+        ]
+        cleaned = " ".join(parts).strip()
+        if cleaned and "?" in cleaned:
+            answer = cleaned[:cleaned.find("?") + 1].strip()
+    if len(re.findall(r"\S+", answer)) > 40:
+        shorten_prompt = f"""Сократите реплику до двух естественных предложений и не более 35 слов. Сохраните её текущую функцию и единственный вопрос, если он есть. Не добавляйте новых мыслей. Верните только сокращённую реплику.
+
+Реплика: {answer}"""
+        shortened = str(gigachat.reply([{"role": "system", "content": shorten_prompt}])).strip()
+        if shortened:
+            answer = shortened
+    return answer
 
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
