@@ -665,6 +665,17 @@ def explicit_end_signal(text):
     )
     return any(re.search(pattern, low) for pattern in patterns)
 
+def explicit_boundary_signal(text):
+    low = " ".join(normalized_words(text))
+    patterns = (
+        r"\bне хочу (?:сейчас )?(?:это )?(?:обсуждать|рассказывать|отвечать)\b",
+        r"\bне буду (?:это )?(?:обсуждать|рассказывать|отвечать)\b",
+        r"\bне (?:задавайте|спрашивайте)\b",
+        r"\bхватит (?:вопросов|спрашивать|расспрашивать)\b",
+        r"\bне хочу углубляться\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
 def controller_state():
     saved = session.get("dialog_controller_state")
     if not isinstance(saved, dict):
@@ -729,7 +740,7 @@ def expected_dialog_action(state, intent, intent_evidence, text):
         return "end_dialog"
     if intent == "correction" and grounded_intent:
         return "repair_interpretation"
-    if intent == "boundary" and grounded_intent:
+    if intent == "boundary" and grounded_intent and explicit_boundary_signal(text):
         return "respect_boundary"
     if intent == "question" and grounded_intent:
         return "answer_information"
