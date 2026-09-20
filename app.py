@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8.7-consultation-state"
+APP_VERSION = "v8.8-psychologist-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -59,6 +59,8 @@ def booking_config(booking_type):
 
 def direct_booking_answer(text):
     low = text.lower()
+    if session.get("consultation_offered") and re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", low):
+        return "Хорошо. Выберите, пожалуйста, удобные дату и время для бесплатной консультации.\n[[BOOK_FREE]]"
     if re.search(r"(я\s+)?(уже\s+)?записал(ась|ся)|запись\s+(готова|подтверждена|получилась)", low):
         last = session.get("last_booking")
         if last:
@@ -88,22 +90,140 @@ def completed_dialog_answer(text):
         return "До встречи! Хорошего дня."
     return None
 
-def consultation_stage_answer(text, history):
-    assistant_messages = [x["content"].lower() for x in history if x["role"] == "assistant"]
-    last_assistant = assistant_messages[-1] if assistant_messages else ""
-    offered = bool(session.get("consultation_offered")) or any(
-        "консультац" in x and re.search(r"(предлаг|предлож|запис|встреч|обсудить подробнее)", x)
-        for x in assistant_messages
+PSYCHOLOGIST_STAGES = {
+    "situation": "понять, что именно происходит с клиентом и что его беспокоит",
+    "duration_impact": "понять, как давно это продолжается или как отражается на жизни клиента",
+    "desired_change": "понять, чего клиент хотел бы изменить или получить в результате",
+}
+
+def parse_json_object(value):
+    value = str(value or "").strip()
+    value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I)
+    left, right = value.find("{"), value.rfind("}")
+    if left < 0 or right <= left:
+        return None
+    try:
+        result = json.loads(value[left:right + 1])
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+def normalized_words(value):
+    return " ".join(re.findall(r"[а-яёa-z0-9]+", str(value or "").lower()))
+
+def grounded_quote(evidence, client_text):
+    evidence = normalized_words(evidence)
+    return len(evidence.split()) >= 2 and evidence in normalized_words(client_text)
+
+def assess_psychologist_stages(history, text):
+    sid = session.get("sid")
+    previous = session.get("dialog_state", {}) if session.get("dialog_state_sid") == sid and history else {}
+    client_text = "\n".join([row["content"] for row in history if row["role"] == "user"] + [text])
+    schema = {key: {"complete": False, "evidence": ""} for key in PSYCHOLOGIST_STAGES}
+    prompt = f"""Определите, какие этапы первичного знакомства уже раскрыты собственными словами клиента.
+Верните только JSON: {json.dumps({"stages": schema}, ensure_ascii=False)}
+
+ЭТАПЫ:
+{chr(10).join(f"{key}: {goal}" for key, goal in PSYCHOLOGIST_STAGES.items())}
+
+Для complete=true приведите в evidence точную непрерывную цитату клиента. Не используйте слова эксперта, не додумывайте и не ставьте диагноз. Если прямого подтверждения нет, complete=false."""
+    raw = gigachat.reply([
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": client_text[-8000:]},
+    ])
+    parsed = parse_json_object(raw)
+    if not parsed:
+        raise RuntimeError("не удалось определить этап диалога")
+    extracted = parsed.get("stages", {})
+    state = {key: bool(previous.get(key)) for key in PSYCHOLOGIST_STAGES}
+    for key in PSYCHOLOGIST_STAGES:
+        item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
+        if isinstance(item, dict) and item.get("complete") is True and grounded_quote(item.get("evidence"), client_text):
+            state[key] = True
+    session["dialog_state"] = state
+    session["dialog_state_sid"] = sid
+    return state
+
+def client_asks_information(text):
+    return "?" in text and bool(re.search(
+        r"(сколько|сто(ит|имость)|цена|как проходит|онлайн|очно|формат|дл(ится|ительность)|"
+        r"часто|конфиденц|образован|опыт|метод|платн|бесплатн|можно подумать|"
+        r"что будет|что потом|где|когда)",
+        text.lower(),
+    ))
+
+def psychologist_action(state, history, text):
+    if client_asks_information(text):
+        return "answer_information", None
+    missing = next((key for key in PSYCHOLOGIST_STAGES if not state.get(key)), None)
+    if missing:
+        return "explore", missing
+    user_turns = 1 + sum(1 for row in history if row["role"] == "user")
+    if user_turns < 2:
+        return "explore", "situation"
+    return "offer_consultation", None
+
+def controller_task(action, stage):
+    if action == "answer_information":
+        return """Ответьте именно на заданный вопрос, используя только базу знаний и факты разговора. Не заменяйте ответ приглашением и не добавляйте новое предложение записаться."""
+    if action == "explore":
+        return f"""Продолжите первичное знакомство. Цель реплики: {PSYCHOLOGIST_STAGES[stage]}. Коротко отреагируйте на смысл последних слов клиента и задайте один уместный вопрос. Не пытайтесь консультировать, объяснять причины состояния или предлагать способы решения. Не приглашайте на встречу и не завершайте разговор."""
+    return """Запрос уже понятен в достаточной степени. Коротко отразите главное без диагноза и интерпретации, обозначьте границу чата и один раз предложите первичную консультацию. Не начинайте консультирование внутри чата."""
+
+def controller_issues(answer, action):
+    low = answer.lower().strip()
+    issues = []
+    if not low:
+        return ["пустой ответ"]
+    if low.count("?") > 1:
+        issues.append("больше одного вопроса")
+    if action == "explore":
+        if "?" not in low:
+            issues.append("нет уточняющего вопроса")
+        if re.search(r"(консультац|запис|встреч)", low):
+            issues.append("слишком раннее приглашение")
+        if re.search(r"(до встречи|всего доброго|хорошего дня|обращайтесь)", low):
+            issues.append("преждевременное завершение разговора")
+    if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|предлагаю запис)", low):
+        issues.append("вместо ответа добавлено приглашение")
+    if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
+        issues.append("не выполнено предложение следующего шага")
+    if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
+        issues.append("неподтверждённое обещание или диагноз")
+    return issues
+
+def generate_controlled_reply(history, text, context, action, stage):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-10:]
     )
-    affirmative = bool(re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", text.lower()))
-    if affirmative and "консультац" in last_assistant:
-        return "Хорошо. Выберите, пожалуйста, удобные дату и время для бесплатной консультации.\n[[BOOK_FREE]]"
-    if affirmative and re.search(r"(обсудить.{0,20}подробнее|поговорить.{0,20}подробнее|готовы.{0,30}(обсудить|поговорить))", last_assistant):
-        return "Тогда предлагаю продолжить на короткой бесплатной консультации. На ней я смогу подробнее познакомиться с вашей ситуацией, а вы — понять, подходит ли вам мой подход. Хотите записаться?"
-    user_turns = 1 + sum(1 for x in history if x["role"] == "user")
-    informational = bool(re.search(r"(сколько|сто(ит|имость)|как проходит|онлайн|очно|формат|дл(ится|ительность)|часто|конфиденц|опыт|образован|метод|платн|после бесплатн|сразу после|можно подумать)", text.lower()))
-    if user_turns >= 3 and not offered and not informational:
-        return "Спасибо, теперь я в целом понимаю, с чем вы столкнулись. В чате я не буду пытаться разбирать это глубже — такую работу лучше проводить на встрече. Могу предложить короткую бесплатную консультацию, чтобы познакомиться и понять, подходим ли мы друг другу."
+    task = controller_task(action, stage)
+    base_prompt = f"""Сформулируйте одну следующую реплику эксперта-психолога.
+
+ЗАДАЧА ТЕКУЩЕЙ РЕПЛИКИ:
+{task}
+
+Правила: отвечайте от первого лица единственного числа; обращайтесь на «вы»; 1–3 коротких естественных предложения; максимум один вопрос. Опирайтесь на конкретные слова клиента. Не повторяйте уже заданный вопрос. Не придумывайте факты. Не используйте служебные комментарии.
+
+БАЗА ЗНАНИЙ:
+{context[-10000:]}
+
+ДИАЛОГ:
+{transcript[-6000:]}
+Клиент: {text}
+
+Верните только реплику эксперта."""
+    answer = ""
+    issues = []
+    for _ in range(3):
+        prompt = base_prompt
+        if issues:
+            prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант без этих нарушений."
+        answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
+        issues = controller_issues(answer, action)
+        if not issues:
+            return answer
+    app.logger.warning("Dialog controller rejected reply for %s: %s", action, issues)
     return None
 
 def yandex_calendar():
@@ -299,12 +419,19 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
-    stage_answer = consultation_stage_answer(text, history)
-    if stage_answer:
-        if "консультац" in stage_answer.lower():
-            session["consultation_offered"] = True
-        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",stage_answer,int(time.time()*1000))); con.commit()
-        return jsonify(answer=stage_answer)
+    try:
+        dialog_state = assess_psychologist_stages(history, text)
+        action, stage = psychologist_action(dialog_state, history, text)
+        controlled_answer = generate_controlled_reply(history, text, context, action, stage)
+    except Exception as exc:
+        app.logger.exception("Psychologist dialog controller failed")
+        return jsonify(error=f"Не удалось сформировать корректный ответ: {exc}"), 502
+    if not controlled_answer:
+        return jsonify(error="Не удалось сформировать корректный ответ. Попробуйте отправить сообщение ещё раз."), 502
+    if action == "offer_consultation":
+        session["consultation_offered"] = True
+    con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",controlled_answer,int(time.time()*1000))); con.commit()
+    return jsonify(answer=controlled_answer)
     free_title, free_duration = booking_config("free")
     regular_title, regular_duration = booking_config("regular")
     booking_rules = f"\n\nТЕХНИЧЕСКИЕ НАСТРОЙКИ ЗАПИСИ:\nБесплатная встреча: {free_title}, {free_duration} минут. Регулярная встреча: {regular_title}, {regular_duration} минут."
