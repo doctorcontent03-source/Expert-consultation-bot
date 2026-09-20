@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.8-no-invalid-fallback"
+APP_VERSION = "v9.9-interest-and-boundary"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -379,13 +379,19 @@ def assess_psychologist_stages(history, text):
     state["solution_interest"] = bool(previous.get("solution_interest"))
     if state["solution_explained"] and not state["solution_interest"]:
         interest_prompt = f"""Определите реакцию клиента на уже объяснённое направление решения.
-Верните только JSON: {{"status":"interested|unsure|not_interested|unknown","evidence":""}}.
-interested означает явное желание продолжить разговор именно об объяснённом решении. Согласие отвечать на вопросы до объяснения решения интересом не считается. Вопрос, сомнение или просьба уточнить означает unsure. evidence — точная цитата клиента.
+Верните только JSON: {{"status":"interested|tentative_interest|needs_information|not_interested|unknown","evidence":""}}.
+interested означает явное желание продолжить разговор именно об объяснённом решении.
+tentative_interest означает осторожное согласие рассмотреть решение: клиент допускает, что оно может подойти, даже если говорит «возможно», «наверное» или сохраняет осторожность.
+needs_information означает прямой вопрос или просьбу сначала уточнить условия.
+Согласие отвечать на диагностические вопросы до объяснения решения интересом не считается. evidence — точная цитата клиента.
 
 Последняя реплика клиента: {text}"""
         interest = parse_json_object(gigachat.reply([{"role": "system", "content": interest_prompt}]))
-        if interest and interest.get("status") == "interested" and grounded_quote(interest.get("evidence"), text):
+        if interest and interest.get("status") in {"interested", "tentative_interest"} and grounded_quote(interest.get("evidence"), text):
             state["solution_interest"] = True
+    if session.pop("forced_solution_interest", False):
+        state["solution_interest"] = True
+    state["corrects_interpretation"] = bool(session.pop("forced_interpretation_correction", False))
 
     session["dialog_state"] = state
     session["dialog_state_sid"] = sid
@@ -406,17 +412,20 @@ def client_asks_information(text):
 def classify_client_control(history, text):
     assistant_rows = [row for row in history if row["role"] == "assistant"]
     if not assistant_rows:
-        return "continue"
+        return {"status": "continue", "expresses_solution_interest": False}
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history[-6:]
     )
-    prompt = f"""Определите только намерение клиента относительно продолжения этого диалога.
-Верните JSON: {{"status":"continue|stop_questions|end_conversation","evidence":""}}.
+    prompt = f"""Определите намерение клиента относительно текущего диалога.
+Верните JSON:
+{{"status":"continue|stop_questions|end_conversation|correct_interpretation","expresses_solution_interest":false,"evidence":""}}.
 
-continue — клиент продолжает содержательный разговор.
-stop_questions — клиент не хочет дальнейших расспросов, возмущён повторением или просит не углубляться, но явно не завершает общение.
-end_conversation — клиент прямо прощается, отказывается продолжать именно с этим собеседником или завершает разговор.
+continue — клиент продолжает разговор.
+stop_questions — клиент просит прекратить расспросы или не хочет сейчас обсуждать тему, но явно не прощается.
+end_conversation — клиент прямо завершает разговор или отказывается продолжать именно с этим собеседником.
+correct_interpretation — клиент прямо сообщает, что эксперт неверно понял, приписал ему сомнение, чувство, намерение или другой смысл.
+expresses_solution_interest=true только если клиент подтверждает явный или осторожный интерес к уже объяснённому направлению помощи.
 Не путайте описание отсутствия желаний в жизни с отказом от диалога. evidence — точная цитата клиента.
 
 ДИАЛОГ:
@@ -424,20 +433,25 @@ end_conversation — клиент прямо прощается, отказыв�
 Клиент: {text}"""
     for _ in range(3):
         result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
-        if result and result.get("status") in {"continue", "stop_questions", "end_conversation"}:
+        if result and result.get("status") in {"continue", "stop_questions", "end_conversation", "correct_interpretation"}:
             evidence = result.get("evidence", "")
             if result["status"] == "continue" or grounded_quote(evidence, text):
-                return result["status"]
+                return {
+                    "status": result["status"],
+                    "expresses_solution_interest": result.get("expresses_solution_interest") is True,
+                }
         prompt += "\nВерните только корректный JSON без пояснений."
-    return "continue"
+    return {"status": "continue", "expresses_solution_interest": False}
 
 def psychologist_action(state, text):
     if client_asks_information(text):
         return "answer_information", None
     if state.get("declines_more_questions"):
-        if state.get("sufficient_information") or state.get("need"):
-            return "explain_solution", None
         return "respect_boundary", None
+    if state.get("corrects_interpretation"):
+        if state.get("solution_interest"):
+            return "repair_and_offer", None
+        return "repair_interpretation", None
     if state.get("sufficient_information"):
         if not state.get("solution_explained"):
             return "explain_solution", None
@@ -454,6 +468,10 @@ def psychologist_action(state, text):
     return "offer_consultation", None
 
 def controller_task(action, stage):
+    if action == "repair_and_offer":
+        return """Клиент исправил неверную трактовку и одновременно подтвердил интерес к уже объяснённой помощи. Коротко признайте ошибку понимания, затем один раз предложите первичную консультацию. Не возвращайтесь к диагностике."""
+    if action == "repair_interpretation":
+        return """Клиент исправил неверную трактовку. Коротко признайте ошибку и отразите только тот смысл, который действительно сообщил клиент. Не задавайте новый диагностический вопрос, не спорьте и не предлагайте консультацию."""
     if action == "end_dialog":
         return """Клиент завершает разговор. Коротко и спокойно попрощайтесь. Не задавайте вопросов, не анализируйте причины отказа, не уговаривайте и не предлагайте консультацию."""
     if action == "answer_information":
@@ -507,22 +525,26 @@ def controller_issues(answer, action):
     return issues
 
 def semantic_reply_issues(answer, action, text, history):
-    if action not in {"answer_information", "explain_solution"}:
-        return []
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history[-6:]
     )
-    prompt = f"""Проверьте функцию следующей реплики эксперта по смыслу, а не по отдельным словам.
+    task = controller_task(action, None)
+    prompt = f"""Проверьте, выполняет ли реплика назначенную функцию по смыслу.
 Верните только JSON:
-{{"answers_direct_question":true,"speaks_as_expert_in_first_person":true,"starts_psychological_work":false,"adds_unrequested_next_step":false}}
+{{"matches_assigned_action":true,"answers_direct_question":true,"speaks_as_expert_in_first_person":true,"starts_psychological_work":false,"adds_unrequested_next_step":false,"asks_new_diagnostic_question":false,"pressures_client":false}}
 
-answers_direct_question=true, если на последний прямой вопрос клиента дан ясный ответ.
-speaks_as_expert_in_first_person=true, если психолог говорит от своего имени и не отправляет клиента к абстрактному психологу в третьем лице.
-starts_psychological_work=true, если реплика уже даёт клиенту советы, упражнения, интерпретации или начинает разбирать проблему вместо приглашения к живому эксперту.
-adds_unrequested_next_step=true, если вместо ответа на вопрос реплика предлагает консультацию, запись или другое действие, о котором клиент не спрашивал.
+matches_assigned_action=true только если реплика выполняет именно назначенную функцию, а не соседний этап.
+answers_direct_question=true, если последний прямой вопрос клиента получил ясный ответ; если прямого вопроса нет, ставьте true.
+speaks_as_expert_in_first_person=true, если психолог говорит от своего имени и не отправляет клиента к абстрактному психологу.
+starts_psychological_work=true, если реплика даёт советы, упражнения, интерпретирует причины или продолжает разбирать проблему вместо живого эксперта.
+adds_unrequested_next_step=true, если при ответе на вопрос или исправлении ошибки добавлена консультация либо запись без разрешения текущей функции.
+asks_new_diagnostic_question=true, если после завершённой диагностики, при соблюдении границы, исправлении ошибки или проверке интереса бот снова расспрашивает о проблеме клиента.
+pressures_client=true, если после отказа или границы бот уговаривает продолжить.
 
-Текущая функция: {action}
+НАЗНАЧЕННАЯ ФУНКЦИЯ:
+{task}
+
 ДИАЛОГ:
 {transcript}
 Клиент: {text}
@@ -532,19 +554,27 @@ adds_unrequested_next_step=true, если вместо ответа на воп�
         review = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
     except Exception:
         app.logger.exception("Semantic reply review failed")
-        return []
+        return ["не удалось проверить функцию реплики"]
     if not review:
-        return []
+        return ["не удалось проверить функцию реплики"]
     issues = []
+    if review.get("matches_assigned_action") is not True:
+        issues.append("реплика выполняет другой этап")
     if review.get("speaks_as_expert_in_first_person") is not True:
         issues.append("эксперт говорит о себе в третьем лице")
     if review.get("starts_psychological_work") is True:
         issues.append("бот начинает психологическую работу в чате")
+    if review.get("asks_new_diagnostic_question") is True:
+        issues.append("бот возвращается к завершённой диагностике")
+    if review.get("pressures_client") is True:
+        issues.append("бот давит после отказа или границы")
     if action == "answer_information":
         if review.get("answers_direct_question") is not True:
             issues.append("нет прямого ответа на вопрос клиента")
         if review.get("adds_unrequested_next_step") is True:
             issues.append("к ответу добавлен незапрошенный следующий шаг")
+    if action in {"respect_boundary", "repair_interpretation"} and review.get("adds_unrequested_next_step") is True:
+        issues.append("после границы или исправления добавлен следующий шаг")
     return issues
 
 def generate_controlled_reply(history, text, context, action, stage):
@@ -792,7 +822,8 @@ def chat():
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
     try:
-        control_intent = classify_client_control(history, text)
+        control = classify_client_control(history, text)
+        control_intent = control["status"]
         if control_intent == "end_conversation":
             closing_answer = generate_controlled_reply(history, text, context, "end_dialog", None)
             if not closing_answer:
@@ -802,6 +833,10 @@ def chat():
             return jsonify(answer=closing_answer, closed=True)
         if control_intent == "stop_questions":
             session["forced_dialog_boundary"] = True
+        if control_intent == "correct_interpretation":
+            session["forced_interpretation_correction"] = True
+            if control.get("expresses_solution_interest"):
+                session["forced_solution_interest"] = True
         dialog_state = assess_psychologist_stages(history, text)
         action, stage = psychologist_action(dialog_state, text)
         controlled_answer = generate_controlled_reply(history, text, context, action, stage)
