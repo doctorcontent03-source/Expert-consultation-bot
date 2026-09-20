@@ -297,380 +297,50 @@ def parse_json_object(value):
         return None
 
 def normalized_words(value):
-    return " ".join(re.findall(r"[а-яёa-z0-9]+", str(value or "").lower()))
+    return re.findall(r"[а-яёa-z0-9]+", str(value).lower())
 
-def grounded_quote(evidence, client_text):
-    evidence = normalized_words(evidence)
-    return len(evidence.split()) >= 2 and evidence in normalized_words(client_text)
+def grounded_in_current_message(evidence, text):
+    evidence = " ".join(normalized_words(evidence))
+    source = " ".join(normalized_words(text))
+    return bool(evidence) and evidence in source
 
-def assess_psychologist_stages(history, text):
-    sid = session.get("sid")
-    previous = session.get("dialog_state", {}) if session.get("dialog_state_sid") == sid and history else {}
-    client_text = "\n".join([row["content"] for row in history if row["role"] == "user"] + [text])
-    schema = {key: {"complete": False, "evidence": ""} for key in PSYCHOLOGIST_STAGES}
-    control_schema = {
-        "stages": schema,
-        "sufficient_information": {"complete": False, "evidence": ""},
-    }
-    prompt = f"""Проверьте состояние первичного диалога по собственным словам клиента.
-Верните только JSON: {json.dumps(control_schema, ensure_ascii=False)}
-
-ЭТАПЫ:
-{chr(10).join(f"{key}: {goal}" for key, goal in PSYCHOLOGIST_STAGES.items())}
-
-Правила проверки:
-- complete=true только при наличии достаточной информации от самого клиента;
-- профессия, односложное согласие и выбор предложенного экспертом варианта не раскрывают потребность;
-- один развёрнутый ответ может закрыть несколько этапов;
-- evidence — точная непрерывная цитата клиента;
-- sufficient_information=true, если уже понятно, с чем пришёл клиент, в чём его проблема и как она влияет на жизнь, а оставшиеся детали не нужны для связи запроса с услугой психолога;
-- эта проверка оценивает только содержание запроса и никогда не определяет желание клиента завершить разговор;
-- не используйте слова эксперта и не додумывайте."""
-    parsed = None
-    for attempt in range(3):
-        assessment_prompt = prompt
-        if attempt:
-            assessment_prompt += "\nПредыдущий ответ не удалось разобрать. Верните только один корректный JSON-объект без пояснений и Markdown."
-        try:
-            raw = gigachat.reply([
-                {"role": "system", "content": assessment_prompt},
-                {"role": "user", "content": client_text[-9000:]},
-            ])
-        except Exception:
-            app.logger.exception("Stage assessment request failed")
-            break
-        parsed = parse_json_object(raw)
-        if parsed and isinstance(parsed.get("stages"), dict):
-            break
-
-    state = {key: bool(previous.get(key)) for key in PSYCHOLOGIST_STAGES}
-    if parsed:
-        extracted = parsed.get("stages", {})
-        for key in PSYCHOLOGIST_STAGES:
-            item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
-            if isinstance(item, dict) and item.get("complete") is True and grounded_quote(item.get("evidence"), client_text):
-                state[key] = True
-    else:
-        app.logger.warning("Using conservative stage assessment after malformed model output")
-        words = normalized_words(text).split()
-        if len(words) >= 4:
-            state["client_context"] = True
-        if len(words) >= 8:
-            state["need"] = True
-        if re.search(r"(день|недел|месяц|год|давно|недавно|после|влияет|мешает|жизн|работ|отношен|семь|долг|одиночеств)", text.lower()):
-            state["prior_experience"] = True
-
-    state["sufficient_information"] = bool(previous.get("sufficient_information"))
-    state["declines_more_questions"] = bool(session.pop("forced_dialog_boundary", False))
-    if parsed:
-        enough = parsed.get("sufficient_information", {})
-        if isinstance(enough, dict) and enough.get("complete") is True and grounded_quote(enough.get("evidence"), client_text):
-            state["sufficient_information"] = True
-    if state.get("client_context") and state.get("need") and state.get("prior_experience"):
-        state["sufficient_information"] = True
-    substantive_turns = sum(
-        1 for row in history
-        if row["role"] == "user" and len(normalized_words(row["content"]).split()) >= 4
+def explicit_end_signal(text):
+    low = " ".join(normalized_words(text))
+    patterns = (
+        r"\bдо свидания\b", r"\bвсего доброго\b", r"\bразговор окончен\b",
+        r"\bзакончим (?:на этом|разговор)\b", r"\bне хочу (?:больше )?(?:говорить|разговаривать|продолжать)\b",
+        r"\bне буду (?:больше )?(?:говорить|разговаривать|продолжать)\b",
     )
-    if len(normalized_words(text).split()) >= 4:
-        substantive_turns += 1
-    if substantive_turns >= 2:
-        state["sufficient_information"] = True
-        state["client_context"] = True
-        state["need"] = True
+    return any(re.search(pattern, low) for pattern in patterns)
 
-    state["solution_explained"] = bool(previous.get("solution_explained"))
-    state["solution_interest"] = bool(previous.get("solution_interest"))
-    if state["solution_explained"] and not state["solution_interest"]:
-        interest_prompt = f"""Определите реакцию клиента на уже объяснённое направление решения.
-Верните только JSON: {{"status":"interested|tentative_interest|needs_information|not_interested|unknown","evidence":""}}.
-interested означает явное желание продолжить разговор именно об объяснённом решении.
-tentative_interest означает осторожное согласие рассмотреть решение: клиент допускает, что оно может подойти, даже если говорит «возможно», «наверное» или сохраняет осторожность.
-needs_information означает прямой вопрос или просьбу сначала уточнить условия.
-Согласие отвечать на диагностические вопросы до объяснения решения интересом не считается. evidence — точная цитата клиента.
-
-Последняя реплика клиента: {text}"""
-        try:
-            interest = parse_json_object(gigachat.reply([{"role": "system", "content": interest_prompt}]))
-        except Exception:
-            app.logger.exception("Interest assessment failed")
-            interest = None
-        if interest and interest.get("status") in {"interested", "tentative_interest"} and grounded_quote(interest.get("evidence"), text):
-            state["solution_interest"] = True
-    if session.pop("forced_solution_interest", False):
-        state["solution_interest"] = True
-    state["corrects_interpretation"] = bool(session.pop("forced_interpretation_correction", False))
-
-    session["dialog_state"] = state
-    session["dialog_state_sid"] = sid
-    return state
-
-def client_asks_information(text):
-    if "?" not in text:
-        return False
-    prompt = f"""Определите, является ли реплика клиента прямым вопросом к эксперту, на который нужно сначала ответить по существу.
-Не считайте информационным вопросом простое описание проблемы. Верните только JSON: {{"is_question":true}} или {{"is_question":false}}.
-Реплика: {text}"""
-    try:
-        result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
-        return bool(result and result.get("is_question") is True)
-    except Exception:
-        return True
-
-def classify_client_control(history, text):
-    assistant_rows = [row for row in history if row["role"] == "assistant"]
-    if not assistant_rows:
-        return {"status": "continue", "expresses_solution_interest": False}
-    transcript = "\n".join(
-        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
-        for row in history[-6:]
+def explicit_boundary_signal(text):
+    low = " ".join(normalized_words(text))
+    patterns = (
+        r"\bне хочу (?:сейчас )?(?:это )?(?:обсуждать|рассказывать|отвечать)\b",
+        r"\bне буду (?:это )?(?:обсуждать|рассказывать|отвечать)\b",
+        r"\bне (?:задавайте|спрашивайте)\b",
+        r"\bхватит (?:вопросов|спрашивать|расспрашивать)\b",
+        r"\bне хочу углубляться\b",
     )
-    prompt = f"""Определите намерение клиента относительно текущего диалога.
-Верните JSON:
-{{"status":"continue|stop_questions|end_conversation|correct_interpretation","expresses_solution_interest":false,"evidence":""}}.
+    return any(re.search(pattern, low) for pattern in patterns)
 
-continue — клиент продолжает разговор.
-stop_questions — клиент просит прекратить расспросы или не хочет сейчас обсуждать тему, но явно не прощается.
-end_conversation — клиент прямо завершает разговор или отказывается продолжать именно с этим собеседником.
-correct_interpretation — клиент прямо сообщает, что эксперт неверно понял, приписал ему сомнение, чувство, намерение или другой смысл.
-expresses_solution_interest=true только если клиент подтверждает явный или осторожный интерес к уже объяснённому направлению помощи.
-Не путайте описание отсутствия желаний в жизни с отказом от диалога. evidence — точная цитата клиента.
-
-ДИАЛОГ:
-{transcript}
-Клиент: {text}"""
-    for _ in range(3):
-        try:
-            result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
-        except Exception:
-            app.logger.exception("Client control classification failed")
-            break
-        if result and result.get("status") in {"continue", "stop_questions", "end_conversation", "correct_interpretation"}:
-            evidence = result.get("evidence", "")
-            if result["status"] == "continue" or grounded_quote(evidence, text):
-                return {
-                    "status": result["status"],
-                    "expresses_solution_interest": result.get("expresses_solution_interest") is True,
-                }
-        prompt += "\nВерните только корректный JSON без пояснений."
-    return {"status": "continue", "expresses_solution_interest": False}
-
-def psychologist_action(state, text):
-    if client_asks_information(text):
-        return "answer_information", None
-    if state.get("declines_more_questions"):
-        return "respect_boundary", None
-    if state.get("corrects_interpretation"):
-        if state.get("solution_interest"):
-            return "repair_and_offer", None
-        return "repair_interpretation", None
-    if state.get("sufficient_information"):
-        if not state.get("solution_explained"):
-            return "explain_solution", None
-        if not state.get("solution_interest"):
-            return "check_interest", None
-        return "offer_consultation", None
-    missing = next((key for key in PSYCHOLOGIST_STAGES if not state.get(key)), None)
-    if missing:
-        return "explore", missing
-    if not state.get("solution_explained"):
-        return "explain_solution", None
-    if not state.get("solution_interest"):
-        return "check_interest", None
-    return "offer_consultation", None
-
-def controller_task(action, stage):
-    if action == "repair_and_offer":
-        return """Клиент исправил неверную трактовку и одновременно подтвердил интерес к уже объяснённой помощи. Коротко признайте ошибку понимания, затем один раз предложите первичную консультацию. Не возвращайтесь к диагностике."""
-    if action == "repair_interpretation":
-        return """Клиент исправил неверную трактовку. Коротко признайте ошибку и отразите только тот смысл, который действительно сообщил клиент. Не задавайте новый диагностический вопрос, не спорьте и не предлагайте консультацию."""
-    if action == "end_dialog":
-        return """Клиент завершает разговор. Коротко и спокойно попрощайтесь. Не задавайте вопросов, не анализируйте причины отказа, не уговаривайте и не предлагайте консультацию."""
-    if action == "answer_information":
-        return """Сначала ответьте по существу на прямой вопрос клиента, используя только базу знаний и подтверждённые факты. Не заменяйте ответ предложением консультации. Не повторяйте уже данную информацию."""
-    if action == "explore":
-        return f"""Получите только недостающую информацию: {PSYCHOLOGIST_STAGES[stage]}. Учитывайте всё, что клиент уже сообщил. Разрешён один открытый вопрос без вариантов ответа и догадок о проблеме. Не интерпретируйте состояние клиента и не собирайте сведения для выполнения самой консультации."""
-    if action == "respect_boundary":
-        return """Клиент не хочет продолжать расспросы. Уважайте эту границу: коротко подтвердите, что углубляться сейчас не нужно. Не задавайте новый вопрос, не анализируйте состояние и не уговаривайте на консультацию."""
-    if action == "explain_solution":
-        return """Диагностика завершена. От первого лица объясните, чем клиенту может быть полезна встреча именно с вами как с психологом. Свяжите это с выявленной потребностью. Используйте только базу знаний. Не давайте советов, не обещайте результат, не начинайте психологическую работу и пока не предлагайте запись."""
-    if action == "check_interest":
-        return """Выясните, хочет ли клиент продолжить разговор именно об уже объяснённом направлении помощи. Если он сомневается, не давите и не приглашайте на запись. Не повторяйте объяснение без необходимости."""
-    return """Все обязательные этапы завершены, направление помощи объяснено, клиент проявил интерес. Один раз предложите первичную консультацию. Не подтверждайте запись и не называйте время без проверки календаря."""
-
-def controller_issues(answer, action):
-    low = answer.lower().strip()
-    issues = []
-    if not low:
-        return ["пустой ответ"]
-    if low.count("?") > 1:
-        issues.append("больше одного вопроса")
-    if action == "explore":
-        if "?" not in low:
-            issues.append("нет открытого вопроса по недостающему этапу")
-        if re.search(r"(консультац|запис|встреч)", low):
-            issues.append("преждевременный переход к консультации")
-        if re.search(r"(до встречи|всего доброго|хорошего дня|обращайтесь)", low):
-            issues.append("преждевременное завершение")
-    if action == "end_dialog":
-        if "?" in low:
-            issues.append("при завершении задан вопрос")
-        if re.search(r"(консультац|запис|давайте продолж|может быть)", low):
-            issues.append("клиента уговаривают продолжить")
-    if action == "respect_boundary" and "?" in low:
-        issues.append("после обозначенной границы задан новый вопрос")
-    if len(re.findall(r"\S+", answer)) > 40:
-        issues.append("реплика длиннее 40 слов")
-    if action == "explain_solution" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
-        issues.append("решение сразу заменено записью")
-    if action == "check_interest":
-        if "?" not in low:
-            issues.append("интерес клиента не проверен")
-        if re.search(r"(запис|когда вам удобно)", low):
-            issues.append("преждевременный переход к записи")
-    if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
-        issues.append("вопрос клиента заменён приглашением")
-    if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
-        issues.append("консультация не предложена")
-    if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
-        issues.append("диагноз или неподтверждённое обещание")
-    return issues
-
-def semantic_reply_issues(answer, action, text, history):
-    transcript = "\n".join(
-        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
-        for row in history[-6:]
-    )
-    task = controller_task(action, None)
-    prompt = f"""Проверьте, выполняет ли реплика назначенную функцию по смыслу.
-Верните только JSON:
-{{"matches_assigned_action":true,"answers_direct_question":true,"speaks_as_expert_in_first_person":true,"starts_psychological_work":false,"adds_unrequested_next_step":false,"asks_new_diagnostic_question":false,"pressures_client":false}}
-
-matches_assigned_action=true только если реплика выполняет именно назначенную функцию, а не соседний этап.
-answers_direct_question=true, если последний прямой вопрос клиента получил ясный ответ; если прямого вопроса нет, ставьте true.
-speaks_as_expert_in_first_person=true, если психолог говорит от своего имени и не отправляет клиента к абстрактному психологу.
-starts_psychological_work=true, если реплика даёт советы, упражнения, интерпретирует причины или продолжает разбирать проблему вместо живого эксперта.
-adds_unrequested_next_step=true, если при ответе на вопрос или исправлении ошибки добавлена консультация либо запись без разрешения текущей функции.
-asks_new_diagnostic_question=true, если после завершённой диагностики, при соблюдении границы, исправлении ошибки или проверке интереса бот снова расспрашивает о проблеме клиента.
-pressures_client=true, если после отказа или границы бот уговаривает продолжить.
-
-НАЗНАЧЕННАЯ ФУНКЦИЯ:
-{task}
-
-ДИАЛОГ:
-{transcript}
-Клиент: {text}
-РЕПЛИКА:
-{answer}"""
-    try:
-        review = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
-    except Exception:
-        app.logger.exception("Semantic reply review failed")
-        return ["не удалось проверить функцию реплики"]
-    if not review:
-        return ["не удалось проверить функцию реплики"]
-    issues = []
-    if review.get("matches_assigned_action") is not True:
-        issues.append("реплика выполняет другой этап")
-    if review.get("speaks_as_expert_in_first_person") is not True:
-        issues.append("эксперт говорит о себе в третьем лице")
-    if review.get("starts_psychological_work") is True:
-        issues.append("бот начинает психологическую работу в чате")
-    if review.get("asks_new_diagnostic_question") is True:
-        issues.append("бот возвращается к завершённой диагностике")
-    if review.get("pressures_client") is True:
-        issues.append("бот давит после отказа или границы")
-    if action == "answer_information":
-        if review.get("answers_direct_question") is not True:
-            issues.append("нет прямого ответа на вопрос клиента")
-        if review.get("adds_unrequested_next_step") is True:
-            issues.append("к ответу добавлен незапрошенный следующий шаг")
-    if action in {"respect_boundary", "repair_interpretation"} and review.get("adds_unrequested_next_step") is True:
-        issues.append("после границы или исправления добавлен следующий шаг")
-    return issues
-
-def generate_controlled_reply(history, text, context, action, stage):
-    transcript = "\n".join(
-        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
-        for row in history[-12:]
-    )
-    task = controller_task(action, stage)
-    base_prompt = f"""Сформулируйте одну следующую реплику эксперта-психолога.
-
-ФУНКЦИЯ РЕПЛИКИ:
-{task}
-
-Общие правила: отвечайте от первого лица единственного числа; обращайтесь на «вы»; не более двух коротких предложений и 40 слов; максимум один вопрос. Опирайтесь на конкретные слова клиента и весь диалог. Не повторяйте уже заданный вопрос. Не предлагайте варианты ответа. Не интерпретируйте состояние, причины и личность клиента. Не придумывайте факты. Не ставьте диагноз. Не проводите консультацию в чате и не выполняйте работу живого эксперта.
-
-БАЗА ЗНАНИЙ:
-{context[-10000:]}
-
-ДИАЛОГ:
-{transcript[-7000:]}
-Клиент: {text}
-
-Верните только реплику эксперта."""
-    answer = ""
-    issues = []
-    best_answer = None
-    for _ in range(5):
-        prompt = base_prompt
-        if issues:
-            prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант, сохранив функцию реплики."
-        answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
-        hard_issues = controller_issues(answer, action)
-        semantic_issues = semantic_reply_issues(answer, action, text, history)
-        issues = list(dict.fromkeys(hard_issues + semantic_issues))
-        if not hard_issues and answer:
-            best_answer = answer
-        if not issues:
-            return answer
-        if hard_issues == ["больше одного вопроса"]:
-            first_question = answer.find("?")
-            if first_question >= 0:
-                shortened = answer[:first_question + 1].strip()
-                if not controller_issues(shortened, action):
-                    best_answer = shortened
-
-    final_prompt = base_prompt + "\n\nСоздайте ещё один вариант. Строго выполните назначенную функцию реплики и обязательные ограничения. Верните только реплику."
-    final_answer = str(gigachat.reply([{"role": "system", "content": final_prompt}])).strip()
-    final_hard_issues = controller_issues(final_answer, action)
-    final_semantic_issues = semantic_reply_issues(final_answer, action, text, history)
-    if final_answer and not final_hard_issues:
-        if final_semantic_issues:
-            app.logger.warning("Sending structurally valid reply with review notes for %s: %s", action, final_semantic_issues)
-        return final_answer
-    if best_answer:
-        app.logger.warning("Using best structurally valid reply for %s after review retries", action)
-        return best_answer
-    if final_answer:
-        app.logger.warning("No structurally valid reply for %s; continuing dialog with final model answer: %s", action, final_hard_issues)
-        return final_answer
-    return answer or None
-
-def explicit_solution_interest(text):
-    low = text.lower().replace("ё", "е")
-    return bool(re.search(r"\b(да|давайте|хочу|хотела бы|хотел бы|интересно|готова|готов|можно|подойдет|подойдёт|помогло бы)\b", low))
-
-def simple_dialog_action(history, text):
-    if "?" in text:
-        return "answer_information"
-    state = session.get("simple_dialog_state") or {}
-    if state.get("solution_explained"):
-        return "offer_consultation" if explicit_solution_interest(text) else "check_interest"
-    substantive_turns = sum(1 for item in list(history) + [{"role": "user", "content": text}] if item["role"] == "user" and len(item["content"].strip()) >= 20)
-    return "explain_solution" if substantive_turns >= 2 else "explore"
-
-def simple_action_task(action):
+def controller_state():
+    saved = session.get("dialog_controller_state")
+    if not isinstance(saved, dict):
+        saved = {}
     return {
-        "explore": "Продолжите установление контакта и выявление потребности. Кратко отразите уже сказанное и задайте не более одного открытого вопроса только о действительно недостающей информации. Не предлагайте встречу и не начинайте психологическую консультацию в чате.",
-        "explain_solution": "Информации уже достаточно. Не задавайте новых диагностических вопросов. Кратко свяжите запрос клиента с тем, чем может быть полезна личная встреча с вами как с экспертом. Не проводите саму консультацию в чате и не обещайте результат.",
-        "check_interest": "Вы уже объяснили направление помощи. Ответьте на текущую реплику и естественно выясните, хочет ли клиент продолжить разговор об этом. Не повторяйте прежнее объяснение и не предлагайте запись без выраженного интереса.",
-        "offer_consultation": "Клиент проявил интерес после объяснения направления помощи. Один раз предложите подходящую встречу. Если клиент уже прямо просит записать его или спрашивает о времени, добавьте соответствующий маркер записи из общих правил.",
-        "answer_information": "Сначала прямо и полно ответьте на вопрос клиента, используя только базу знаний и контекст. Не подменяйте ответ приглашением и не повторяйте уже сказанное. Затем мягко вернитесь к ближайшему незавершённому этапу, только если это уместно.",
-    }[action]
+        "contact": bool(saved.get("contact")),
+        "need": bool(saved.get("need")),
+        "previous_experience": bool(saved.get("previous_experience")),
+        "desired_result": bool(saved.get("desired_result")),
+        "solution_explained": bool(saved.get("solution_explained")),
+        "interest_confirmed": bool(saved.get("interest_confirmed")),
+        "consultation_offered": bool(saved.get("consultation_offered")),
+        "diagnostic_questions": max(0, min(3, int(saved.get("diagnostic_questions", 0) or 0))),
+        "asked_questions": list(saved.get("asked_questions") or [])[-3:],
+    }
 
-def parse_dialog_payload(raw):
+def parse_controller_payload(raw):
     cleaned = str(raw or "").strip()
     fence = chr(96) * 3
     if cleaned.startswith(fence):
@@ -678,73 +348,201 @@ def parse_dialog_payload(raw):
     try:
         data = json.loads(cleaned)
     except (TypeError, json.JSONDecodeError):
-        return {"reply": cleaned, "intent": "continue"}
-    reply = str(data.get("reply", "")).strip()
-    intent = str(data.get("intent", "continue")).strip().lower()
+        return None
+    if not isinstance(data, dict):
+        return None
+    reply = data.get("reply")
+    action = data.get("action")
+    intent = data.get("intent")
+    evidence = data.get("intent_evidence", "")
+    observations = data.get("observations")
+    if not isinstance(reply, str) or not reply.strip():
+        return None
+    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "answer_information", "respect_boundary", "repair_interpretation", "end_dialog"}:
+        return None
     if intent not in {"continue", "interest", "question", "boundary", "end", "correction"}:
-        intent = "continue"
-    return {"reply": reply, "intent": intent}
+        return None
+    if not isinstance(observations, dict):
+        return None
+    return {
+        "reply": reply.strip(),
+        "action": action,
+        "intent": intent,
+        "intent_evidence": str(evidence or "").strip(),
+        "observations": observations,
+    }
 
-def simple_reply_issues(reply, action, intent):
-    issues = []
+def apply_grounded_observations(state, observations, text):
+    updated = dict(state)
+    for field in ("contact", "need", "previous_experience", "desired_result"):
+        item = observations.get(field)
+        if not isinstance(item, dict):
+            continue
+        if item.get("present") is True and grounded_in_current_message(item.get("evidence", ""), text):
+            updated[field] = True
+    return updated
+
+def expected_dialog_action(state, intent, intent_evidence, text):
+    grounded_intent = grounded_in_current_message(intent_evidence, text)
+    if intent == "end" and grounded_intent and explicit_end_signal(text):
+        return "end_dialog"
+    if intent == "correction" and grounded_intent:
+        return "repair_interpretation"
+    if intent == "boundary" and grounded_intent and explicit_boundary_signal(text):
+        return "respect_boundary"
+    if intent == "question" and grounded_intent:
+        return "answer_information"
+    required_complete = state["contact"] and state["need"] and state["previous_experience"]
+    enough_for_solution = state["need"] and (state["previous_experience"] or state["diagnostic_questions"] >= 2)
+    if not required_complete and state["diagnostic_questions"] < 3 and not enough_for_solution:
+        return "explore"
+    if not state["solution_explained"]:
+        return "explain_solution"
+    if intent == "interest" and grounded_intent:
+        return "offer_consultation" if not state["consultation_offered"] else "check_interest"
+    return "check_interest"
+
+def question_from_reply(reply):
+    parts = re.findall(r"[^?]*\?", reply)
+    return parts[-1].strip() if parts else ""
+
+def questions_are_similar(left, right):
+    a, b = set(normalized_words(left)), set(normalized_words(right))
+    if not a or not b:
+        return False
+    return len(a & b) / len(a | b) >= 0.72
+
+def controller_reply_issues(payload, expected_action, state):
+    reply = payload["reply"]
     low = reply.lower()
-    if not reply:
-        issues.append("empty")
-    if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
-        issues.append("internal_comment")
+    action = payload["action"]
+    issues = []
+    if action != expected_action:
+        issues.append("назначено неверное действие")
+    if len(re.findall(r"\S+", reply)) > 45:
+        issues.append("ответ длиннее 45 слов")
     if reply.count("?") > 1:
-        issues.append("multiple_questions")
-    if action == "explore" and re.search(r"(запис|консультац|встреч)", low):
-        issues.append("premature_offer")
+        issues.append("задано больше одного вопроса")
+    if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
+        issues.append("служебный комментарий")
+    question = question_from_reply(reply)
+    if action == "explore":
+        if not question:
+            issues.append("на этапе уточнения нет вопроса")
+        if re.search(r"(запис|консультац|встреч)", low):
+            issues.append("преждевременно предложена встреча")
+        if any(questions_are_similar(question, old) for old in state["asked_questions"]):
+            issues.append("повторён уже заданный вопрос")
+    if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"} and question:
+        issues.append("задан вопрос на этапе без вопросов")
+    if action == "end_dialog" and not explicit_end_signal(payload["intent_evidence"]):
+        issues.append("нет явного завершения разговора")
+    if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
+        issues.append("ответ на вопрос заменён записью")
+    if action == "check_interest" and re.search(r"(запис|когда вам удобно|\[\[book_)", low):
+        issues.append("интерес подменён записью")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
-        issues.append("unexpected_booking")
-    if intent in {"boundary", "end"} and re.search(r"(расскаж|поделит|уточн|давайте разбер)", low):
-        issues.append("pressure_after_boundary")
+        issues.append("маркер записи появился не на том этапе")
+    if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
+        issues.append("встреча не предложена")
+    if re.search(r"\b(психолог|специалист|эксперт) (?:поможет|сможет|проводит)\b", low):
+        issues.append("эксперт говорит о себе в третьем лице")
+    if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
+        issues.append("неподтверждённое обещание")
     return issues
 
-def generate_simple_dialog_reply(history, text, context, action):
-    visible_history = [{"role": x["role"], "content": x["content"]} for x in history]
-    first_client_turn = not any(x["role"] == "user" for x in history)
-    task = simple_action_task(action)
-    system = SYSTEM_RULES + f"""
+def controller_prompt(state, context, history, text, retry_issues=None):
+    transcript = "\n".join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])
+    correction = ""
+    if retry_issues:
+        correction = "\nПредыдущий вариант отклонён по причинам: " + "; ".join(retry_issues) + ". Исправьте механизм перехода и создайте другой ответ."
+    return SYSTEM_RULES + f"""
 
-ТЕКУЩАЯ ФУНКЦИЯ РЕПЛИКИ:
-{task}
+Вы управляете одной следующей репликой по состояниям, а не по заготовленному скрипту.
 
-Сформулируйте одну короткую естественную реплику от имени эксперта. Учитывайте смысл всего разговора, не копируйте предыдущие ответы и не используйте служебные комментарии.
-Одновременно определите намерение последней реплики клиента: continue — продолжает разговор; interest — проявляет интерес к объяснённому решению или встрече; question — задаёт вопрос; boundary — поправляет собеседника, просит не углубляться или отказывается отвечать на текущий вопрос; end — однозначно завершает весь разговор; correction — исправляет неверное понимание без завершения разговора.
-Обычное описание проблемы, включая слова «ничего не хочу», не является завершением разговора.
-Верните только JSON: {{"reply":"текст ответа","intent":"continue|interest|question|boundary|end|correction"}}.
+ТЕКУЩЕЕ СОСТОЯНИЕ:
+{json.dumps(state, ensure_ascii=False)}
+
+ПОСЛЕДОВАТЕЛЬНОСТЬ:
+1. Установить контекст клиента.
+2. Понять потребность и желаемое изменение.
+3. Выяснить релевантный предыдущий опыт. Для психолога — длительность проблемы или её влияние на жизнь.
+4. Если сведений достаточно, прекратить диагностику.
+5. Объяснить, чем может быть полезна встреча с экспертом, не проводя консультацию в чате.
+6. Проверить интерес к объяснённому направлению.
+7. Сначала отвечать на прямые вопросы и учитывать сомнения.
+8. Предлагать консультацию только после объяснения решения и проявленного интереса.
+
+Выберите ровно одно действие:
+explore — получить один недостающий факт;
+explain_solution — объяснить пользу встречи без вопроса и без записи;
+check_interest — проверить интерес без записи;
+offer_consultation — один раз предложить встречу;
+answer_information — ответить на прямой вопрос;
+respect_boundary — принять границу без нового вопроса и давления;
+repair_interpretation — признать неверное понимание без нового диагностического вопроса;
+end_dialog — попрощаться только при явном завершении разговора.
+
+Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Не угадывайте профессию, проблему, чувства и намерения. Не повторяйте уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
+
+Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
+contact — понятен контекст жизни или ситуации клиента;
+need — понятно, что не устраивает или причиняет трудность;
+previous_experience — понятны длительность, влияние или прежние попытки;
+desired_result — понятно желаемое изменение.
+intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
+
+Верните только JSON:
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|repair_interpretation|end_dialog","intent":"continue|interest|question|boundary|end|correction","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
-{context}"""
-    messages = [{"role": "system", "content": system}] + visible_history + [{"role": "user", "content": text}]
-    models = [os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat", os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"]
-    best = None
+{context[-10000:]}
+
+ДИАЛОГ:
+{transcript[-7000:]}
+Клиент: {text}{correction}"""
+
+def generate_stateful_dialog_reply(history, text, context):
+    original_state = controller_state()
+    models = [
+        os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat",
+        os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max",
+    ]
     last_error = None
-    for attempt, model in enumerate(models):
-        attempt_messages = list(messages)
-        if attempt:
-            attempt_messages[0] = {"role": "system", "content": system + "\nПредыдущая попытка нарушила структурные ограничения. Сформулируйте новый вариант без повторов, давления и преждевременной записи."}
+    retry_issues = None
+    for model in models:
+        prompt = controller_prompt(original_state, context, history, text, retry_issues)
         try:
-            parsed = parse_dialog_payload(gigachat.reply(attempt_messages, model=model))
+            payload = parse_controller_payload(gigachat.reply([{"role": "system", "content": prompt}], model=model))
         except Exception as exc:
             last_error = exc
-            app.logger.exception("GigaChat dialog attempt failed with model %s", model)
+            retry_issues = ["модель не вернула ответ"]
+            app.logger.exception("Dialog generation failed with model %s", model)
             continue
-        if first_client_turn and parsed["intent"] == "end":
-            parsed["intent"] = "continue"
-        issues = simple_reply_issues(parsed["reply"], action, parsed["intent"])
-        if parsed["reply"] and best is None:
-            best = parsed
-        if not issues:
-            return parsed
-        app.logger.warning("Dialog reply rejected from %s: %s", model, issues)
-    if best:
-        return best
-    if last_error:
+        if payload is None:
+            retry_issues = ["ответ не соответствует JSON-схеме"]
+            continue
+        state = apply_grounded_observations(original_state, payload["observations"], text)
+        expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text)
+        issues = controller_reply_issues(payload, expected, original_state)
+        if issues:
+            retry_issues = issues
+            app.logger.warning("Dialog reply rejected from %s: %s", model, issues)
+            continue
+        if payload["action"] == "explore":
+            state["diagnostic_questions"] = min(3, state["diagnostic_questions"] + 1)
+            question = question_from_reply(payload["reply"])
+            if question:
+                state["asked_questions"] = (state["asked_questions"] + [question])[-3:]
+        elif payload["action"] == "explain_solution":
+            state["solution_explained"] = True
+        elif payload["action"] == "offer_consultation":
+            state["interest_confirmed"] = True
+            state["consultation_offered"] = True
+        return payload["reply"], payload["action"], state
+    if last_error and retry_issues == ["модель не вернула ответ"]:
         raise last_error
-    raise RuntimeError("GigaChat returned an empty response")
+    raise RuntimeError("Обе модели не смогли создать ответ, соответствующий состоянию диалога")
 
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
@@ -944,25 +742,19 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
-    action = simple_dialog_action(history, text)
     try:
-        generated = generate_simple_dialog_reply(history, text, context, action)
+        answer, action, dialog_state = generate_stateful_dialog_reply(history, text, context)
     except Exception as exc:
-        app.logger.exception("Simplified dialog generation failed")
+        app.logger.exception("Stateful dialog generation failed")
         return jsonify(error=f"GigaChat недоступен: {exc}"), 502
-    answer = generated["reply"]
-    observed_intent = generated["intent"]
-    if observed_intent == "end":
+    session["dialog_controller_state"] = dialog_state
+    if action == "end_dialog":
         session["dialog_closed"] = True
-    state = session.get("simple_dialog_state") or {}
-    if action == "explain_solution":
-        state["solution_explained"] = True
     if action == "offer_consultation":
-        state["consultation_offered"] = True
         session["consultation_offered"] = True
-    session["simple_dialog_state"] = state
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
     return jsonify(answer=answer, closed=bool(session.get("dialog_closed")))
+
 
 def check_admin(): return request.headers.get("X-Admin-Password")==ADMIN_PASSWORD
 @app.get("/api/admin")
