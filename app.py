@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.9-interest-and-boundary"
+APP_VERSION = "v10.0-nonblocking-review"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -331,10 +331,14 @@ def assess_psychologist_stages(history, text):
         assessment_prompt = prompt
         if attempt:
             assessment_prompt += "\nПредыдущий ответ не удалось разобрать. Верните только один корректный JSON-объект без пояснений и Markdown."
-        raw = gigachat.reply([
-            {"role": "system", "content": assessment_prompt},
-            {"role": "user", "content": client_text[-9000:]},
-        ])
+        try:
+            raw = gigachat.reply([
+                {"role": "system", "content": assessment_prompt},
+                {"role": "user", "content": client_text[-9000:]},
+            ])
+        except Exception:
+            app.logger.exception("Stage assessment request failed")
+            break
         parsed = parse_json_object(raw)
         if parsed and isinstance(parsed.get("stages"), dict):
             break
@@ -386,7 +390,11 @@ needs_information означает прямой вопрос или просьб
 Согласие отвечать на диагностические вопросы до объяснения решения интересом не считается. evidence — точная цитата клиента.
 
 Последняя реплика клиента: {text}"""
-        interest = parse_json_object(gigachat.reply([{"role": "system", "content": interest_prompt}]))
+        try:
+            interest = parse_json_object(gigachat.reply([{"role": "system", "content": interest_prompt}]))
+        except Exception:
+            app.logger.exception("Interest assessment failed")
+            interest = None
         if interest and interest.get("status") in {"interested", "tentative_interest"} and grounded_quote(interest.get("evidence"), text):
             state["solution_interest"] = True
     if session.pop("forced_solution_interest", False):
@@ -432,7 +440,11 @@ expresses_solution_interest=true только если клиент подтве
 {transcript}
 Клиент: {text}"""
     for _ in range(3):
-        result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+        try:
+            result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+        except Exception:
+            app.logger.exception("Client control classification failed")
+            break
         if result and result.get("status") in {"continue", "stop_questions", "end_conversation", "correct_interpretation"}:
             evidence = result.get("evidence", "")
             if result["status"] == "continue" or grounded_quote(evidence, text):
@@ -600,29 +612,41 @@ def generate_controlled_reply(history, text, context, action, stage):
 Верните только реплику эксперта."""
     answer = ""
     issues = []
-    for _ in range(4):
+    best_answer = None
+    for _ in range(5):
         prompt = base_prompt
         if issues:
             prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант, сохранив функцию реплики."
         answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
-        issues = controller_issues(answer, action)
-        issues.extend(semantic_reply_issues(answer, action, text, history))
-        issues = list(dict.fromkeys(issues))
+        hard_issues = controller_issues(answer, action)
+        semantic_issues = semantic_reply_issues(answer, action, text, history)
+        issues = list(dict.fromkeys(hard_issues + semantic_issues))
+        if not hard_issues and answer:
+            best_answer = answer
         if not issues:
             return answer
-        if issues == ["больше одного вопроса"]:
+        if hard_issues == ["больше одного вопроса"]:
             first_question = answer.find("?")
             if first_question >= 0:
-                return answer[:first_question + 1].strip()
-    final_prompt = base_prompt + "\n\nЭто последняя проверка. Предыдущие варианты не выполнили функцию реплики: " + ", ".join(issues) + ". Верните только корректную реплику, без объяснений."
-    answer = str(gigachat.reply([{"role": "system", "content": final_prompt}])).strip()
-    final_issues = controller_issues(answer, action)
-    final_issues.extend(semantic_reply_issues(answer, action, text, history))
-    final_issues = list(dict.fromkeys(final_issues))
-    if final_issues:
-        app.logger.warning("Rejected final dialog reply for %s: %s", action, final_issues)
-        return None
-    return answer
+                shortened = answer[:first_question + 1].strip()
+                if not controller_issues(shortened, action):
+                    best_answer = shortened
+
+    final_prompt = base_prompt + "\n\nСоздайте ещё один вариант. Строго выполните назначенную функцию реплики и обязательные ограничения. Верните только реплику."
+    final_answer = str(gigachat.reply([{"role": "system", "content": final_prompt}])).strip()
+    final_hard_issues = controller_issues(final_answer, action)
+    final_semantic_issues = semantic_reply_issues(final_answer, action, text, history)
+    if final_answer and not final_hard_issues:
+        if final_semantic_issues:
+            app.logger.warning("Sending structurally valid reply with review notes for %s: %s", action, final_semantic_issues)
+        return final_answer
+    if best_answer:
+        app.logger.warning("Using best structurally valid reply for %s after review retries", action)
+        return best_answer
+    if final_answer:
+        app.logger.warning("No structurally valid reply for %s; continuing dialog with final model answer: %s", action, final_hard_issues)
+        return final_answer
+    return answer or None
 
 def yandex_calendar():
     if os.getenv("CALENDAR_MODE", "yandex").strip().lower() == "demo":
