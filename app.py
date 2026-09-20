@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8.9-universal-flow"
+APP_VERSION = "v9.0-universal-flow-booking"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -57,25 +57,213 @@ def booking_config(booking_type):
     except ValueError: duration = default_duration
     return title, duration
 
+MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+WEEKDAYS_RU = {
+    "понедельник": 0, "понедельника": 0, "вторник": 1, "вторника": 1,
+    "среда": 2, "среду": 2, "среды": 2, "четверг": 3, "четверга": 3,
+    "пятница": 4, "пятницу": 4, "пятницы": 4, "суббота": 5, "субботу": 5,
+    "субботы": 5, "воскресенье": 6, "воскресенья": 6,
+}
+
+def booking_timezone():
+    return ZoneInfo(os.getenv("BOOKING_TIMEZONE", "Europe/Moscow"))
+
+def parse_requested_slot(text, now=None):
+    low = text.lower().replace("ё", "е")
+    matches = list(re.finditer(r"(?<!\d)(\d{1,2})[:.](\d{2})(?!\d)", low))
+    if not matches:
+        return None
+    hour, minute = map(int, matches[-1].groups())
+    if hour > 23 or minute > 59:
+        return None
+    tz = booking_timezone()
+    now = now.astimezone(tz) if now else datetime.now(tz)
+    target = None
+    if "послезавтра" in low:
+        target = (now + timedelta(days=2)).date()
+    elif "завтра" in low:
+        target = (now + timedelta(days=1)).date()
+    elif "сегодня" in low:
+        target = now.date()
+    else:
+        numeric = re.search(r"(?<!\d)(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?(?!\d)", low)
+        named = re.search(r"(?<!\d)(\d{1,2})\s+(" + "|".join(MONTHS_RU) + r")(?:\s+(\d{4}))?", low)
+        if numeric:
+            day, month = int(numeric.group(1)), int(numeric.group(2))
+            year = int(numeric.group(3)) if numeric.group(3) else now.year
+            if year < 100:
+                year += 2000
+            try:
+                target = datetime(year, month, day).date()
+            except ValueError:
+                return None
+            if numeric.group(3) is None and target < now.date():
+                target = target.replace(year=now.year + 1)
+        elif named:
+            day, month = int(named.group(1)), MONTHS_RU[named.group(2)]
+            year = int(named.group(3)) if named.group(3) else now.year
+            try:
+                target = datetime(year, month, day).date()
+            except ValueError:
+                return None
+            if named.group(3) is None and target < now.date():
+                target = target.replace(year=now.year + 1)
+        else:
+            for word, weekday in WEEKDAYS_RU.items():
+                if re.search(rf"\b{word}\b", low):
+                    days = (weekday - now.weekday()) % 7 or 7
+                    target = (now + timedelta(days=days)).date()
+                    break
+    if target is None:
+        return None
+    return datetime(target.year, target.month, target.day, hour, minute, tzinfo=tz)
+
+def calendar_slot_is_free(calendar, start, duration):
+    return not bool(calendar.search(start=start, end=start + timedelta(minutes=duration), event=True, expand=True))
+
+def nearby_free_slots(calendar, start, duration, count=3):
+    result = []
+    candidate = start + timedelta(minutes=30)
+    deadline = start + timedelta(days=14)
+    while candidate <= deadline and len(result) < count:
+        if candidate >= datetime.now(start.tzinfo) + timedelta(minutes=30) and calendar_slot_is_free(calendar, candidate, duration):
+            result.append(candidate)
+        candidate += timedelta(minutes=30)
+    return result
+
+def contact_details(text):
+    email_match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, re.I)
+    phone_match = re.search(r"(?:\+?\d[\d\s()\-]{8,}\d)", text)
+    if not email_match or not phone_match or len(re.sub(r"\D", "", phone_match.group(0))) < 10:
+        return None
+    name = text
+    for value in (email_match.group(0), phone_match.group(0)):
+        name = name.replace(value, " ")
+    name = re.sub(r"\b(имя|телефон|тел|почта|email|e-mail)\b\s*[:—-]?", " ", name, flags=re.I)
+    name = re.sub(r"[;,|\n]+", " ", name)
+    name = re.sub(r"\s+", " ", name).strip(" .:-")
+    if not name or len(name) > 120 or not re.search(r"[A-Za-zА-Яа-яЁё]", name):
+        return None
+    return name, phone_match.group(0).strip(), email_match.group(0)
+
+def create_chat_booking(start, booking_type, name, phone, email):
+    title, duration = booking_config(booking_type)
+    if start < datetime.now(start.tzinfo) + timedelta(minutes=30):
+        return None, "Выберите время не раньше чем через 30 минут."
+    calendar = yandex_calendar()
+    if not calendar_slot_is_free(calendar, start, duration):
+        return None, "За время оформления этот интервал заняли. Назовите, пожалуйста, другое время."
+    end = start + timedelta(minutes=duration)
+    stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    tzid = os.getenv("BOOKING_TIMEZONE", "Europe/Moscow")
+    event = "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Expert Consultation Bot//RU",
+        "BEGIN:VEVENT", f"UID:{uuid.uuid4()}@expert-consultation-bot", f"DTSTAMP:{stamp}",
+        f"DTSTART;TZID={tzid}:{start.strftime('%Y%m%dT%H%M%S')}",
+        f"DTEND;TZID={tzid}:{end.strftime('%Y%m%dT%H%M%S')}",
+        "SUMMARY:" + ical_escape(title + " — " + name),
+        "DESCRIPTION:" + ical_escape(f"Имя: {name}\nТелефон: {phone}\nEmail: {email}\nФормат: онлайн"),
+        "END:VEVENT", "END:VCALENDAR", ""
+    ])
+    calendar.save_event(event)
+    return f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, {duration} минут", None
+
+def chat_booking_answer(text):
+    low = text.lower()
+    if session.get("awaiting_booking_type"):
+        if re.search(r"(бесплат|первичн|ознакомитель)", low):
+            session.pop("awaiting_booking_type", None)
+            session["requested_booking_type"] = "free"
+            return "Назовите удобные дату и время — я проверю их в календаре."
+        if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
+            session.pop("awaiting_booking_type", None)
+            session["requested_booking_type"] = "regular"
+            return "Назовите удобные дату и время — я проверю их в календаре."
+
+    pending = session.get("pending_booking")
+    if pending:
+        if re.search(r"\b(отменить|отмена|не хочу записываться|передумал(?:а)?)\b", low):
+            session.pop("pending_booking", None)
+            return "Хорошо, запись не оформляю."
+        details = contact_details(text)
+        if not details:
+            if "?" in text:
+                return None
+            return "Для записи пришлите, пожалуйста, одним сообщением имя, телефон и email."
+        try:
+            start = datetime.fromisoformat(pending["start"])
+            confirmation, error = create_chat_booking(start, pending["type"], *details)
+        except Exception:
+            app.logger.exception("Chat calendar booking failed")
+            return "Сейчас не удалось проверить календарь. Попробуйте ещё раз немного позже."
+        if error:
+            session.pop("pending_booking", None)
+            return error
+        session.pop("pending_booking", None)
+        session["last_booking"] = confirmation
+        session["dialog_closed"] = False
+        return f"Запись подтверждена: {confirmation}."
+
+    offered = session.get("offered_slots", [])
+    time_only = re.search(r"(?<!\d)(\d{1,2})[:.](\d{2})(?!\d)", text)
+    if offered and time_only:
+        hour, minute = map(int, time_only.groups())
+        matches = [datetime.fromisoformat(value) for value in offered if datetime.fromisoformat(value).hour == hour and datetime.fromisoformat(value).minute == minute]
+        if len(matches) == 1:
+            start = matches[0]
+            booking_type = session.pop("offered_booking_type", "free")
+            session.pop("offered_slots", None)
+            session["pending_booking"] = {"start": start.isoformat(), "type": booking_type}
+            return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Пришлите одним сообщением имя, телефон и email."
+
+    booking_intent = bool(re.search(r"(запис|встреч|консультац|подойд[её]т|удобно|свободно)", low))
+    if not session.get("consultation_offered") and not booking_intent:
+        return None
+    start = parse_requested_slot(text)
+    if not start:
+        return None
+    booking_type = session.pop("requested_booking_type", None) or ("regular" if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low) else "free")
+    _, duration = booking_config(booking_type)
+    if start < datetime.now(start.tzinfo) + timedelta(minutes=30):
+        return "Это время уже прошло или до него осталось меньше 30 минут. Назовите другое время."
+    try:
+        calendar = yandex_calendar()
+        if not calendar_slot_is_free(calendar, start, duration):
+            alternatives = nearby_free_slots(calendar, start, duration)
+            if alternatives:
+                session["offered_slots"] = [value.isoformat() for value in alternatives]
+                session["offered_booking_type"] = booking_type
+                variants = ", ".join(value.strftime("%d.%m в %H:%M") for value in alternatives)
+                return f"В {start.strftime('%d.%m в %H:%M')} уже занято. Ближайшие свободные варианты: {variants}. Какой подходит?"
+            return "Это время занято. Назовите другой удобный день и время."
+    except Exception:
+        app.logger.exception("Chat calendar availability check failed")
+        return "Сейчас не удалось проверить календарь. Попробуйте ещё раз немного позже."
+    session["pending_booking"] = {"start": start.isoformat(), "type": booking_type}
+    return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Пришлите одним сообщением имя, телефон и email."
+
 def direct_booking_answer(text):
     low = text.lower()
-    if session.get("consultation_offered") and re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", low):
-        return "Хорошо. Выберите, пожалуйста, удобные дату и время для бесплатной консультации.\n[[BOOK_FREE]]"
     if re.search(r"(я\s+)?(уже\s+)?записал(ась|ся)|запись\s+(готова|подтверждена|получилась)", low):
         last = session.get("last_booking")
-        if last:
-            return f"Да, вижу вашу запись: {last}."
-        return "Спасибо, запись оформлена."
-    if re.search(r"(нужно|надо|обязательно|сразу|потом).{0,30}запис", low):
-        return None
-    asks_time = bool(re.search(r"(когда.{0,35}(свобод|можно|запис|принима)|свободн.{0,20}(дни|даты|время|окна)|подобрать.{0,20}(время|дат)|какие.{0,20}(дни|даты|время|окна)|(хочу|готов|давайте|можно).{0,25}запис|запишите)", low))
+        return f"Да, вижу вашу запись: {last}." if last else "Спасибо, запись оформлена."
+    if session.get("consultation_offered") and re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", low):
+        session["awaiting_booking_type"] = True
+        return "На какую встречу хотите записаться: бесплатную первичную или регулярную?"
+    asks_time = bool(re.search(r"(когда.{0,35}(свобод|можно|запис|принима|есть.{0,12}врем)|свободн.{0,20}(дни|даты|время|окна)|(хочу|готов|давайте|можно).{0,25}запис|запишите)", low))
     if not asks_time:
         return None
     if re.search(r"(бесплат|ознакомитель|перв(ая|ую).{0,15}консультац)", low):
-        return "Да. Выберите, пожалуйста, удобные дату и время для бесплатной консультации по кнопке ниже.\n[[BOOK_FREE]]"
+        session["requested_booking_type"] = "free"
+        return "Назовите удобные дату и время — я проверю их в календаре."
     if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
-        return "Да. Выберите, пожалуйста, удобные дату и время для регулярной встречи по кнопке ниже.\n[[BOOK_REGULAR]]"
-    return "Календарь подключён. Выберите, пожалуйста, нужный тип встречи и удобные дату и время.\n[[BOOK_FREE]]\n[[BOOK_REGULAR]]"
+        session["requested_booking_type"] = "regular"
+        return "Назовите удобные дату и время — я проверю их в календаре."
+    session["awaiting_booking_type"] = True
+    return "На какую встречу хотите записаться: бесплатную первичную или регулярную?"
 
 def completed_dialog_answer(text):
     if not session.get("last_booking") or session.get("dialog_closed"):
@@ -449,6 +637,10 @@ def chat():
     if completed_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",completed_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=completed_answer, closed=True)
+    booking_answer = chat_booking_answer(text)
+    if booking_answer:
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",booking_answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=booking_answer)
     direct_answer = direct_booking_answer(text)
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
