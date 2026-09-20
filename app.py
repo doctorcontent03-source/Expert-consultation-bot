@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.5-contextual-boundary"
+APP_VERSION = "v9.6-role-and-answer-review"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -469,7 +469,7 @@ def controller_task(action, stage):
     if action == "respect_boundary":
         return """Клиент не хочет продолжать расспросы. Уважайте эту границу: коротко подтвердите, что углубляться сейчас не нужно. Не задавайте новый вопрос, не анализируйте состояние и не уговаривайте на консультацию."""
     if action == "explain_solution":
-        return """Диагностика завершена. Свяжите выявленную потребность с тем, чем действительно может быть полезна встреча с экспертом. Покажите разрыв между текущей ситуацией и желаемым изменением и объясните принцип помощи. Используйте только базу знаний. Не обещайте результат, не начинайте психологическую работу и пока не предлагайте запись."""
+        return """Диагностика завершена. От первого лица объясните, чем клиенту может быть полезна встреча именно с вами как с психологом. Свяжите это с выявленной потребностью. Используйте только базу знаний. Не давайте советов, не обещайте результат, не начинайте психологическую работу и пока не предлагайте запись."""
     if action == "check_interest":
         return """Выясните, хочет ли клиент продолжить разговор именно об уже объяснённом направлении помощи. Если он сомневается, не давите и не приглашайте на запись. Не повторяйте объяснение без необходимости."""
     return """Все обязательные этапы завершены, направление помощи объяснено, клиент проявил интерес. Один раз предложите первичную консультацию. Не подтверждайте запись и не называйте время без проверки календаря."""
@@ -512,6 +512,47 @@ def controller_issues(answer, action):
         issues.append("диагноз или неподтверждённое обещание")
     return issues
 
+def semantic_reply_issues(answer, action, text, history):
+    if action not in {"answer_information", "explain_solution"}:
+        return []
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-6:]
+    )
+    prompt = f"""Проверьте функцию следующей реплики эксперта по смыслу, а не по отдельным словам.
+Верните только JSON:
+{{"answers_direct_question":true,"speaks_as_expert_in_first_person":true,"starts_psychological_work":false,"adds_unrequested_next_step":false}}
+
+answers_direct_question=true, если на последний прямой вопрос клиента дан ясный ответ.
+speaks_as_expert_in_first_person=true, если психолог говорит от своего имени и не отправляет клиента к абстрактному психологу в третьем лице.
+starts_psychological_work=true, если реплика уже даёт клиенту советы, упражнения, интерпретации или начинает разбирать проблему вместо приглашения к живому эксперту.
+adds_unrequested_next_step=true, если вместо ответа на вопрос реплика предлагает консультацию, запись или другое действие, о котором клиент не спрашивал.
+
+Текущая функция: {action}
+ДИАЛОГ:
+{transcript}
+Клиент: {text}
+РЕПЛИКА:
+{answer}"""
+    try:
+        review = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+    except Exception:
+        app.logger.exception("Semantic reply review failed")
+        return []
+    if not review:
+        return []
+    issues = []
+    if review.get("speaks_as_expert_in_first_person") is not True:
+        issues.append("эксперт говорит о себе в третьем лице")
+    if review.get("starts_psychological_work") is True:
+        issues.append("бот начинает психологическую работу в чате")
+    if action == "answer_information":
+        if review.get("answers_direct_question") is not True:
+            issues.append("нет прямого ответа на вопрос клиента")
+        if review.get("adds_unrequested_next_step") is True:
+            issues.append("к ответу добавлен незапрошенный следующий шаг")
+    return issues
+
 def generate_controlled_reply(history, text, context, action, stage):
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
@@ -541,6 +582,8 @@ def generate_controlled_reply(history, text, context, action, stage):
             prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант, сохранив функцию реплики."
         answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
         issues = controller_issues(answer, action)
+        issues.extend(semantic_reply_issues(answer, action, text, history))
+        issues = list(dict.fromkeys(issues))
         if not issues:
             return answer
         if issues == ["больше одного вопроса"]:
