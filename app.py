@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.4-semantic-boundary"
+APP_VERSION = "v9.5-contextual-boundary"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -410,6 +410,9 @@ def client_asks_information(text):
         return True
 
 def classify_client_control(history, text):
+    assistant_rows = [row for row in history if row["role"] == "assistant"]
+    if not assistant_rows:
+        return "continue"
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history[-6:]
