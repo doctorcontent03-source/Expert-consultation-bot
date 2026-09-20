@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.1-resilient-controller"
+APP_VERSION = "v9.2-sufficiency-boundary"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -308,8 +308,13 @@ def assess_psychologist_stages(history, text):
     previous = session.get("dialog_state", {}) if session.get("dialog_state_sid") == sid and history else {}
     client_text = "\n".join([row["content"] for row in history if row["role"] == "user"] + [text])
     schema = {key: {"complete": False, "evidence": ""} for key in PSYCHOLOGIST_STAGES}
-    prompt = f"""Проверьте, какие этапы первичного диалога уже раскрыты собственными словами клиента.
-Верните только JSON: {json.dumps({"stages": schema}, ensure_ascii=False)}
+    control_schema = {
+        "stages": schema,
+        "sufficient_information": {"complete": False, "evidence": ""},
+        "declines_more_questions": {"complete": False, "evidence": ""},
+    }
+    prompt = f"""Проверьте состояние первичного диалога по собственным словам клиента.
+Верните только JSON: {json.dumps(control_schema, ensure_ascii=False)}
 
 ЭТАПЫ:
 {chr(10).join(f"{key}: {goal}" for key, goal in PSYCHOLOGIST_STAGES.items())}
@@ -319,6 +324,8 @@ def assess_psychologist_stages(history, text):
 - профессия, односложное согласие и выбор предложенного экспертом варианта не раскрывают потребность;
 - один развёрнутый ответ может закрыть несколько этапов;
 - evidence — точная непрерывная цитата клиента;
+- sufficient_information=true, если уже понятно, с чем пришёл клиент, в чём его проблема и как она влияет на жизнь, а оставшиеся детали не нужны для связи запроса с услугой психолога;
+- declines_more_questions=true, если клиент прямо не хочет продолжать расспросы или углубляться;
 - не используйте слова эксперта и не додумывайте."""
     parsed = None
     for attempt in range(3):
@@ -349,6 +356,18 @@ def assess_psychologist_stages(history, text):
             state["need"] = True
         if re.search(r"(день|недел|месяц|год|давно|недавно|после|влияет|мешает|жизн|работ|отношен|семь|долг|одиночеств)", text.lower()):
             state["prior_experience"] = True
+
+    state["sufficient_information"] = bool(previous.get("sufficient_information"))
+    state["declines_more_questions"] = False
+    if parsed:
+        enough = parsed.get("sufficient_information", {})
+        boundary = parsed.get("declines_more_questions", {})
+        if isinstance(enough, dict) and enough.get("complete") is True and grounded_quote(enough.get("evidence"), client_text):
+            state["sufficient_information"] = True
+        if isinstance(boundary, dict) and boundary.get("complete") is True and grounded_quote(boundary.get("evidence"), text):
+            state["declines_more_questions"] = True
+    if state.get("client_context") and state.get("need") and state.get("prior_experience"):
+        state["sufficient_information"] = True
 
     state["solution_explained"] = bool(previous.get("solution_explained"))
     state["solution_interest"] = bool(previous.get("solution_interest"))
@@ -381,6 +400,16 @@ def client_asks_information(text):
 def psychologist_action(state, text):
     if client_asks_information(text):
         return "answer_information", None
+    if state.get("declines_more_questions"):
+        if state.get("sufficient_information") or state.get("need"):
+            return "explain_solution", None
+        return "respect_boundary", None
+    if state.get("sufficient_information"):
+        if not state.get("solution_explained"):
+            return "explain_solution", None
+        if not state.get("solution_interest"):
+            return "check_interest", None
+        return "offer_consultation", None
     missing = next((key for key in PSYCHOLOGIST_STAGES if not state.get(key)), None)
     if missing:
         return "explore", missing
@@ -394,7 +423,9 @@ def controller_task(action, stage):
     if action == "answer_information":
         return """Сначала ответьте по существу на прямой вопрос клиента, используя только базу знаний и подтверждённые факты. Не заменяйте ответ предложением консультации. Не повторяйте уже данную информацию."""
     if action == "explore":
-        return f"""Получите только недостающую информацию: {PSYCHOLOGIST_STAGES[stage]}. Учитывайте всё, что клиент уже сообщил. Разрешён один открытый вопрос без вариантов ответа и догадок о проблеме. Не собирайте сведения для выполнения самой консультации."""
+        return f"""Получите только недостающую информацию: {PSYCHOLOGIST_STAGES[stage]}. Учитывайте всё, что клиент уже сообщил. Разрешён один открытый вопрос без вариантов ответа и догадок о проблеме. Не интерпретируйте состояние клиента и не собирайте сведения для выполнения самой консультации."""
+    if action == "respect_boundary":
+        return """Клиент не хочет продолжать расспросы. Уважайте эту границу: коротко подтвердите, что углубляться сейчас не нужно. Не задавайте новый вопрос, не анализируйте состояние и не уговаривайте на консультацию."""
     if action == "explain_solution":
         return """Диагностика завершена. Свяжите выявленную потребность с тем, чем действительно может быть полезна встреча с экспертом. Покажите разрыв между текущей ситуацией и желаемым изменением и объясните принцип помощи. Используйте только базу знаний. Не обещайте результат, не начинайте психологическую работу и пока не предлагайте запись."""
     if action == "check_interest":
@@ -415,6 +446,10 @@ def controller_issues(answer, action):
             issues.append("преждевременный переход к консультации")
         if re.search(r"(до встречи|всего доброго|хорошего дня|обращайтесь)", low):
             issues.append("преждевременное завершение")
+    if action == "respect_boundary" and "?" in low:
+        issues.append("после обозначенной границы задан новый вопрос")
+    if len(re.findall(r"\S+", answer)) > 40:
+        issues.append("реплика длиннее 40 слов")
     if action == "explain_solution" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
         issues.append("решение сразу заменено записью")
     if action == "check_interest":
@@ -441,7 +476,7 @@ def generate_controlled_reply(history, text, context, action, stage):
 ФУНКЦИЯ РЕПЛИКИ:
 {task}
 
-Общие правила: отвечайте от первого лица единственного числа; обращайтесь на «вы»; 1–3 естественных предложения; максимум один вопрос. Опирайтесь на конкретные слова клиента и весь диалог. Не повторяйте уже заданный вопрос. Не предлагайте варианты ответа. Не придумывайте факты. Не ставьте диагноз. Не проводите консультацию в чате и не выполняйте работу живого эксперта.
+Общие правила: отвечайте от первого лица единственного числа; обращайтесь на «вы»; не более двух коротких предложений и 40 слов; максимум один вопрос. Опирайтесь на конкретные слова клиента и весь диалог. Не повторяйте уже заданный вопрос. Не предлагайте варианты ответа. Не интерпретируйте состояние, причины и личность клиента. Не придумывайте факты. Не ставьте диагноз. Не проводите консультацию в чате и не выполняйте работу живого эксперта.
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
