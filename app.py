@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v9.0-universal-flow-booking"
+APP_VERSION = "v9.1-resilient-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -320,19 +320,35 @@ def assess_psychologist_stages(history, text):
 - один развёрнутый ответ может закрыть несколько этапов;
 - evidence — точная непрерывная цитата клиента;
 - не используйте слова эксперта и не додумывайте."""
-    raw = gigachat.reply([
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": client_text[-9000:]},
-    ])
-    parsed = parse_json_object(raw)
-    if not parsed:
-        raise RuntimeError("не удалось проверить достаточность информации")
-    extracted = parsed.get("stages", {})
+    parsed = None
+    for attempt in range(3):
+        assessment_prompt = prompt
+        if attempt:
+            assessment_prompt += "\nПредыдущий ответ не удалось разобрать. Верните только один корректный JSON-объект без пояснений и Markdown."
+        raw = gigachat.reply([
+            {"role": "system", "content": assessment_prompt},
+            {"role": "user", "content": client_text[-9000:]},
+        ])
+        parsed = parse_json_object(raw)
+        if parsed and isinstance(parsed.get("stages"), dict):
+            break
+
     state = {key: bool(previous.get(key)) for key in PSYCHOLOGIST_STAGES}
-    for key in PSYCHOLOGIST_STAGES:
-        item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
-        if isinstance(item, dict) and item.get("complete") is True and grounded_quote(item.get("evidence"), client_text):
-            state[key] = True
+    if parsed:
+        extracted = parsed.get("stages", {})
+        for key in PSYCHOLOGIST_STAGES:
+            item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
+            if isinstance(item, dict) and item.get("complete") is True and grounded_quote(item.get("evidence"), client_text):
+                state[key] = True
+    else:
+        app.logger.warning("Using conservative stage assessment after malformed model output")
+        words = normalized_words(text).split()
+        if len(words) >= 4:
+            state["client_context"] = True
+        if len(words) >= 8:
+            state["need"] = True
+        if re.search(r"(день|недел|месяц|год|давно|недавно|после|влияет|мешает|жизн|работ|отношен|семь|долг|одиночеств)", text.lower()):
+            state["prior_experience"] = True
 
     state["solution_explained"] = bool(previous.get("solution_explained"))
     state["solution_interest"] = bool(previous.get("solution_interest"))
@@ -437,7 +453,7 @@ def generate_controlled_reply(history, text, context, action, stage):
 Верните только реплику эксперта."""
     answer = ""
     issues = []
-    for _ in range(3):
+    for _ in range(4):
         prompt = base_prompt
         if issues:
             prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант, сохранив функцию реплики."
@@ -445,7 +461,22 @@ def generate_controlled_reply(history, text, context, action, stage):
         issues = controller_issues(answer, action)
         if not issues:
             return answer
-    app.logger.warning("Dialog controller rejected reply for %s: %s", action, issues)
+        if issues == ["больше одного вопроса"]:
+            first_question = answer.find("?")
+            if first_question >= 0:
+                return answer[:first_question + 1].strip()
+    app.logger.warning("Dialog controller could not fully validate reply for %s: %s", action, issues)
+    if answer:
+        if action == "explore":
+            parts = [
+                part for part in re.split(r"(?<=[.!?])\s+", answer)
+                if not re.search(r"(консультац|запис|до встречи|всего доброго|хорошего дня|обращайтесь)", part.lower())
+            ]
+            cleaned = " ".join(parts).strip()
+            if cleaned and "?" in cleaned:
+                first_question = cleaned.find("?")
+                return cleaned[:first_question + 1].strip()
+        return answer
     return None
 
 def yandex_calendar():
@@ -649,9 +680,9 @@ def chat():
         dialog_state = assess_psychologist_stages(history, text)
         action, stage = psychologist_action(dialog_state, text)
         controlled_answer = generate_controlled_reply(history, text, context, action, stage)
-    except Exception as exc:
+    except Exception:
         app.logger.exception("Psychologist dialog controller failed")
-        return jsonify(error=f"Не удалось сформировать корректный ответ: {exc}"), 502
+        return jsonify(error="GigaChat временно не смог обработать сообщение. Попробуйте отправить его ещё раз."), 502
     if not controlled_answer:
         return jsonify(error="Не удалось сформировать корректный ответ. Попробуйте отправить сообщение ещё раз."), 502
     if action == "explain_solution":
