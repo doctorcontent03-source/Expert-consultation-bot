@@ -13,7 +13,7 @@ DB = Path(os.getenv("DATA_DIR", str(ROOT))) / "bot.db"
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
-APP_VERSION = "v8.8-psychologist-controller"
+APP_VERSION = "v8.9-universal-flow"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
@@ -91,9 +91,9 @@ def completed_dialog_answer(text):
     return None
 
 PSYCHOLOGIST_STAGES = {
-    "situation": "понять, что именно происходит с клиентом и что его беспокоит",
-    "duration_impact": "понять, как давно это продолжается или как отражается на жизни клиента",
-    "desired_change": "понять, чего клиент хотел бы изменить или получить в результате",
+    "client_context": "понять контекст клиента, связанный с обращением, не подменяя его догадкой по одной реплике",
+    "need": "понять, что клиент хочет изменить, что сейчас не получается, почему это стало проблемой и какой результат ему нужен; один развёрнутый ответ может закрыть этап",
+    "prior_experience": "понять, как давно существует проблема и как она влияет на жизнь клиента",
 }
 
 def parse_json_object(value):
@@ -120,55 +120,82 @@ def assess_psychologist_stages(history, text):
     previous = session.get("dialog_state", {}) if session.get("dialog_state_sid") == sid and history else {}
     client_text = "\n".join([row["content"] for row in history if row["role"] == "user"] + [text])
     schema = {key: {"complete": False, "evidence": ""} for key in PSYCHOLOGIST_STAGES}
-    prompt = f"""Определите, какие этапы первичного знакомства уже раскрыты собственными словами клиента.
+    prompt = f"""Проверьте, какие этапы первичного диалога уже раскрыты собственными словами клиента.
 Верните только JSON: {json.dumps({"stages": schema}, ensure_ascii=False)}
 
 ЭТАПЫ:
 {chr(10).join(f"{key}: {goal}" for key, goal in PSYCHOLOGIST_STAGES.items())}
 
-Для complete=true приведите в evidence точную непрерывную цитату клиента. Не используйте слова эксперта, не додумывайте и не ставьте диагноз. Если прямого подтверждения нет, complete=false."""
+Правила проверки:
+- complete=true только при наличии достаточной информации от самого клиента;
+- профессия, односложное согласие и выбор предложенного экспертом варианта не раскрывают потребность;
+- один развёрнутый ответ может закрыть несколько этапов;
+- evidence — точная непрерывная цитата клиента;
+- не используйте слова эксперта и не додумывайте."""
     raw = gigachat.reply([
         {"role": "system", "content": prompt},
-        {"role": "user", "content": client_text[-8000:]},
+        {"role": "user", "content": client_text[-9000:]},
     ])
     parsed = parse_json_object(raw)
     if not parsed:
-        raise RuntimeError("не удалось определить этап диалога")
+        raise RuntimeError("не удалось проверить достаточность информации")
     extracted = parsed.get("stages", {})
     state = {key: bool(previous.get(key)) for key in PSYCHOLOGIST_STAGES}
     for key in PSYCHOLOGIST_STAGES:
         item = extracted.get(key, {}) if isinstance(extracted, dict) else {}
         if isinstance(item, dict) and item.get("complete") is True and grounded_quote(item.get("evidence"), client_text):
             state[key] = True
+
+    state["solution_explained"] = bool(previous.get("solution_explained"))
+    state["solution_interest"] = bool(previous.get("solution_interest"))
+    if state["solution_explained"] and not state["solution_interest"]:
+        interest_prompt = f"""Определите реакцию клиента на уже объяснённое направление решения.
+Верните только JSON: {{"status":"interested|unsure|not_interested|unknown","evidence":""}}.
+interested означает явное желание продолжить разговор именно об объяснённом решении. Согласие отвечать на вопросы до объяснения решения интересом не считается. Вопрос, сомнение или просьба уточнить означает unsure. evidence — точная цитата клиента.
+
+Последняя реплика клиента: {text}"""
+        interest = parse_json_object(gigachat.reply([{"role": "system", "content": interest_prompt}]))
+        if interest and interest.get("status") == "interested" and grounded_quote(interest.get("evidence"), text):
+            state["solution_interest"] = True
+
     session["dialog_state"] = state
     session["dialog_state_sid"] = sid
     return state
 
 def client_asks_information(text):
-    return "?" in text and bool(re.search(
-        r"(сколько|сто(ит|имость)|цена|как проходит|онлайн|очно|формат|дл(ится|ительность)|"
-        r"часто|конфиденц|образован|опыт|метод|платн|бесплатн|можно подумать|"
-        r"что будет|что потом|где|когда)",
-        text.lower(),
-    ))
+    if "?" not in text:
+        return False
+    prompt = f"""Определите, является ли реплика клиента прямым вопросом к эксперту, на который нужно сначала ответить по существу.
+Не считайте информационным вопросом простое описание проблемы. Верните только JSON: {{"is_question":true}} или {{"is_question":false}}.
+Реплика: {text}"""
+    try:
+        result = parse_json_object(gigachat.reply([{"role": "system", "content": prompt}]))
+        return bool(result and result.get("is_question") is True)
+    except Exception:
+        return True
 
-def psychologist_action(state, history, text):
+def psychologist_action(state, text):
     if client_asks_information(text):
         return "answer_information", None
     missing = next((key for key in PSYCHOLOGIST_STAGES if not state.get(key)), None)
     if missing:
         return "explore", missing
-    user_turns = 1 + sum(1 for row in history if row["role"] == "user")
-    if user_turns < 2:
-        return "explore", "situation"
+    if not state.get("solution_explained"):
+        return "explain_solution", None
+    if not state.get("solution_interest"):
+        return "check_interest", None
     return "offer_consultation", None
 
 def controller_task(action, stage):
     if action == "answer_information":
-        return """Ответьте именно на заданный вопрос, используя только базу знаний и факты разговора. Не заменяйте ответ приглашением и не добавляйте новое предложение записаться."""
+        return """Сначала ответьте по существу на прямой вопрос клиента, используя только базу знаний и подтверждённые факты. Не заменяйте ответ предложением консультации. Не повторяйте уже данную информацию."""
     if action == "explore":
-        return f"""Продолжите первичное знакомство. Цель реплики: {PSYCHOLOGIST_STAGES[stage]}. Коротко отреагируйте на смысл последних слов клиента и задайте один уместный вопрос. Не пытайтесь консультировать, объяснять причины состояния или предлагать способы решения. Не приглашайте на встречу и не завершайте разговор."""
-    return """Запрос уже понятен в достаточной степени. Коротко отразите главное без диагноза и интерпретации, обозначьте границу чата и один раз предложите первичную консультацию. Не начинайте консультирование внутри чата."""
+        return f"""Получите только недостающую информацию: {PSYCHOLOGIST_STAGES[stage]}. Учитывайте всё, что клиент уже сообщил. Разрешён один открытый вопрос без вариантов ответа и догадок о проблеме. Не собирайте сведения для выполнения самой консультации."""
+    if action == "explain_solution":
+        return """Диагностика завершена. Свяжите выявленную потребность с тем, чем действительно может быть полезна встреча с экспертом. Покажите разрыв между текущей ситуацией и желаемым изменением и объясните принцип помощи. Используйте только базу знаний. Не обещайте результат, не начинайте психологическую работу и пока не предлагайте запись."""
+    if action == "check_interest":
+        return """Выясните, хочет ли клиент продолжить разговор именно об уже объяснённом направлении помощи. Если он сомневается, не давите и не приглашайте на запись. Не повторяйте объяснение без необходимости."""
+    return """Все обязательные этапы завершены, направление помощи объяснено, клиент проявил интерес. Один раз предложите первичную консультацию. Не подтверждайте запись и не называйте время без проверки календаря."""
 
 def controller_issues(answer, action):
     low = answer.lower().strip()
@@ -179,37 +206,44 @@ def controller_issues(answer, action):
         issues.append("больше одного вопроса")
     if action == "explore":
         if "?" not in low:
-            issues.append("нет уточняющего вопроса")
+            issues.append("нет открытого вопроса по недостающему этапу")
         if re.search(r"(консультац|запис|встреч)", low):
-            issues.append("слишком раннее приглашение")
+            issues.append("преждевременный переход к консультации")
         if re.search(r"(до встречи|всего доброго|хорошего дня|обращайтесь)", low):
-            issues.append("преждевременное завершение разговора")
-    if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|предлагаю запис)", low):
-        issues.append("вместо ответа добавлено приглашение")
+            issues.append("преждевременное завершение")
+    if action == "explain_solution" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
+        issues.append("решение сразу заменено записью")
+    if action == "check_interest":
+        if "?" not in low:
+            issues.append("интерес клиента не проверен")
+        if re.search(r"(запис|когда вам удобно)", low):
+            issues.append("преждевременный переход к записи")
+    if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
+        issues.append("вопрос клиента заменён приглашением")
     if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
-        issues.append("не выполнено предложение следующего шага")
+        issues.append("консультация не предложена")
     if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
-        issues.append("неподтверждённое обещание или диагноз")
+        issues.append("диагноз или неподтверждённое обещание")
     return issues
 
 def generate_controlled_reply(history, text, context, action, stage):
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
-        for row in history[-10:]
+        for row in history[-12:]
     )
     task = controller_task(action, stage)
     base_prompt = f"""Сформулируйте одну следующую реплику эксперта-психолога.
 
-ЗАДАЧА ТЕКУЩЕЙ РЕПЛИКИ:
+ФУНКЦИЯ РЕПЛИКИ:
 {task}
 
-Правила: отвечайте от первого лица единственного числа; обращайтесь на «вы»; 1–3 коротких естественных предложения; максимум один вопрос. Опирайтесь на конкретные слова клиента. Не повторяйте уже заданный вопрос. Не придумывайте факты. Не используйте служебные комментарии.
+Общие правила: отвечайте от первого лица единственного числа; обращайтесь на «вы»; 1–3 естественных предложения; максимум один вопрос. Опирайтесь на конкретные слова клиента и весь диалог. Не повторяйте уже заданный вопрос. Не предлагайте варианты ответа. Не придумывайте факты. Не ставьте диагноз. Не проводите консультацию в чате и не выполняйте работу живого эксперта.
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
 
 ДИАЛОГ:
-{transcript[-6000:]}
+{transcript[-7000:]}
 Клиент: {text}
 
 Верните только реплику эксперта."""
@@ -218,7 +252,7 @@ def generate_controlled_reply(history, text, context, action, stage):
     for _ in range(3):
         prompt = base_prompt
         if issues:
-            prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант без этих нарушений."
+            prompt += "\n\nПредыдущий вариант отклонён: " + ", ".join(issues) + ". Создайте новый вариант, сохранив функцию реплики."
         answer = str(gigachat.reply([{"role": "system", "content": prompt}])).strip()
         issues = controller_issues(answer, action)
         if not issues:
@@ -421,13 +455,16 @@ def chat():
         return jsonify(answer=direct_answer)
     try:
         dialog_state = assess_psychologist_stages(history, text)
-        action, stage = psychologist_action(dialog_state, history, text)
+        action, stage = psychologist_action(dialog_state, text)
         controlled_answer = generate_controlled_reply(history, text, context, action, stage)
     except Exception as exc:
         app.logger.exception("Psychologist dialog controller failed")
         return jsonify(error=f"Не удалось сформировать корректный ответ: {exc}"), 502
     if not controlled_answer:
         return jsonify(error="Не удалось сформировать корректный ответ. Попробуйте отправить сообщение ещё раз."), 502
+    if action == "explain_solution":
+        dialog_state["solution_explained"] = True
+        session["dialog_state"] = dialog_state
     if action == "offer_consultation":
         session["consultation_offered"] = True
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",controlled_answer,int(time.time()*1000))); con.commit()
