@@ -42,6 +42,37 @@ HOME_HTML = HOME_HTML.replace(
     "</script></body>",
     ";fetch('/api/history').then(r=>r.json()).then(v=>{if(v.messages&&v.messages.length){chat.innerHTML='';v.messages.forEach(x=>add(x.content.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim(),x.role==='user'?'user':'bot'))}if(v.closed)form.hidden=true});</script></body>"
 )
+HOME_HTML = re.sub(
+    r"form\.onsubmit=async e=>\{.*?input\.focus\(\)\}",
+    """const pending=[];let sending=false;
+async function drain(){
+  if(sending||!pending.length)return;
+  sending=true;
+  const item=pending.shift(),w=item.w;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:item.m})});
+    const v=await r.json(),a=v.answer||v.error||'';
+    const free=a.includes('[[BOOK_FREE]]'),regular=a.includes('[[BOOK_REGULAR]]');
+    w.textContent=a.replace('[[BOOK_FREE]]','').replace('[[BOOK_REGULAR]]','').trim();
+    const addLink=(href,label)=>{const l=document.createElement('a');l.href=href;l.textContent=label;l.style.cssText='display:block;width:max-content;margin:10px 0 0;padding:10px 14px;border-radius:12px;background:#285c45;color:white;text-decoration:none;font-weight:700';w.append(document.createElement('br'),l)};
+    if(free)addLink('/booking?type=free','Записаться на бесплатную консультацию');
+    if(regular)addLink('/booking?type=regular','Записаться на регулярную встречу');
+    if(v.closed){form.hidden=true;if(!a)w.remove()}
+  }catch{w.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}
+  sending=false;input.focus();drain()
+}
+form.onsubmit=e=>{
+  e.preventDefault();
+  const m=input.value.trim();
+  if(!m)return;
+  add(m,'user');input.value='';
+  const w=document.createElement('div');w.className='bubble bot';w.textContent='…';chat.append(w);
+  pending.push({m,w});drain()
+}""".replace("\n", ""),
+    HOME_HTML,
+    count=1,
+    flags=re.S,
+)
 BOOKING_HTML = BOOKING_HTML.replace(
     "body:JSON.stringify(Object.fromEntries(new FormData(f)))",
     "body:JSON.stringify(Object.assign(Object.fromEntries(new FormData(f)),{booking_type:'{{ booking_type }}'}))"
@@ -394,8 +425,11 @@ def apply_grounded_observations(state, observations, text):
             updated[field] = True
     return updated
 
-def expected_dialog_action(state, intent, intent_evidence, text):
+def expected_dialog_action(state, intent, intent_evidence, text, first_client_turn=False):
     grounded_intent = grounded_in_current_message(intent_evidence, text)
+    if first_client_turn and intent in {"correction", "interest"}:
+        intent = "continue"
+        grounded_intent = False
     if explicit_correction_signal(text) or (intent == "correction" and grounded_intent):
         return "repair_interpretation"
     if intent == "end" and grounded_intent and explicit_end_signal(text):
@@ -466,7 +500,15 @@ def presupposes_unstated_obstacle(reply):
         low,
     ))
 
-def controller_reply_issues(payload, expected_action, state, history):
+def frames_first_turn_as_reaction(reply):
+    low = " ".join(normalized_words(reply))
+    return bool(re.search(
+        r"\bваш(?:а|у|е|и|ей|его)?\s+(?:реакц|мнени|оценк|решени|отказ)"
+        r"|\bпочему\s+(?:у вас\s+)?возникло\s+такое\s+мнение\b",
+        low,
+    ))
+
+def controller_reply_issues(payload, expected_action, state, history, first_client_turn=False):
     reply = payload["reply"]
     low = reply.lower()
     action = payload["action"]
@@ -483,6 +525,8 @@ def controller_reply_issues(payload, expected_action, state, history):
         issues.append("ответ начинается с предположения о состоянии клиента")
     if repeats_recent_opening(reply, history):
         issues.append("повторено начало предыдущей реплики")
+    if first_client_turn and frames_first_turn_as_reaction(reply):
+        issues.append("первая реплика клиента ошибочно представлена как реакция на эксперта")
     if action == "check_interest" and presupposes_unstated_obstacle(reply):
         issues.append("клиенту приписано препятствие или сомнение")
     question = question_from_reply(reply)
@@ -511,12 +555,20 @@ def controller_reply_issues(payload, expected_action, state, history):
         issues.append("неподтверждённое обещание")
     return issues
 
-def controller_prompt(state, context, history, text, retry_issues=None):
+def controller_prompt(state, context, history, text, retry_issues=None, first_client_turn=False):
     transcript = "\n".join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])
     correction = ""
     if retry_issues:
         correction = "\nПредыдущий вариант отклонён по причинам: " + "; ".join(retry_issues) + ". Исправьте механизм перехода и создайте другой ответ."
-    return SYSTEM_RULES + f"""
+    first_turn_rule = ""
+    if first_client_turn:
+        first_turn_rule = """
+ПЕРВАЯ РЕПЛИКА КЛИЕНТА: до неё эксперт произнёс только нейтральное приветствие.
+Она описывает ситуацию клиента или содержит его вопрос и не является реакцией на мнение,
+предложение, объяснение или отказ эксперта. Не называйте её «реакцией», «мнением» или отказом
+от разговора и не выясняйте, почему у клиента возникло такое мнение.
+"""
+    return SYSTEM_RULES + first_turn_rule + f"""
 
 Вы управляете одной следующей репликой по состояниям, а не по заготовленному скрипту.
 
@@ -584,13 +636,15 @@ def fallback_action_instruction(action):
         "end_dialog": "Коротко и спокойно попрощайтесь без вопроса, анализа и предложения консультации.",
     }[action]
 
-def fallback_reply_is_usable(reply, action, state, history):
+def fallback_reply_is_usable(reply, action, state, history, first_client_turn=False):
     if not reply or len(re.findall(r"\S+", reply)) > 55 or reply.count("?") > 1:
         return False
     low = reply.lower()
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         return False
     if uses_ungrounded_hypothesis(reply) or repeats_recent_opening(reply, history):
+        return False
+    if first_client_turn and frames_first_turn_as_reaction(reply):
         return False
     if action == "check_interest" and presupposes_unstated_obstacle(reply):
         return False
@@ -608,22 +662,23 @@ def fallback_reply_is_usable(reply, action, state, history):
 
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
+    first_client_turn = not any(row["role"] == "assistant" for row in history)
     primary_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
     fallback_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     primary_issues = []
     primary_error = None
     state = dict(original_state)
-    expected = expected_dialog_action(state, "continue", "", text)
+    expected = expected_dialog_action(state, "continue", "", text, first_client_turn)
     try:
-        raw = gigachat.reply([{"role": "system", "content": controller_prompt(original_state, context, history, text)}], model=primary_model)
+        raw = gigachat.reply([{"role": "system", "content": controller_prompt(original_state, context, history, text, first_client_turn=first_client_turn)}], model=primary_model)
         payload = parse_controller_payload(raw)
         if payload is None:
             primary_issues = ["ответ не соответствует JSON-схеме"]
         else:
             state = apply_grounded_observations(original_state, payload["observations"], text)
-            expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text)
+            expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text, first_client_turn)
             payload["action"] = expected
-            primary_issues = controller_reply_issues(payload, expected, original_state, history)
+            primary_issues = controller_reply_issues(payload, expected, original_state, history, first_client_turn)
             if not primary_issues:
                 return payload["reply"], expected, advance_dialog_state(state, expected, payload["reply"])
     except Exception as exc:
@@ -652,10 +707,10 @@ def generate_stateful_dialog_reply(history, text, context):
         if primary_error:
             raise primary_error
         raise
-    if fallback_reply_is_usable(fallback_reply, expected, original_state, history):
+    if fallback_reply_is_usable(fallback_reply, expected, original_state, history, first_client_turn):
         return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
     cleaned_reply = clean_fallback_reply(fallback_reply, expected)
-    if fallback_reply_is_usable(cleaned_reply, expected, original_state, history):
+    if fallback_reply_is_usable(cleaned_reply, expected, original_state, history, first_client_turn):
         app.logger.warning("Fallback reply was repaired locally for action %s", expected)
         return cleaned_reply, expected, advance_dialog_state(state, expected, cleaned_reply)
     if cleaned_reply:
