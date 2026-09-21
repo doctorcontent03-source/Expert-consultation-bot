@@ -404,6 +404,10 @@ def expected_dialog_action(state, intent, intent_evidence, text):
         return "respect_boundary"
     if intent == "question" and grounded_intent:
         return "answer_information"
+    if state["solution_explained"]:
+        if intent == "interest" and grounded_intent:
+            return "offer_consultation" if not state["consultation_offered"] else "check_interest"
+        return "check_interest"
     required_complete = (
         state["contact"] and state["need"]
         and state["previous_experience"] and state["desired_result"]
@@ -412,11 +416,7 @@ def expected_dialog_action(state, intent, intent_evidence, text):
         return "explore"
     if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
-    if not state["solution_explained"]:
-        return "explain_solution"
-    if intent == "interest" and grounded_intent:
-        return "offer_consultation" if not state["consultation_offered"] else "check_interest"
-    return "check_interest"
+    return "explain_solution"
 
 def question_from_reply(reply):
     parts = re.findall(r"[^?]*\?", reply)
