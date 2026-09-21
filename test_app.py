@@ -47,6 +47,15 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
         "intent": intent,
         "intent_evidence": evidence,
         "observations": fields,
+        "reply_assessment": {
+            "based_on_client_meaning": True,
+            "treats_message_as_feedback_to_expert": False,
+            "asks_only_missing_information": True,
+            "repeats_known_information": False,
+            "performs_expert_work": False,
+            "pressures_client": False,
+            "question_count": reply.count("?"),
+        },
     }, ensure_ascii=False)
 
 
@@ -139,14 +148,18 @@ class TestBot(unittest.TestCase):
         text = "Я сейчас не хочу это обсуждать"
         self.assertEqual(target.expected_dialog_action(self.state(), "boundary", text, text), "respect_boundary")
 
-    def test_explicit_correction_is_repaired(self):
-        text = "Кто сказал, что меня что-то останавливает?"
-        self.assertEqual(target.expected_dialog_action(self.state(), "question", text, text), "repair_interpretation")
+    def test_semantic_correction_is_repaired_independent_of_wording(self):
+        for text in ("Вы поняли меня не так", "Я говорила совсем о другом", "Это неверный вывод"):
+            self.assertEqual(target.expected_dialog_action(self.state(), "correction", text, text), "repair_interpretation")
 
-    def test_end_requires_explicit_end_signal(self):
-        self.assertEqual(target.expected_dialog_action(self.state(), "end", "ерунда", "Да ерунда какая-то"), "explore")
-        text = "Не хочу больше продолжать разговор"
+    def test_semantic_end_requires_grounded_evidence(self):
+        self.assertEqual(target.expected_dialog_action(self.state(), "end", "другая цитата", "Да ерунда какая-то"), "explore")
+        text = "На этом закончим"
         self.assertEqual(target.expected_dialog_action(self.state(), "end", text, text), "end_dialog")
+
+    def test_semantic_rupture_repairs_contact_independent_of_wording(self):
+        for text in ("Этот вопрос здесь неуместен", "Вы вообще меня слышите?", "Так беседовать невозможно"):
+            self.assertEqual(target.expected_dialog_action(self.state(), "rupture", text, text), "repair_contact")
 
     # First client turn is situation/question, never feedback to expert
     def test_first_turn_situation_cannot_be_treated_as_reaction(self):
@@ -156,33 +169,39 @@ class TestBot(unittest.TestCase):
             "explore",
         )
 
-    def test_first_turn_situation_cannot_be_treated_as_boundary_or_end(self):
+    def test_first_turn_preserves_semantically_grounded_boundary_or_end(self):
         state = self.state()
-        text = "Да ерунда какая-то, ничего не хочу."
-        self.assertEqual(target.expected_dialog_action(state, "boundary", "ничего не хочу", text, first_client_turn=True), "explore")
-        self.assertEqual(target.expected_dialog_action(state, "end", "ничего не хочу", text, first_client_turn=True), "explore")
+        boundary = "Я не хочу это обсуждать"
+        ending = "До свидания"
+        self.assertEqual(target.expected_dialog_action(state, "boundary", boundary, boundary, first_client_turn=True), "respect_boundary")
+        self.assertEqual(target.expected_dialog_action(state, "end", ending, ending, first_client_turn=True), "end_dialog")
 
     def test_first_turn_direct_question_still_gets_answer(self):
         state = self.state()
         text = "Сколько стоит консультация?"
         self.assertEqual(target.expected_dialog_action(state, "question", text, text, first_client_turn=True), "answer_information")
 
-    def test_first_turn_validator_rejects_feedback_framing(self):
-        bad = payload("Понял вашу реакцию. Почему возникло такое мнение?")
-        parsed = target.parse_controller_payload(bad)
-        issues = target.controller_reply_issues(parsed, "explore", self.state(), [], first_client_turn=True)
-        self.assertIn("первая реплика клиента ошибочно представлена как реакция на эксперта", issues)
+    def test_first_turn_validator_uses_semantic_assessment(self):
+        bad = target.parse_controller_payload(payload("Ответ эксперта?"))
+        bad["reply_assessment"]["treats_message_as_feedback_to_expert"] = True
+        issues = target.controller_reply_issues(bad, "explore", self.state(), [], first_client_turn=True)
+        self.assertIn("первая реплика ошибочно представлена как оценка слов эксперта", issues)
 
     def test_first_turn_prompt_marks_neutral_greeting_context(self):
         prompt = target.controller_prompt(self.state(), "База", [], "Да ерунда какая-то", first_client_turn=True)
         self.assertIn("ПЕРВАЯ РЕПЛИКА КЛИЕНТА", prompt)
-        self.assertIn("не является реакцией", prompt)
+        self.assertIn("содержательного высказывания", prompt)
+
+    def test_sufficient_psychologist_information_does_not_require_extra_context(self):
+        state = self.state(
+            need=True,
+            previous_experience=True,
+            desired_result=True,
+            diagnostic_questions=2,
+        )
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Вернуть смысл жизни"), "explain_solution")
 
     # Reply validation
-    def test_no_ungrounded_hypothesis(self):
-        self.assertTrue(target.uses_ungrounded_hypothesis("Понятно. Похоже, вам трудно."))
-        self.assertFalse(target.uses_ungrounded_hypothesis("Понятно, это длится два года."))
-
     def test_no_repeated_question(self):
         state = self.state(asked_questions=["Давно у вас такое состояние?"])
         data = target.parse_controller_payload(payload("Давно у вас такое состояние?"))
@@ -213,17 +232,17 @@ class TestBot(unittest.TestCase):
         self.assertIn("не организация и не команда", target.SYSTEM_RULES)
         self.assertIn("будем рады", target.SYSTEM_RULES)
 
-    def test_fallback_never_advances_state_when_invalid(self):
+    def test_shown_fallback_question_always_advances_state(self):
         invalid = ScriptedGigaChat([
-            payload("Понял вашу реакцию. Почему возникло такое мнение?"),
-            "Понял вашу реакцию. Почему возникло такое мнение?",
+            "invalid json",
+            "Сколько это длится? Как это влияет на вашу жизнь?",
         ])
         target.gigachat = invalid
         with target.app.test_request_context("/"):
             answer, action, state = target.generate_stateful_dialog_reply([], "Да ерунда какая-то, ничего не хочу.", "База")
-        self.assertEqual(action, "continue_without_transition")
-        self.assertEqual(state["diagnostic_questions"], 0)
-        self.assertTrue(answer)
+        self.assertEqual(action, "explore")
+        self.assertEqual(answer.count("?"), 1)
+        self.assertEqual(state["diagnostic_questions"], 1)
 
     # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
@@ -323,4 +342,3 @@ class TestBot(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
