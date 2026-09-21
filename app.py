@@ -425,22 +425,22 @@ def repeats_recent_opening(reply, history):
 
 def uses_ungrounded_hypothesis(reply):
     return bool(re.search(
-        r"(?:^|[.!?]\\s+)(?:похоже|возможно|вероятно|видимо|кажется)\\b",
+        r"(?:^|[.!?]\s+)(?:похоже|возможно|вероятно|видимо|кажется)\b",
         str(reply).lower(),
     ))
 
 def clean_fallback_reply(reply, action):
     cleaned = str(reply or "").strip()
     cleaned = re.sub(
-        r"(?:^|(?<=[.!?])\\s+)(?:похоже|возможно|вероятно|видимо|кажется)\\b[^.!?]*(?:[.!?]|$)",
+        r"(?:^|(?<=[.!?])\s+)(?:похоже|возможно|вероятно|видимо|кажется)\b[^.!?]*(?:[.!?]|$)",
         " ",
         cleaned,
         flags=re.I,
     )
     if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"}:
-        cleaned = re.sub(r"[^.!?]*\\?+", " ", cleaned)
+        cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
     cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
-    return re.sub(r"\\s+", " ", cleaned).strip()
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 def controller_reply_issues(payload, expected_action, state, history):
     reply = payload["reply"]
