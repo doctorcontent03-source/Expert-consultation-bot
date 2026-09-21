@@ -424,8 +424,23 @@ def repeats_recent_opening(reply, history):
     return bool(previous) and current == reply_opening(previous)
 
 def uses_ungrounded_hypothesis(reply):
-    low = " ".join(normalized_words(reply))
-    return bool(re.search(r"^(?:похоже|возможно|вероятно|видимо|кажется) вы\b", low))
+    return bool(re.search(
+        r"(?:^|[.!?]\s+)(?:похоже|возможно|вероятно|видимо|кажется)\b",
+        str(reply).lower(),
+    ))
+
+def clean_fallback_reply(reply, action):
+    cleaned = str(reply or "").strip()
+    cleaned = re.sub(
+        r"(?:^|(?<=[.!?])\s+)(?:похоже|возможно|вероятно|видимо|кажется)\b[^.!?]*(?:[.!?]|$)",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"}:
+        cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
+    cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 def controller_reply_issues(payload, expected_action, state, history):
     reply = payload["reply"]
@@ -502,7 +517,7 @@ respect_boundary — принять границу без нового вопр�
 repair_interpretation — признать неверное понимание без нового диагностического вопроса;
 end_dialog — попрощаться только при явном завершении разговора.
 
-Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента и не начинайте ответ с гипотезы о том, что он якобы чувствует, думает или понимает. Не повторяйте начало предыдущей реплики и уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
+Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не начинайте ни одно предложение со слов «похоже», «возможно», «вероятно», «видимо» или «кажется» и не выдвигайте гипотез о том, что клиент якобы чувствует, думает или понимает. Не повторяйте начало предыдущей реплики и уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
 
 Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
 contact — понятен контекст жизни или ситуации клиента;
@@ -592,7 +607,7 @@ def generate_stateful_dialog_reply(history, text, context):
 
 Создайте только следующую реплику эксперта, без JSON, пояснений и служебных комментариев.
 Назначенная функция реплики: {fallback_action_instruction(expected)}
-Учитывайте весь разговор. Опирайтесь на конкретные слова клиента, не приписывайте ему чувства, мысли и причины, которых он не называл. Не начинайте так же, как предыдущую реплику, и не повторяйте уже заданный вопрос. Максимум 45 слов и один вопрос.
+Учитывайте весь разговор. Опирайтесь на конкретные слова клиента, не приписывайте ему чувства, мысли и причины, которых он не называл. Не начинайте ни одно предложение со слов «похоже», «возможно», «вероятно», «видимо» или «кажется». Не начинайте так же, как предыдущую реплику, и не повторяйте уже заданный вопрос. Максимум 45 слов и один вопрос.
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -609,9 +624,19 @@ def generate_stateful_dialog_reply(history, text, context):
         if primary_error:
             raise primary_error
         raise
-    if not fallback_reply_is_usable(fallback_reply, expected, original_state, history):
-        raise RuntimeError("Резервная модель не смогла создать допустимую реплику")
-    return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
+    if fallback_reply_is_usable(fallback_reply, expected, original_state, history):
+        return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
+    cleaned_reply = clean_fallback_reply(fallback_reply, expected)
+    if fallback_reply_is_usable(cleaned_reply, expected, original_state, history):
+        app.logger.warning("Fallback reply was repaired locally for action %s", expected)
+        return cleaned_reply, expected, advance_dialog_state(state, expected, cleaned_reply)
+    if cleaned_reply:
+        app.logger.warning("Fallback reply kept dialog alive without advancing state for action %s", expected)
+        return cleaned_reply, "continue_without_transition", original_state
+    if fallback_reply:
+        app.logger.warning("Fallback reply kept dialog alive in original form without advancing state")
+        return fallback_reply, "continue_without_transition", original_state
+    raise RuntimeError("GigaChat returned no reply")
 
 def advance_dialog_state(state, action, reply):
     updated = dict(state)
