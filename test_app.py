@@ -56,9 +56,34 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
             "pressures_client": False,
             "offers_consultation": action == "offer_consultation",
             "uses_generic_self_promotion": False,
+            "gender_matches_expert": True,
+            "adds_or_repeats_consultation_offer": False,
+            "answers_client_question": True,
+            "leaks_internal_instructions": False,
             "question_count": reply.count("?"),
         },
     }, ensure_ascii=False)
+
+
+def review(**changes):
+    import json
+    result = {
+        "based_on_client_meaning": True,
+        "treats_message_as_feedback_to_expert": False,
+        "asks_only_missing_information": True,
+        "repeats_known_information": False,
+        "performs_expert_work": False,
+        "pressures_client": False,
+        "offers_consultation": False,
+        "uses_generic_self_promotion": False,
+        "gender_matches_expert": True,
+        "adds_or_repeats_consultation_offer": False,
+        "answers_client_question": True,
+        "leaks_internal_instructions": False,
+        "question_count": 1,
+    }
+    result.update(changes)
+    return json.dumps(result, ensure_ascii=False)
 
 
 class TestBot(unittest.TestCase):
@@ -229,6 +254,29 @@ class TestBot(unittest.TestCase):
         self.assertIn("консультация не предложена", issues)
         self.assertIn("вместо приглашения используется общая реклама помощи", issues)
 
+    def test_wrong_expert_gender_is_rejected_semantically(self):
+        data = target.parse_controller_payload(payload("Готова ответить на ваши вопросы.", action="answer_information"))
+        data["reply_assessment"]["gender_matches_expert"] = False
+        issues = target.controller_reply_issues(data, "answer_information", self.state(), [])
+        self.assertIn("грамматический род не соответствует эксперту", issues)
+
+    def test_second_consultation_invitation_is_rejected_semantically(self):
+        data = target.parse_controller_payload(payload("Ответ на организационный вопрос.", action="answer_information"))
+        data["reply_assessment"]["adds_or_repeats_consultation_offer"] = True
+        issues = target.controller_reply_issues(
+            data,
+            "answer_information",
+            self.state(consultation_offered=True),
+            [],
+        )
+        self.assertIn("консультация предложена повторно", issues)
+
+    def test_internal_instructions_are_rejected_semantically(self):
+        data = target.parse_controller_payload(payload("Служебная структура", action="answer_information"))
+        data["reply_assessment"]["leaks_internal_instructions"] = True
+        issues = target.controller_reply_issues(data, "answer_information", self.state(), [])
+        self.assertIn("в ответ попали служебные инструкции", issues)
+
     def test_repeated_assistant_reply_is_rejected_generically(self):
         previous = "Краткое отражение запроса и один вопрос?"
         data = target.parse_controller_payload(payload(previous))
@@ -271,16 +319,19 @@ class TestBot(unittest.TestCase):
         self.assertIn("не организация и не команда", target.SYSTEM_RULES)
         self.assertIn("будем рады", target.SYSTEM_RULES)
 
-    def test_shown_fallback_question_always_advances_state(self):
+    def test_malformed_structured_output_is_repaired_and_never_leaked(self):
+        malformed = payload("Давно у вас такое состояние?").replace('":', '"\\:')
         invalid = ScriptedGigaChat([
             "invalid json",
-            "Сколько это длится? Как это влияет на вашу жизнь?",
+            malformed,
+            review(),
         ])
         target.gigachat = invalid
         with target.app.test_request_context("/"):
             answer, action, state = target.generate_stateful_dialog_reply([], "Да ерунда какая-то, ничего не хочу.", "База")
         self.assertEqual(action, "explore")
         self.assertEqual(answer.count("?"), 1)
+        self.assertFalse(answer.lstrip().startswith("{"))
         self.assertEqual(state["diagnostic_questions"], 1)
 
     # Calendar and post-booking
