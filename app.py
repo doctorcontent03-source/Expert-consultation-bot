@@ -347,6 +347,7 @@ def controller_state():
         "solution_explained": bool(saved.get("solution_explained")),
         "interest_confirmed": bool(saved.get("interest_confirmed")),
         "consultation_offered": bool(saved.get("consultation_offered")),
+        "declined": bool(saved.get("declined")),
         "diagnostic_questions": max(0, min(3, int(saved.get("diagnostic_questions", 0) or 0))),
         "asked_questions": list(saved.get("asked_questions") or [])[-3:],
     }
@@ -370,9 +371,9 @@ def parse_controller_payload(raw):
     assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
         return None
-    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "answer_information", "respect_boundary", "repair_interpretation", "repair_contact", "end_dialog"}:
+    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "answer_information", "respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog"}:
         return None
-    if intent not in {"continue", "interest", "question", "boundary", "end", "correction", "rupture"}:
+    if intent not in {"continue", "interest", "decline", "question", "boundary", "end", "correction", "rupture"}:
         return None
     if not isinstance(observations, dict) or not isinstance(assessment, dict):
         return None
@@ -402,6 +403,8 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         grounded_intent = False
     if intent == "rupture" and grounded_intent:
         return "repair_contact"
+    if intent == "decline" and grounded_intent:
+        return "respect_decline"
     if intent == "correction" and grounded_intent:
         return "repair_interpretation"
     if intent == "end" and grounded_intent:
@@ -419,7 +422,7 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "explore"
     if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
-    return "explain_solution"
+    return "offer_consultation"
 
 def question_from_reply(reply):
     parts = re.findall(r"[^?]*\?", reply)
@@ -430,6 +433,18 @@ def questions_are_similar(left, right):
     if not a or not b:
         return False
     return len(a & b) / len(a | b) >= 0.72
+
+def repeats_recent_reply(reply, history):
+    current = set(normalized_words(reply))
+    if not current:
+        return False
+    for row in reversed(history):
+        if row["role"] != "assistant":
+            continue
+        previous = set(normalized_words(row["content"]))
+        if previous and len(current & previous) / len(current | previous) >= 0.88:
+            return True
+    return False
 
 def clean_fallback_reply(reply, action):
     cleaned = str(reply or "").strip()
@@ -470,8 +485,14 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("бот начинает проводить консультацию в чате")
     if assessment.get("pressures_client") is True:
         issues.append("бот давит на клиента")
+    if action == "offer_consultation" and assessment.get("offers_consultation") is not True:
+        issues.append("консультация не предложена")
+    if action == "offer_consultation" and assessment.get("uses_generic_self_promotion") is True:
+        issues.append("вместо приглашения используется общая реклама помощи")
     if int(assessment.get("question_count", reply.count("?")) or 0) > 1:
         issues.append("задано больше одного смыслового вопроса")
+    if repeats_recent_reply(reply, history):
+        issues.append("повторена предыдущая реплика")
     question = question_from_reply(reply)
     if action == "explore":
         if not question:
@@ -480,7 +501,7 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
             issues.append("преждевременно предложена встреча")
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
             issues.append("повторён уже заданный вопрос")
-    if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and question:
+    if action in {"respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and question:
         issues.append("задан вопрос на этапе без вопросов")
     if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
         issues.append("ответ на вопрос заменён записью")
@@ -488,8 +509,6 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("интерес подменён записью")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         issues.append("маркер записи появился не на том этапе")
-    if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
-        issues.append("встреча не предложена")
     if re.search(r"\b(психолог|специалист|эксперт) (?:поможет|сможет|проводит)\b", low):
         issues.append("эксперт говорит о себе в третьем лице")
     if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
@@ -520,10 +539,10 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 2. Понять потребность и желаемое изменение.
 3. Выяснить релевантный предыдущий опыт. Для психолога — длительность проблемы или её влияние на жизнь.
 4. Если сведений достаточно, прекратить диагностику.
-5. Объяснить, чем может быть полезна встреча с экспертом, не проводя консультацию в чате.
-6. Проверить интерес к объяснённому направлению.
+5. Для психолога после достаточных 2–3 уточнений кратко связать запрос с работой на встрече и ненавязчиво предложить первичную консультацию. Не вставлять отдельную рекламную презентацию помощи.
+6. Если консультация уже была предложена, учитывать согласие, вопросы или отказ клиента без повторного предложения.
 7. Сначала отвечать на прямые вопросы и учитывать сомнения.
-8. Предлагать консультацию только после объяснения решения и проявленного интереса.
+8. Для экспертов, продающих отдельный продукт или решение, предлагать консультацию после объяснения решения и проявленного интереса. Для психолога консультация является самой услугой и предлагается сразу после завершённого выявления потребности.
 
 Выберите ровно одно действие:
 explore — получить один недостающий факт;
@@ -532,6 +551,7 @@ check_interest — проверить интерес без записи;
 offer_consultation — один раз предложить встречу;
 answer_information — ответить на прямой вопрос;
 respect_boundary — принять границу без нового вопроса и давления;
+respect_decline — принять отказ от предложенного направления или встречи, не переубеждать и не повторять предложение;
 repair_interpretation — признать неверное понимание без нового диагностического вопроса;
 repair_contact — признать, что предыдущий ход разговора был неуместным, остановить диагностику и не оправдываться;
 end_dialog — попрощаться только при явном завершении разговора.
@@ -544,10 +564,11 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
-rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте это по смыслу сообщения в контексте, а не по отдельным словам.
+decline означает, что клиент отклоняет последнее предложение или приглашение, но не обязательно завершает весь разговор.
+rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}},"reply_assessment":{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,"asks_only_missing_information":true,"repeats_known_information":false,"performs_expert_work":false,"pressures_client":false,"question_count":1}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}},"reply_assessment":{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,"asks_only_missing_information":true,"repeats_known_information":false,"performs_expert_work":false,"pressures_client":false,"offers_consultation":false,"uses_generic_self_promotion":false,"question_count":1}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -571,9 +592,10 @@ def fallback_action_instruction(action):
         "explore": "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации. Не завершайте разговор и не предлагайте встречу.",
         "explain_solution": "Без вопроса кратко объясните от первого лица, чем встреча с вами может быть полезна в описанной ситуации. Не проводите консультацию в чате и не предлагайте запись.",
         "check_interest": "Нейтрально выясните отношение клиента к уже объяснённому направлению помощи. Не приписывайте ему сомнение, страх, отказ или препятствие и не предлагайте запись.",
-        "offer_consultation": "Один раз предложите подходящую консультацию от первого лица.",
+        "offer_consultation": "Кратко свяжите уже понятный запрос с разбором на встрече и один раз ненавязчиво предложите первичную консультацию от первого лица. Не рекламируйте себя, не обещайте результат и не описывайте помощь общими продающими формулировками.",
         "answer_information": "Прямо ответьте на последний вопрос клиента по базе знаний. Не заменяйте ответ приглашением.",
         "respect_boundary": "Коротко примите обозначенную клиентом границу. Не задавайте вопрос, не анализируйте и не уговаривайте.",
+        "respect_decline": "Коротко и спокойно примите отказ от последнего предложения. Не задавайте вопрос, не переубеждайте и не повторяйте предложение.",
         "repair_interpretation": "Коротко признайте неверное понимание и исправьте его по словам клиента. Не задавайте новый диагностический вопрос.",
         "repair_contact": "Коротко признайте, что предыдущий ход беседы был неуместным. Не оправдывайтесь, не задавайте вопрос и не продолжайте диагностику в этой реплике.",
         "end_dialog": "Коротко и спокойно попрощайтесь без вопроса, анализа и предложения консультации.",
@@ -591,7 +613,7 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
             return False
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
             return False
-    if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and "?" in reply:
+    if action in {"respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and "?" in reply:
         return False
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         return False
@@ -685,8 +707,9 @@ def advance_dialog_state(state, action, reply):
     elif action == "explain_solution":
         updated["solution_explained"] = True
     elif action == "offer_consultation":
-        updated["interest_confirmed"] = True
         updated["consultation_offered"] = True
+    elif action == "respect_decline":
+        updated["declined"] = True
     return updated
 
 def yandex_calendar():
