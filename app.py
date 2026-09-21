@@ -335,38 +335,6 @@ def grounded_in_current_message(evidence, text):
     source = " ".join(normalized_words(text))
     return bool(evidence) and evidence in source
 
-def explicit_end_signal(text):
-    low = " ".join(normalized_words(text))
-    patterns = (
-        r"\bдо свидания\b", r"\bвсего доброго\b", r"\bразговор окончен\b",
-        r"\bзакончим (?:на этом|разговор)\b", r"\bне хочу (?:больше )?(?:говорить|разговаривать|продолжать)\b",
-        r"\bне буду (?:больше )?(?:говорить|разговаривать|продолжать)\b",
-    )
-    return any(re.search(pattern, low) for pattern in patterns)
-
-def explicit_boundary_signal(text):
-    low = " ".join(normalized_words(text))
-    patterns = (
-        r"\bне хочу (?:сейчас )?(?:это )?(?:обсуждать|рассказывать|отвечать)\b",
-        r"\bне буду (?:это )?(?:обсуждать|рассказывать|отвечать)\b",
-        r"\bне (?:задавайте|спрашивайте)\b",
-        r"\bхватит (?:вопросов|спрашивать|расспрашивать)\b",
-        r"\bне хочу углубляться\b",
-    )
-    return any(re.search(pattern, low) for pattern in patterns)
-
-def explicit_correction_signal(text):
-    low = " ".join(normalized_words(text))
-    patterns = (
-        r"\bкто сказал\b",
-        r"\bс чего вы (?:взяли|решили)\b",
-        r"\bя (?:этого )?не (?:говорил|говорила|писал|писала|утверждал|утверждала)\b",
-        r"\bя не выражал(?:а)?\b",
-        r"\bвы меня (?:неправильно|не так) поняли\b",
-        r"\bя имел(?:а)? в виду другое\b",
-    )
-    return any(re.search(pattern, low) for pattern in patterns)
-
 def controller_state():
     saved = session.get("dialog_controller_state")
     if not isinstance(saved, dict):
@@ -399,13 +367,14 @@ def parse_controller_payload(raw):
     intent = data.get("intent")
     evidence = data.get("intent_evidence", "")
     observations = data.get("observations")
+    assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
         return None
-    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "answer_information", "respect_boundary", "repair_interpretation", "end_dialog"}:
+    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "answer_information", "respect_boundary", "repair_interpretation", "repair_contact", "end_dialog"}:
         return None
-    if intent not in {"continue", "interest", "question", "boundary", "end", "correction"}:
+    if intent not in {"continue", "interest", "question", "boundary", "end", "correction", "rupture"}:
         return None
-    if not isinstance(observations, dict):
+    if not isinstance(observations, dict) or not isinstance(assessment, dict):
         return None
     return {
         "reply": reply.strip(),
@@ -413,6 +382,7 @@ def parse_controller_payload(raw):
         "intent": intent,
         "intent_evidence": str(evidence or "").strip(),
         "observations": observations,
+        "reply_assessment": assessment,
     }
 
 def apply_grounded_observations(state, observations, text):
@@ -427,14 +397,16 @@ def apply_grounded_observations(state, observations, text):
 
 def expected_dialog_action(state, intent, intent_evidence, text, first_client_turn=False):
     grounded_intent = grounded_in_current_message(intent_evidence, text)
-    if first_client_turn and intent in {"correction", "interest"}:
+    if first_client_turn and intent in {"correction", "interest", "rupture"}:
         intent = "continue"
         grounded_intent = False
-    if explicit_correction_signal(text) or (intent == "correction" and grounded_intent):
+    if intent == "rupture" and grounded_intent:
+        return "repair_contact"
+    if intent == "correction" and grounded_intent:
         return "repair_interpretation"
-    if intent == "end" and grounded_intent and explicit_end_signal(text):
+    if intent == "end" and grounded_intent:
         return "end_dialog"
-    if intent == "boundary" and grounded_intent and explicit_boundary_signal(text):
+    if intent == "boundary" and grounded_intent:
         return "respect_boundary"
     if intent == "question" and grounded_intent:
         return "answer_information"
@@ -442,10 +414,7 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         if intent == "interest" and grounded_intent:
             return "offer_consultation" if not state["consultation_offered"] else "check_interest"
         return "check_interest"
-    required_complete = (
-        state["contact"] and state["need"]
-        and state["previous_experience"] and state["desired_result"]
-    )
+    required_complete = state["need"] and state["previous_experience"] and state["desired_result"]
     if state["diagnostic_questions"] < 2:
         return "explore"
     if not required_complete and state["diagnostic_questions"] < 3:
@@ -462,57 +431,25 @@ def questions_are_similar(left, right):
         return False
     return len(a & b) / len(a | b) >= 0.72
 
-def reply_opening(reply, size=2):
-    words = normalized_words(reply)
-    return tuple(words[:size])
-
-def repeats_recent_opening(reply, history):
-    current = reply_opening(reply)
-    if not current:
-        return False
-    previous = next((row["content"] for row in reversed(history) if row["role"] == "assistant"), "")
-    return bool(previous) and current == reply_opening(previous)
-
-def uses_ungrounded_hypothesis(reply):
-    return bool(re.search(
-        r"(?:^|[.!?]\s+)(?:похоже|возможно|вероятно|видимо|кажется)\b",
-        str(reply).lower(),
-    ))
-
 def clean_fallback_reply(reply, action):
     cleaned = str(reply or "").strip()
-    cleaned = re.sub(
-        r"(?:^|(?<=[.!?])\s+)(?:похоже|возможно|вероятно|видимо|кажется)\b[^.!?]*(?:[.!?]|$)",
-        " ",
-        cleaned,
-        flags=re.I,
-    )
-    if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"}:
+    if action == "explore" and cleaned.count("?") > 1:
+        positions = [match.start() for match in re.finditer(r"\?", cleaned)]
+        chars = list(cleaned)
+        for position in positions[:-1]:
+            chars[position] = "."
+        cleaned = "".join(chars)
+    if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"}:
         cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
     cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
     return re.sub(r"\s+", " ", cleaned).strip()
-
-def presupposes_unstated_obstacle(reply):
-    low = " ".join(normalized_words(reply))
-    return bool(re.search(
-        r"\b(?:что|почему) (?:вас )?(?:останавливает|сдерживает|смущает|пугает|мешает)"
-        r"|\bпочему вы (?:сомневаетесь|не готовы|отказываетесь)\b",
-        low,
-    ))
-
-def frames_first_turn_as_reaction(reply):
-    low = " ".join(normalized_words(reply))
-    return bool(re.search(
-        r"\bваш(?:а|у|е|и|ей|его)?\s+(?:реакц|мнени|оценк|решени|отказ)"
-        r"|\bпочему\s+(?:у вас\s+)?возникло\s+такое\s+мнение\b",
-        low,
-    ))
 
 def controller_reply_issues(payload, expected_action, state, history, first_client_turn=False):
     reply = payload["reply"]
     low = reply.lower()
     action = payload["action"]
     issues = []
+    assessment = payload.get("reply_assessment") or {}
     if action != expected_action:
         issues.append("назначено неверное действие")
     if len(re.findall(r"\S+", reply)) > 45:
@@ -521,14 +458,20 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("задано больше одного вопроса")
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         issues.append("служебный комментарий")
-    if uses_ungrounded_hypothesis(reply):
-        issues.append("ответ начинается с предположения о состоянии клиента")
-    if repeats_recent_opening(reply, history):
-        issues.append("повторено начало предыдущей реплики")
-    if first_client_turn and frames_first_turn_as_reaction(reply):
-        issues.append("первая реплика клиента ошибочно представлена как реакция на эксперта")
-    if action == "check_interest" and presupposes_unstated_obstacle(reply):
-        issues.append("клиенту приписано препятствие или сомнение")
+    if assessment.get("based_on_client_meaning") is not True:
+        issues.append("ответ не опирается на смысл слов клиента")
+    if assessment.get("treats_message_as_feedback_to_expert") is True and first_client_turn:
+        issues.append("первая реплика ошибочно представлена как оценка слов эксперта")
+    if assessment.get("asks_only_missing_information") is not True:
+        issues.append("запрошена уже известная или ненужная информация")
+    if assessment.get("repeats_known_information") is True:
+        issues.append("повторена уже подтверждённая информация")
+    if assessment.get("performs_expert_work") is True:
+        issues.append("бот начинает проводить консультацию в чате")
+    if assessment.get("pressures_client") is True:
+        issues.append("бот давит на клиента")
+    if int(assessment.get("question_count", reply.count("?")) or 0) > 1:
+        issues.append("задано больше одного смыслового вопроса")
     question = question_from_reply(reply)
     if action == "explore":
         if not question:
@@ -537,10 +480,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
             issues.append("преждевременно предложена встреча")
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
             issues.append("повторён уже заданный вопрос")
-    if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"} and question:
+    if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and question:
         issues.append("задан вопрос на этапе без вопросов")
-    if action == "end_dialog" and not explicit_end_signal(payload["intent_evidence"]):
-        issues.append("нет явного завершения разговора")
     if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
         issues.append("ответ на вопрос заменён записью")
     if action == "check_interest" and re.search(r"(запис|когда вам удобно|\[\[book_)", low):
@@ -564,9 +505,8 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
     if first_client_turn:
         first_turn_rule = """
 ПЕРВАЯ РЕПЛИКА КЛИЕНТА: до неё эксперт произнёс только нейтральное приветствие.
-Она описывает ситуацию клиента или содержит его вопрос и не является реакцией на мнение,
-предложение, объяснение или отказ эксперта. Не называйте её «реакцией», «мнением» или отказом
-от разговора и не выясняйте, почему у клиента возникло такое мнение.
+Определяйте её функцию с учётом этого контекста: содержательного высказывания, предложения
+или объяснения эксперта до неё ещё не было.
 """
     return SYSTEM_RULES + first_turn_rule + f"""
 
@@ -593,9 +533,10 @@ offer_consultation — один раз предложить встречу;
 answer_information — ответить на прямой вопрос;
 respect_boundary — принять границу без нового вопроса и давления;
 repair_interpretation — признать неверное понимание без нового диагностического вопроса;
+repair_contact — признать, что предыдущий ход разговора был неуместным, остановить диагностику и не оправдываться;
 end_dialog — попрощаться только при явном завершении разговора.
 
-Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению — например отдельное «возможно» или «наверное» — не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не начинайте ни одно предложение со слов «похоже», «возможно», «вероятно», «видимо» или «кажется» и не выдвигайте гипотез о том, что клиент якобы чувствует, думает или понимает. Не повторяйте начало предыдущей реплики и уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
+Не считайте описание состояния отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не выдвигайте неподтверждённых гипотез, не повторяйте уже полученную информацию и заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один смысловой вопрос.
 
 Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
 contact — понятен контекст жизни или ситуации клиента;
@@ -603,9 +544,10 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
+rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте это по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|repair_interpretation|end_dialog","intent":"continue|interest|question|boundary|end|correction","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}},"reply_assessment":{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,"asks_only_missing_information":true,"repeats_known_information":false,"performs_expert_work":false,"pressures_client":false,"question_count":1}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -633,6 +575,7 @@ def fallback_action_instruction(action):
         "answer_information": "Прямо ответьте на последний вопрос клиента по базе знаний. Не заменяйте ответ приглашением.",
         "respect_boundary": "Коротко примите обозначенную клиентом границу. Не задавайте вопрос, не анализируйте и не уговаривайте.",
         "repair_interpretation": "Коротко признайте неверное понимание и исправьте его по словам клиента. Не задавайте новый диагностический вопрос.",
+        "repair_contact": "Коротко признайте, что предыдущий ход беседы был неуместным. Не оправдывайтесь, не задавайте вопрос и не продолжайте диагностику в этой реплике.",
         "end_dialog": "Коротко и спокойно попрощайтесь без вопроса, анализа и предложения консультации.",
     }[action]
 
@@ -642,19 +585,13 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
     low = reply.lower()
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         return False
-    if uses_ungrounded_hypothesis(reply) or repeats_recent_opening(reply, history):
-        return False
-    if first_client_turn and frames_first_turn_as_reaction(reply):
-        return False
-    if action == "check_interest" and presupposes_unstated_obstacle(reply):
-        return False
     if action == "explore":
         question = question_from_reply(reply)
         if not question or re.search(r"(запис|консультац|встреч|до встречи|всего доброго|обращайтесь)", low):
             return False
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
             return False
-    if action in {"respect_boundary", "repair_interpretation", "end_dialog", "explain_solution"} and "?" in reply:
+    if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and "?" in reply:
         return False
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         return False
@@ -686,39 +623,56 @@ def generate_stateful_dialog_reply(history, text, context):
         primary_issues = ["основная модель не вернула ответ"]
         app.logger.exception("Primary dialog generation failed")
 
-    fallback_prompt = SYSTEM_RULES + f"""
-
-Создайте только следующую реплику эксперта, без JSON, пояснений и служебных комментариев.
-Назначенная функция реплики: {fallback_action_instruction(expected)}
-Учитывайте весь разговор. Опирайтесь на конкретные слова клиента, не приписывайте ему чувства, мысли и причины, которых он не называл. Не начинайте ни одно предложение со слов «похоже», «возможно», «вероятно», «видимо» или «кажется». Не начинайте так же, как предыдущую реплику, и не повторяйте уже заданный вопрос. Максимум 45 слов и один вопрос.
-
-БАЗА ЗНАНИЙ:
-{context[-10000:]}
-
-ДИАЛОГ:
-{chr(10).join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])[-7000:]}
-Клиент: {text}
-
-Первая попытка была отклонена: {"; ".join(primary_issues)}."""
+    fallback_prompt = controller_prompt(
+        original_state,
+        context,
+        history,
+        text,
+        retry_issues=primary_issues,
+        first_client_turn=first_client_turn,
+    )
     try:
-        fallback_reply = plain_reply_from_model(gigachat.reply([{"role": "system", "content": fallback_prompt}], model=fallback_model))
+        fallback_raw = gigachat.reply([{"role": "system", "content": fallback_prompt}], model=fallback_model)
     except Exception:
         app.logger.exception("Fallback dialog generation failed")
         if primary_error:
             raise primary_error
         raise
-    if fallback_reply_is_usable(fallback_reply, expected, original_state, history, first_client_turn):
-        return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
+    fallback_payload = parse_controller_payload(fallback_raw)
+    fallback_reply = fallback_payload["reply"] if fallback_payload else plain_reply_from_model(fallback_raw)
+    if fallback_payload:
+        fallback_state = apply_grounded_observations(original_state, fallback_payload["observations"], text)
+        fallback_expected = expected_dialog_action(
+            fallback_state,
+            fallback_payload["intent"],
+            fallback_payload["intent_evidence"],
+            text,
+            first_client_turn,
+        )
+        fallback_payload["action"] = fallback_expected
+        fallback_issues = controller_reply_issues(
+            fallback_payload,
+            fallback_expected,
+            original_state,
+            history,
+            first_client_turn,
+        )
+        if not fallback_issues:
+            return (
+                fallback_reply,
+                fallback_expected,
+                advance_dialog_state(fallback_state, fallback_expected, fallback_reply),
+            )
     cleaned_reply = clean_fallback_reply(fallback_reply, expected)
     if fallback_reply_is_usable(cleaned_reply, expected, original_state, history, first_client_turn):
         app.logger.warning("Fallback reply was repaired locally for action %s", expected)
         return cleaned_reply, expected, advance_dialog_state(state, expected, cleaned_reply)
     if cleaned_reply:
-        app.logger.warning("Fallback reply kept dialog alive without advancing state for action %s", expected)
-        return cleaned_reply, "continue_without_transition", original_state
+        app.logger.warning("Fallback reply kept dialog alive and synchronized state for action %s", expected)
+        return cleaned_reply, expected, advance_dialog_state(state, expected, cleaned_reply)
     if fallback_reply:
-        app.logger.warning("Fallback reply kept dialog alive in original form without advancing state")
-        return fallback_reply, "continue_without_transition", original_state
+        app.logger.warning("Fallback reply kept dialog alive and synchronized state in original form")
+        return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
     raise RuntimeError("GigaChat returned no reply")
 
 def advance_dialog_state(state, action, reply):
