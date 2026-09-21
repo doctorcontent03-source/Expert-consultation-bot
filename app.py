@@ -324,6 +324,18 @@ def explicit_boundary_signal(text):
     )
     return any(re.search(pattern, low) for pattern in patterns)
 
+def explicit_correction_signal(text):
+    low = " ".join(normalized_words(text))
+    patterns = (
+        r"\bкто сказал\b",
+        r"\bс чего вы (?:взяли|решили)\b",
+        r"\bя (?:этого )?не (?:говорил|говорила|писал|писала|утверждал|утверждала)\b",
+        r"\bя не выражал(?:а)?\b",
+        r"\bвы меня (?:неправильно|не так) поняли\b",
+        r"\bя имел(?:а)? в виду другое\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
 def controller_state():
     saved = session.get("dialog_controller_state")
     if not isinstance(saved, dict):
@@ -384,17 +396,21 @@ def apply_grounded_observations(state, observations, text):
 
 def expected_dialog_action(state, intent, intent_evidence, text):
     grounded_intent = grounded_in_current_message(intent_evidence, text)
+    if explicit_correction_signal(text) or (intent == "correction" and grounded_intent):
+        return "repair_interpretation"
     if intent == "end" and grounded_intent and explicit_end_signal(text):
         return "end_dialog"
-    if intent == "correction" and grounded_intent:
-        return "repair_interpretation"
     if intent == "boundary" and grounded_intent and explicit_boundary_signal(text):
         return "respect_boundary"
     if intent == "question" and grounded_intent:
         return "answer_information"
-    required_complete = state["contact"] and state["need"] and state["previous_experience"]
-    enough_for_solution = state["need"] and (state["previous_experience"] or state["diagnostic_questions"] >= 2)
-    if not required_complete and state["diagnostic_questions"] < 3 and not enough_for_solution:
+    required_complete = (
+        state["contact"] and state["need"]
+        and state["previous_experience"] and state["desired_result"]
+    )
+    if state["diagnostic_questions"] < 2:
+        return "explore"
+    if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
     if not state["solution_explained"]:
         return "explain_solution"
@@ -442,6 +458,14 @@ def clean_fallback_reply(reply, action):
     cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
     return re.sub(r"\s+", " ", cleaned).strip()
 
+def presupposes_unstated_obstacle(reply):
+    low = " ".join(normalized_words(reply))
+    return bool(re.search(
+        r"\b(?:что|почему) (?:вас )?(?:останавливает|сдерживает|смущает|пугает|мешает)"
+        r"|\bпочему вы (?:сомневаетесь|не готовы|отказываетесь)\b",
+        low,
+    ))
+
 def controller_reply_issues(payload, expected_action, state, history):
     reply = payload["reply"]
     low = reply.lower()
@@ -459,6 +483,8 @@ def controller_reply_issues(payload, expected_action, state, history):
         issues.append("ответ начинается с предположения о состоянии клиента")
     if repeats_recent_opening(reply, history):
         issues.append("повторено начало предыдущей реплики")
+    if action == "check_interest" and presupposes_unstated_obstacle(reply):
+        issues.append("клиенту приписано препятствие или сомнение")
     question = question_from_reply(reply)
     if action == "explore":
         if not question:
@@ -517,7 +543,7 @@ respect_boundary — принять границу без нового вопр�
 repair_interpretation — признать неверное понимание без нового диагностического вопроса;
 end_dialog — попрощаться только при явном завершении разговора.
 
-Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не начинайте ни одно предложение со слов «похоже», «возможно», «вероятно», «видимо» или «кажется» и не выдвигайте гипотез о том, что клиент якобы чувствует, думает или понимает. Не повторяйте начало предыдущей реплики и уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
+Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению — например отдельное «возможно» или «наверное» — не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не начинайте ни одно предложение со слов «похоже», «возможно», «вероятно», «видимо» или «кажется» и не выдвигайте гипотез о том, что клиент якобы чувствует, думает или понимает. Не повторяйте начало предыдущей реплики и уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
 
 Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
 contact — понятен контекст жизни или ситуации клиента;
@@ -550,7 +576,7 @@ def fallback_action_instruction(action):
     return {
         "explore": "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации. Не завершайте разговор и не предлагайте встречу.",
         "explain_solution": "Без вопроса кратко объясните от первого лица, чем встреча с вами может быть полезна в описанной ситуации. Не проводите консультацию в чате и не предлагайте запись.",
-        "check_interest": "Кратко выясните отношение клиента к уже объяснённому направлению помощи. Не предлагайте запись.",
+        "check_interest": "Нейтрально выясните отношение клиента к уже объяснённому направлению помощи. Не приписывайте ему сомнение, страх, отказ или препятствие и не предлагайте запись.",
         "offer_consultation": "Один раз предложите подходящую консультацию от первого лица.",
         "answer_information": "Прямо ответьте на последний вопрос клиента по базе знаний. Не заменяйте ответ приглашением.",
         "respect_boundary": "Коротко примите обозначенную клиентом границу. Не задавайте вопрос, не анализируйте и не уговаривайте.",
@@ -565,6 +591,8 @@ def fallback_reply_is_usable(reply, action, state, history):
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         return False
     if uses_ungrounded_hypothesis(reply) or repeats_recent_opening(reply, history):
+        return False
+    if action == "check_interest" and presupposes_unstated_obstacle(reply):
         return False
     if action == "explore":
         question = question_from_reply(reply)
