@@ -357,6 +357,7 @@ def parse_controller_payload(raw):
     fence = chr(96) * 3
     if cleaned.startswith(fence):
         cleaned = re.sub(r"^" + re.escape(fence) + r"(?:json)?\s*|\s*" + re.escape(fence) + r"$", "", cleaned, flags=re.I | re.S).strip()
+    cleaned = cleaned.replace("\\:", ":")
     try:
         data = json.loads(cleaned)
     except (TypeError, json.JSONDecodeError):
@@ -375,7 +376,7 @@ def parse_controller_payload(raw):
         return None
     if intent not in {"continue", "interest", "decline", "question", "boundary", "end", "correction", "rupture"}:
         return None
-    if not isinstance(observations, dict) or not isinstance(assessment, dict):
+    if not isinstance(observations, dict):
         return None
     return {
         "reply": reply.strip(),
@@ -383,7 +384,7 @@ def parse_controller_payload(raw):
         "intent": intent,
         "intent_evidence": str(evidence or "").strip(),
         "observations": observations,
-        "reply_assessment": assessment,
+        "reply_assessment": assessment if isinstance(assessment, dict) else {},
     }
 
 def apply_grounded_observations(state, observations, text):
@@ -485,6 +486,14 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("бот начинает проводить консультацию в чате")
     if assessment.get("pressures_client") is True:
         issues.append("бот давит на клиента")
+    if assessment.get("gender_matches_expert") is not True:
+        issues.append("грамматический род не соответствует эксперту")
+    if state.get("consultation_offered") and action != "offer_consultation" and assessment.get("adds_or_repeats_consultation_offer") is True:
+        issues.append("консультация предложена повторно")
+    if action == "answer_information" and assessment.get("answers_client_question") is not True:
+        issues.append("нет прямого ответа на вопрос клиента")
+    if assessment.get("leaks_internal_instructions") is True:
+        issues.append("в ответ попали служебные инструкции")
     if action == "offer_consultation" and assessment.get("offers_consultation") is not True:
         issues.append("консультация не предложена")
     if action == "offer_consultation" and assessment.get("uses_generic_self_promotion") is True:
@@ -514,6 +523,53 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
     if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
         issues.append("неподтверждённое обещание")
     return issues
+
+def review_reply_semantics(reply, expected_action, state, history, text, context, model):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-10:]
+    )
+    prompt = f"""Вы — независимый контролёр одной реплики диалога. Оценивайте смысл,
+а не наличие отдельных слов. Ничего не исправляйте и не сочиняйте.
+
+Назначенное действие: {expected_action}
+Консультация уже предлагалась: {"да" if state.get("consultation_offered") else "нет"}
+
+Верните только JSON:
+{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,
+"asks_only_missing_information":true,"repeats_known_information":false,
+"performs_expert_work":false,"pressures_client":false,"offers_consultation":false,
+"uses_generic_self_promotion":false,"gender_matches_expert":true,
+"adds_or_repeats_consultation_offer":false,"answers_client_question":true,
+"leaks_internal_instructions":false,"question_count":0}}
+
+Правила оценки:
+- gender_matches_expert сверяйте с базой знаний; при нейтральной реплике ставьте true;
+- adds_or_repeats_consultation_offer=true, если к ответу добавлено новое приглашение,
+  напоминание о записи или подталкивание выбрать время;
+- answers_client_question=true, если прямой вопрос получил ответ; если вопроса нет, ставьте true;
+- question_count — число самостоятельных смысловых вопросов, даже если знаков вопроса меньше;
+- leaks_internal_instructions=true для JSON, схемы, названий действий, наблюдений или правил контроллера;
+- uses_generic_self_promotion=true, если вместо уместного приглашения эксперт рекламирует
+  себя или обещает общие результаты.
+
+БАЗА ЗНАНИЙ:
+{context[-10000:]}
+
+ДИАЛОГ:
+{transcript[-7000:]}
+Клиент: {text}
+ОТВЕТ ЭКСПЕРТА:
+{reply}"""
+    try:
+        assessment = parse_json_object(gigachat.reply(
+            [{"role": "system", "content": prompt}],
+            model=model,
+        ))
+    except Exception:
+        app.logger.exception("Independent reply review failed")
+        return None
+    return assessment if isinstance(assessment, dict) else None
 
 def controller_prompt(state, context, history, text, retry_issues=None, first_client_turn=False):
     transcript = "\n".join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])
@@ -624,78 +680,68 @@ def generate_stateful_dialog_reply(history, text, context):
     first_client_turn = not any(row["role"] == "assistant" for row in history)
     primary_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
     fallback_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
-    primary_issues = []
-    primary_error = None
-    state = dict(original_state)
-    expected = expected_dialog_action(state, "continue", "", text, first_client_turn)
-    try:
-        raw = gigachat.reply([{"role": "system", "content": controller_prompt(original_state, context, history, text, first_client_turn=first_client_turn)}], model=primary_model)
+    review_model = fallback_model
+    issues = []
+    last_error = None
+    models = (primary_model, fallback_model, primary_model)
+    for model in models:
+        prompt = controller_prompt(
+            original_state,
+            context,
+            history,
+            text,
+            retry_issues=issues or None,
+            first_client_turn=first_client_turn,
+        )
+        try:
+            raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
+        except Exception as exc:
+            last_error = exc
+            issues = ["модель не вернула ответ"]
+            app.logger.exception("Dialog generation failed with model %s", model)
+            continue
         payload = parse_controller_payload(raw)
         if payload is None:
-            primary_issues = ["ответ не соответствует JSON-схеме"]
-        else:
-            state = apply_grounded_observations(original_state, payload["observations"], text)
-            expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text, first_client_turn)
-            payload["action"] = expected
-            primary_issues = controller_reply_issues(payload, expected, original_state, history, first_client_turn)
-            if not primary_issues:
-                return payload["reply"], expected, advance_dialog_state(state, expected, payload["reply"])
-    except Exception as exc:
-        primary_error = exc
-        primary_issues = ["основная модель не вернула ответ"]
-        app.logger.exception("Primary dialog generation failed")
-
-    fallback_prompt = controller_prompt(
-        original_state,
-        context,
-        history,
-        text,
-        retry_issues=primary_issues,
-        first_client_turn=first_client_turn,
-    )
-    try:
-        fallback_raw = gigachat.reply([{"role": "system", "content": fallback_prompt}], model=fallback_model)
-    except Exception:
-        app.logger.exception("Fallback dialog generation failed")
-        if primary_error:
-            raise primary_error
-        raise
-    fallback_payload = parse_controller_payload(fallback_raw)
-    fallback_reply = fallback_payload["reply"] if fallback_payload else plain_reply_from_model(fallback_raw)
-    if fallback_payload:
-        fallback_state = apply_grounded_observations(original_state, fallback_payload["observations"], text)
-        fallback_expected = expected_dialog_action(
-            fallback_state,
-            fallback_payload["intent"],
-            fallback_payload["intent_evidence"],
+            issues = ["ответ не соответствует JSON-схеме"]
+            continue
+        state = apply_grounded_observations(original_state, payload["observations"], text)
+        expected = expected_dialog_action(
+            state,
+            payload["intent"],
+            payload["intent_evidence"],
             text,
             first_client_turn,
         )
-        fallback_payload["action"] = fallback_expected
-        fallback_issues = controller_reply_issues(
-            fallback_payload,
-            fallback_expected,
+        payload["action"] = expected
+        assessment = review_reply_semantics(
+            payload["reply"],
+            expected,
+            original_state,
+            history,
+            text,
+            context,
+            review_model,
+        )
+        if assessment is None:
+            issues = ["не удалось независимо проверить ответ"]
+            continue
+        payload["reply_assessment"] = assessment
+        issues = controller_reply_issues(
+            payload,
+            expected,
             original_state,
             history,
             first_client_turn,
         )
-        if not fallback_issues:
-            return (
-                fallback_reply,
-                fallback_expected,
-                advance_dialog_state(fallback_state, fallback_expected, fallback_reply),
+        if not issues:
+            return payload["reply"], expected, advance_dialog_state(
+                state,
+                expected,
+                payload["reply"],
             )
-    cleaned_reply = clean_fallback_reply(fallback_reply, expected)
-    if fallback_reply_is_usable(cleaned_reply, expected, original_state, history, first_client_turn):
-        app.logger.warning("Fallback reply was repaired locally for action %s", expected)
-        return cleaned_reply, expected, advance_dialog_state(state, expected, cleaned_reply)
-    if cleaned_reply:
-        app.logger.warning("Fallback reply kept dialog alive and synchronized state for action %s", expected)
-        return cleaned_reply, expected, advance_dialog_state(state, expected, cleaned_reply)
-    if fallback_reply:
-        app.logger.warning("Fallback reply kept dialog alive and synchronized state in original form")
-        return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
-    raise RuntimeError("GigaChat returned no reply")
+    if last_error:
+        raise last_error
+    raise RuntimeError("Models did not return a validated dialog reply")
 
 def advance_dialog_state(state, action, reply):
     updated = dict(state)
