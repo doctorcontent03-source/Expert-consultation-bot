@@ -54,6 +54,8 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
             "repeats_known_information": False,
             "performs_expert_work": False,
             "pressures_client": False,
+            "offers_consultation": action == "offer_consultation",
+            "uses_generic_self_promotion": False,
             "question_count": reply.count("?"),
         },
     }, ensure_ascii=False)
@@ -111,17 +113,17 @@ class TestBot(unittest.TestCase):
         self.assertTrue(updated["contact"])
         self.assertFalse(updated["need"])
 
-    def test_two_questions_required_before_solution(self):
+    def test_two_questions_required_before_consultation_invitation(self):
         state = self.state(contact=True, need=True, previous_experience=True, desired_result=True)
         self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "explore")
         state["diagnostic_questions"] = 2
-        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "explain_solution")
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "offer_consultation")
 
     def test_missing_information_allows_only_three_questions(self):
         state = self.state(contact=True, need=True, diagnostic_questions=2)
         self.assertEqual(target.expected_dialog_action(state, "continue", "", "Не знаю"), "explore")
         state["diagnostic_questions"] = 3
-        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Не знаю"), "explain_solution")
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Не знаю"), "offer_consultation")
 
     def test_direct_question_is_answered_before_progression(self):
         state = self.state(contact=True, need=True, diagnostic_questions=1)
@@ -161,6 +163,21 @@ class TestBot(unittest.TestCase):
         for text in ("Этот вопрос здесь неуместен", "Вы вообще меня слышите?", "Так беседовать невозможно"):
             self.assertEqual(target.expected_dialog_action(self.state(), "rupture", text, text), "repair_contact")
 
+    def test_semantic_decline_is_respected_independent_of_wording(self):
+        state = self.state(consultation_offered=True)
+        for text in ("Нет", "Мне это не подходит", "Я не хочу записываться"):
+            self.assertEqual(target.expected_dialog_action(state, "decline", text, text), "respect_decline")
+
+    def test_decline_reply_cannot_repeat_or_pressure(self):
+        data = target.parse_controller_payload(payload(
+            "Хорошо, не буду настаивать.",
+            action="respect_decline",
+            intent="decline",
+            evidence="Нет",
+        ))
+        issues = target.controller_reply_issues(data, "respect_decline", self.state(), [])
+        self.assertEqual(issues, [])
+
     # First client turn is situation/question, never feedback to expert
     def test_first_turn_situation_cannot_be_treated_as_reaction(self):
         state = self.state()
@@ -199,7 +216,29 @@ class TestBot(unittest.TestCase):
             desired_result=True,
             diagnostic_questions=2,
         )
-        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Вернуть смысл жизни"), "explain_solution")
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Вернуть смысл жизни"), "offer_consultation")
+
+    def test_generic_self_promotion_is_rejected_at_invitation_stage(self):
+        data = target.parse_controller_payload(payload(
+            "Моя помощь направлена на возвращение жизненной энергии.",
+            action="offer_consultation",
+        ))
+        data["reply_assessment"]["offers_consultation"] = False
+        data["reply_assessment"]["uses_generic_self_promotion"] = True
+        issues = target.controller_reply_issues(data, "offer_consultation", self.state(), [])
+        self.assertIn("консультация не предложена", issues)
+        self.assertIn("вместо приглашения используется общая реклама помощи", issues)
+
+    def test_repeated_assistant_reply_is_rejected_generically(self):
+        previous = "Краткое отражение запроса и один вопрос?"
+        data = target.parse_controller_payload(payload(previous))
+        issues = target.controller_reply_issues(
+            data,
+            "explore",
+            self.state(),
+            [{"role": "assistant", "content": previous}],
+        )
+        self.assertIn("повторена предыдущая реплика", issues)
 
     # Reply validation
     def test_no_repeated_question(self):
