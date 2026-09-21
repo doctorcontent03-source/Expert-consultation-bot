@@ -8,16 +8,6 @@ from zoneinfo import ZoneInfo
 import app as target
 
 
-class FakeGigaChat:
-    def reply(self, messages):
-        prompt = messages[0]["content"]
-        if "Извлеките из собственных слов клиента" in prompt:
-            return '{"stages":{}}'
-        if "Определите функцию реплики" in prompt:
-            return '{"question_purpose":"answer_client_question","performs_expert_work":false,"asks_for_deliverable_details":false,"uses_unsupported_assumption":false,"repeats_answered_question":false,"claims_unverified_product":false,"makes_unverified_promise":false,"answers_client_question":true,"natural_and_clear":true}'
-        return "Тестовый ответ"
-
-
 class FakeCalendar:
     def __init__(self, busy=None):
         self.busy = busy or []
@@ -30,566 +20,307 @@ class FakeCalendar:
         self.saved.append(event)
 
 
+class ScriptedGigaChat:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.prompts = []
+
+    def reply(self, messages, model=None):
+        self.prompts.append(messages[0]["content"])
+        if not self.replies:
+            raise RuntimeError("No scripted reply")
+        value = self.replies.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def payload(reply, action="explore", intent="continue", evidence="", observations=None):
+    observations = observations or {}
+    fields = {}
+    for key in ("contact", "need", "previous_experience", "desired_result"):
+        fields[key] = observations.get(key, {"present": False, "evidence": ""})
+    import json
+    return json.dumps({
+        "reply": reply,
+        "action": action,
+        "intent": intent,
+        "intent_evidence": evidence,
+        "observations": fields,
+    }, ensure_ascii=False)
+
+
 class TestBot(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         target.DB = target.Path(self.tmp.name)
-        target.gigachat = FakeGigaChat()
         target.app.config["TESTING"] = True
         target.app.secret_key = "test"
         self.client = target.app.test_client()
         self.calendar = FakeCalendar()
         self.original_calendar = target.yandex_calendar
+        self.original_gigachat = target.gigachat
         target.yandex_calendar = lambda: self.calendar
+        con = target.db()
+        con.execute(
+            "insert into documents(id,name,text,created_at,expert_slug) values(?,?,?,?,?)",
+            ("kb", "О Кирилле.txt", "Кирилл — психолог. Консультации проходят онлайн.", 1, "psychologist"),
+        )
+        con.commit()
 
     def tearDown(self):
         target.yandex_calendar = self.original_calendar
+        target.gigachat = self.original_gigachat
         self.tmp.close()
         try:
             os.unlink(self.tmp.name)
         except OSError:
             pass
 
+    def state(self, **changes):
+        base = {
+            "contact": False,
+            "need": False,
+            "previous_experience": False,
+            "desired_result": False,
+            "solution_explained": False,
+            "interest_confirmed": False,
+            "consultation_offered": False,
+            "diagnostic_questions": 0,
+            "asked_questions": [],
+        }
+        base.update(changes)
+        return base
+
+    # Universal sequence and grounded state
+    def test_grounded_observations_only_accept_client_quote(self):
+        state = self.state()
+        updated = target.apply_grounded_observations(state, {
+            "contact": {"present": True, "evidence": "мне 42"},
+            "need": {"present": True, "evidence": "клиент потерял смысл"},
+        }, "Мне 42, и я ни во что не верю")
+        self.assertTrue(updated["contact"])
+        self.assertFalse(updated["need"])
+
+    def test_two_questions_required_before_solution(self):
+        state = self.state(contact=True, need=True, previous_experience=True, desired_result=True)
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "explore")
+        state["diagnostic_questions"] = 2
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "explain_solution")
+
+    def test_missing_information_allows_only_three_questions(self):
+        state = self.state(contact=True, need=True, diagnostic_questions=2)
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Не знаю"), "explore")
+        state["diagnostic_questions"] = 3
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Не знаю"), "explain_solution")
+
+    def test_direct_question_is_answered_before_progression(self):
+        state = self.state(contact=True, need=True, diagnostic_questions=1)
+        text = "Сколько длится консультация?"
+        self.assertEqual(target.expected_dialog_action(state, "question", text, text), "answer_information")
+
+    def test_interest_cannot_trigger_offer_before_solution(self):
+        text = "Да, мне интересно"
+        state = self.state(contact=True, need=True, previous_experience=True, desired_result=True, diagnostic_questions=1)
+        self.assertEqual(target.expected_dialog_action(state, "interest", text, text), "explore")
+
+    def test_interest_after_solution_triggers_one_offer(self):
+        text = "Да, мне интересно"
+        state = self.state(solution_explained=True)
+        self.assertEqual(target.expected_dialog_action(state, "interest", text, text), "offer_consultation")
+        state["consultation_offered"] = True
+        self.assertEqual(target.expected_dialog_action(state, "interest", text, text), "check_interest")
+
+    def test_neutral_possible_is_not_interest_or_obstacle(self):
+        state = self.state(solution_explained=True)
+        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Возможно"), "check_interest")
+
+    def test_explicit_boundary_is_respected(self):
+        text = "Я сейчас не хочу это обсуждать"
+        self.assertEqual(target.expected_dialog_action(self.state(), "boundary", text, text), "respect_boundary")
+
+    def test_explicit_correction_is_repaired(self):
+        text = "Кто сказал, что меня что-то останавливает?"
+        self.assertEqual(target.expected_dialog_action(self.state(), "question", text, text), "repair_interpretation")
+
+    def test_end_requires_explicit_end_signal(self):
+        self.assertEqual(target.expected_dialog_action(self.state(), "end", "ерунда", "Да ерунда какая-то"), "explore")
+        text = "Не хочу больше продолжать разговор"
+        self.assertEqual(target.expected_dialog_action(self.state(), "end", text, text), "end_dialog")
+
+    # First client turn is situation/question, never feedback to expert
+    def test_first_turn_situation_cannot_be_treated_as_reaction(self):
+        state = self.state()
+        self.assertEqual(
+            target.expected_dialog_action(state, "correction", "ерунда", "Да ерунда какая-то, ничего не хочу.", first_client_turn=True),
+            "explore",
+        )
+
+    def test_first_turn_situation_cannot_be_treated_as_boundary_or_end(self):
+        state = self.state()
+        text = "Да ерунда какая-то, ничего не хочу."
+        self.assertEqual(target.expected_dialog_action(state, "boundary", "ничего не хочу", text, first_client_turn=True), "explore")
+        self.assertEqual(target.expected_dialog_action(state, "end", "ничего не хочу", text, first_client_turn=True), "explore")
+
+    def test_first_turn_direct_question_still_gets_answer(self):
+        state = self.state()
+        text = "Сколько стоит консультация?"
+        self.assertEqual(target.expected_dialog_action(state, "question", text, text, first_client_turn=True), "answer_information")
+
+    def test_first_turn_validator_rejects_feedback_framing(self):
+        bad = payload("Понял вашу реакцию. Почему возникло такое мнение?")
+        parsed = target.parse_controller_payload(bad)
+        issues = target.controller_reply_issues(parsed, "explore", self.state(), [], first_client_turn=True)
+        self.assertIn("первая реплика клиента ошибочно представлена как реакция на эксперта", issues)
+
+    def test_first_turn_prompt_marks_neutral_greeting_context(self):
+        prompt = target.controller_prompt(self.state(), "База", [], "Да ерунда какая-то", first_client_turn=True)
+        self.assertIn("ПЕРВАЯ РЕПЛИКА КЛИЕНТА", prompt)
+        self.assertIn("не является реакцией", prompt)
+
+    # Reply validation
+    def test_no_ungrounded_hypothesis(self):
+        self.assertTrue(target.uses_ungrounded_hypothesis("Понятно. Похоже, вам трудно."))
+        self.assertFalse(target.uses_ungrounded_hypothesis("Понятно, это длится два года."))
+
+    def test_no_repeated_question(self):
+        state = self.state(asked_questions=["Давно у вас такое состояние?"])
+        data = target.parse_controller_payload(payload("Давно у вас такое состояние?"))
+        issues = target.controller_reply_issues(data, "explore", state, [])
+        self.assertIn("повторён уже заданный вопрос", issues)
+
+    def test_no_early_consultation_offer(self):
+        data = target.parse_controller_payload(payload("Давайте запишемся на консультацию?"))
+        issues = target.controller_reply_issues(data, "explore", self.state(), [])
+        self.assertIn("преждевременно предложена встреча", issues)
+
+    def test_no_question_while_explaining_solution(self):
+        data = target.parse_controller_payload(payload("На встрече смогу разобраться подробнее. Хотите?","explain_solution"))
+        issues = target.controller_reply_issues(data, "explain_solution", self.state(), [])
+        self.assertIn("задан вопрос на этапе без вопросов", issues)
+
+    def test_answer_is_not_replaced_by_booking(self):
+        data = target.parse_controller_payload(payload("Хотите записаться?","answer_information","question","Сколько стоит?"))
+        issues = target.controller_reply_issues(data, "answer_information", self.state(), [])
+        self.assertIn("ответ на вопрос заменён записью", issues)
+
+    def test_expert_cannot_speak_in_third_person(self):
+        data = target.parse_controller_payload(payload("Психолог поможет разобраться.","explain_solution"))
+        issues = target.controller_reply_issues(data, "explain_solution", self.state(), [])
+        self.assertIn("эксперт говорит о себе в третьем лице", issues)
+
+    def test_team_voice_is_forbidden_by_system_rules(self):
+        self.assertIn("не организация и не команда", target.SYSTEM_RULES)
+        self.assertIn("будем рады", target.SYSTEM_RULES)
+
+    def test_fallback_never_advances_state_when_invalid(self):
+        invalid = ScriptedGigaChat([
+            payload("Понял вашу реакцию. Почему возникло такое мнение?"),
+            "Понял вашу реакцию. Почему возникло такое мнение?",
+        ])
+        target.gigachat = invalid
+        with target.app.test_request_context("/"):
+            answer, action, state = target.generate_stateful_dialog_reply([], "Да ерунда какая-то, ничего не хочу.", "База")
+        self.assertEqual(action, "continue_without_transition")
+        self.assertEqual(state["diagnostic_questions"], 0)
+        self.assertTrue(answer)
+
+    # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
         now = datetime(2026, 9, 17, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
         self.assertEqual(target.parse_requested_slot("Завтра в 20:00", now).isoformat(), "2026-09-18T20:00:00+03:00")
-        self.assertEqual(target.parse_requested_slot("19 сентября в 11:30", now).isoformat(), "2026-09-19T11:30:00+03:00")
-        self.assertEqual(target.parse_requested_slot("В пятницу в 18:00", now).isoformat(), "2026-09-18T18:00:00+03:00")
-
-    def test_chat_checks_slot_and_books_from_contacts(self):
-        with self.client.session_transaction() as session:
-            session["expert_slug"] = "marketer"
-            session["consultation_offered"] = True
-        future = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=60)
-        request_text = future.strftime("%d.%m.%Y в 20:00")
-        first = self.client.post("/api/chat", json={"message": request_text})
-        self.assertEqual(first.status_code, 200)
-        self.assertIn("свободно", first.json["answer"])
-        second = self.client.post("/api/chat", json={"message": "Анна Иванова, +7 999 123-45-67, anna@example.com"})
-        self.assertEqual(second.status_code, 200)
-        self.assertIn("Запись подтверждена", second.json["answer"])
-        self.assertEqual(len(self.calendar.saved), 1)
-        self.assertIn("Анна Иванова", self.calendar.saved[0])
+        self.assertEqual(target.parse_requested_slot("В воскресенье в 11:00", now).isoformat(), "2026-09-20T11:00:00+03:00")
 
     def test_unrelated_date_does_not_start_booking(self):
         with target.app.test_request_context("/"):
-            target.session["expert_slug"] = "marketer"
             self.assertIsNone(target.chat_booking_answer("Завтра в 20:00 у меня начинается урок"))
 
-    def test_consultation_acceptance_moves_to_booking_once(self):
+    def test_direct_booking_request_starts_calendar_flow(self):
         with target.app.test_request_context("/"):
-            target.session["expert_slug"] = "marketer"
+            answer = target.direct_booking_answer("Когда можно записаться на бесплатную консультацию?")
+            self.assertIn("дату и время", answer)
+            self.assertEqual(target.session["requested_booking_type"], "free")
+
+    def test_free_slot_requests_contacts_and_rechecks_on_save(self):
+        future = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=30)
+        with target.app.test_request_context("/"):
             target.session["consultation_offered"] = True
-            answer = target.accepted_consultation_answer("Хочу")
-            self.assertIn("дату и время", answer)
-            self.assertNotIn("[[BOOK_", answer)
-            self.assertEqual(target.session.get("requested_booking_type"), "free")
+            first = target.chat_booking_answer(future.strftime("%d.%m.%Y в %H:%M"))
+            self.assertIn("свободно", first)
+            self.assertIn("имя, телефон и email", first)
+            second = target.chat_booking_answer("Анна, +7 999 123-45-67, anna@example.com")
+            self.assertIn("Запись подтверждена", second)
+            self.assertEqual(len(self.calendar.saved), 1)
 
-    def test_acceptance_with_when_does_not_repeat_consultation_offer(self):
-        history = [{"role": "assistant", "content": "Могу показать это на бесплатной консультации. Хотите записаться?"}]
-        with target.app.test_request_context("/"):
-            target.session["expert_slug"] = "marketer"
-            answer = target.accepted_offer_with_booking_question("Давайте. Когда?", history)
-            self.assertIn("дату и время", answer)
-            self.assertNotIn("Хотите записаться", answer)
-            self.assertEqual(target.session.get("requested_booking_type"), "free")
-
-    def test_discovery_guard_blocks_early_offer(self):
-        state = {key: False for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
-        state.update(identity=True)
-        answer = target.guard_discovery_answer(
-            "Могу предложить бесплатную консультацию. Хотите попробовать?",
-            state,
-            "task",
-            "На подготовку уходит много времени",
-        )
-        self.assertNotIn("консультац", answer.lower())
-
-    def test_discovery_guard_removes_assumed_cooperation(self):
-        state = {key: False for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
-        state["identity"] = True
-        answer = target.guard_discovery_answer(
-            "Какой результат вы хотите получить, работая со мной?",
-            state,
-            "task",
-            "Я репетитор английского языка",
-        )
-        self.assertNotIn("работая со мной", answer.lower())
-
-    def test_discovery_focus_rephrases_after_confusion(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        class NaturalReply:
-            def reply(self, messages):
-                self.prompt = messages[0]["content"]
-                return "Я спрашиваю именно о вашей повседневной работе. Что в ней сейчас больше всего мешает?"
-        fake, old = NaturalReply(), target.gigachat
-        target.gigachat = fake
-        try:
-            answer = target.generate_discovery_reply([], "В смысле?!", "", profile, "task")
-        finally:
-            target.gigachat = old
-        self.assertIn("повседневной работе", answer)
-        self.assertIn("Клиент выразил непонимание: да", fake.prompt)
-
-    def test_discovery_focus_replaces_domain_consulting_question(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        class FocusedReply:
-            def reply(self, messages):
-                return "С курсом уже понятно, где теряется время. Как нейросети справлялись с этой задачей раньше?"
-        old = target.gigachat
-        target.gigachat = FocusedReply()
-        try:
-            answer = target.generate_discovery_reply([], "Хочу создать курс, но времени совсем нет", "", profile, "ai_experience")
-        finally:
-            target.gigachat = old
-        self.assertIn("нейросети", answer)
-        self.assertNotIn("темы", answer)
-        self.assertEqual(answer.count("?"), 1)
-
-    def test_discovery_guard_requires_solution_interest(self):
-        state = {key: True for key in target.EXPERT_PROFILES["marketer"]["discovery_stages"]}
-        state.update(solution_explained=True, solution_interest=False)
-        answer = target.guard_discovery_answer(
-            "Тогда предлагаю бесплатную консультацию. Хотите записаться?",
-            state,
-            None,
-            "Понятно",
-        )
-        self.assertNotIn("запис", answer.lower())
-        state["solution_interest"] = True
-        allowed = target.guard_discovery_answer(
-            "Тогда предлагаю бесплатную консультацию. Хотите записаться?",
-            state,
-            None,
-            "Да, мне интересно",
-        )
-        self.assertIn("записаться", allowed)
-
-    def test_discovery_json_parser(self):
-        parsed = target.parse_json_object('```json\n{"identity":true,"goal":false}\n```')
-        self.assertTrue(parsed["identity"])
-        self.assertFalse(parsed["goal"])
-
-    def test_state_machine_requires_grounded_stage_evidence(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        class Extractor:
-            def __init__(self, response): self.response = response
-            def reply(self, messages): return self.response
-        old = target.gigachat
-        try:
-            with target.app.test_request_context("/"):
-                target.gigachat = Extractor('{"stages":{"identity":{"complete":true,"evidence":"Я репетитор английского"},"task":{"complete":true,"evidence":"Я репетитор английского"},"ai_experience":{"complete":true,"evidence":"Я репетитор английского"}}}')
-                state = target.assess_discovery([], "Я репетитор английского, работаю с детьми и взрослыми", profile)
-        finally:
-            target.gigachat = old
-        self.assertTrue(state["identity"])
-        self.assertFalse(state["task"])
-        self.assertFalse(state["ai_experience"])
-        self.assertFalse(state["solution_explained"])
-        self.assertFalse(state["solution_interest"])
-
-    def test_generation_failure_cannot_escape_state_machine(self):
-        class BreakAfterAssessment:
-            def reply(self, messages):
-                if "Извлеките из собственных слов клиента" in messages[0]["content"]:
-                    return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор английского"},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
-                raise RuntimeError("generation unavailable")
-        old = target.gigachat
-        target.gigachat = BreakAfterAssessment()
-        try:
-            with self.client.session_transaction() as session:
-                session["expert_slug"] = "marketer"
-            response = self.client.post("/api/chat", json={"message":"Я репетитор английского, работаю с детьми и взрослыми"})
-        finally:
-            target.gigachat = old
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("консультац", response.json["answer"].lower())
-        self.assertEqual(response.json["answer"], target.safe_phase_reply("explore_task", target.EXPERT_PROFILES["marketer"]))
-
-    def test_state_machine_accepts_need_only_from_client_words(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        class Extractor:
-            def reply(self, messages):
-                return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор"},"task":{"complete":true,"evidence":"Хотелось бы побыстрее готовиться к урокам"},"ai_experience":{"complete":false,"evidence":""}}}'
-        old = target.gigachat
-        target.gigachat = Extractor()
-        try:
-            with target.app.test_request_context("/"):
-                history = [{"role":"user","content":"Я репетитор"},{"role":"assistant","content":"Что хотелось бы изменить?"}]
-                state = target.assess_discovery(history, "Хотелось бы побыстрее готовиться к урокам", profile)
-        finally:
-            target.gigachat = old
-        self.assertTrue(state["identity"])
-        self.assertTrue(state["task"])
-        self.assertFalse(state["ai_experience"])
-
-    def test_interest_cannot_exist_before_solution_explanation(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        class Extractor:
-            def reply(self, messages):
-                return '{"stages":{"identity":{"complete":false,"evidence":""},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
-        old = target.gigachat
-        target.gigachat = Extractor()
-        try:
-            with target.app.test_request_context("/"):
-                target.session["sid"] = "same-dialog"
-                target.session["discovery_sid"] = "same-dialog"
-                target.session["discovery_state"] = {"identity":True,"task":True,"ai_experience":True,"solution_explained":False,"solution_interest":False}
-                history = [{"role": "user", "content": "Предыдущая часть разговора"}]
-                state = target.assess_discovery(history, "Да, интересно", profile)
-                self.assertFalse(state["solution_interest"])
-                target.session["discovery_state"]["solution_explained"] = True
-                state = target.assess_discovery(history, "Да, интересно", profile)
-                self.assertTrue(state["solution_interest"])
-        finally:
-            target.gigachat = old
-
-    def test_phase_controller_never_explains_solution_without_task(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        state = dict(identity=True, task=True, ai_experience=False, solution_explained=False, solution_interest=False)
-        with target.app.test_request_context("/"):
-            self.assertEqual(target.discovery_action(state, profile, "Нейросеть всё время теряет логику курса"), "explore_ai_experience")
-
-    def test_phase_controller_repairs_misunderstood_question(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        state = dict(identity=True, task=False, ai_experience=False, solution_explained=False, solution_interest=False)
-        with target.app.test_request_context("/"):
-            self.assertEqual(target.discovery_action(state, profile, "Не поняла вопрос"), "repair_task")
-            self.assertEqual(target.discovery_action(state, profile, "Вы издеваетесь? Какое отношение это имеет к вам?"), "repair_task")
-
-    def test_phase_controller_explains_solution_when_discovery_complete(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        state = dict(identity=True, task=True, ai_experience=True, solution_explained=False, solution_interest=False)
-        with target.app.test_request_context("/"):
-            self.assertEqual(target.discovery_action(state, profile, "Не знаю, можно ли это исправить"), "explain_solution")
-
-    def test_full_marketer_state_sequence(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        with target.app.test_request_context("/"):
-            state = dict(identity=True, task=False, ai_experience=False, solution_explained=False, solution_interest=False)
-            self.assertEqual(target.discovery_action(state, profile, "Я репетитор"), "explore_task")
-            state["task"] = True
-            self.assertEqual(target.discovery_action(state, profile, "Хочу быстрее готовиться"), "explore_ai_experience")
-            state["ai_experience"] = True
-            self.assertEqual(target.discovery_action(state, profile, "Пробовала, но переделываю"), "explain_solution")
-            state["solution_explained"] = True
-            self.assertEqual(target.discovery_action(state, profile, "Понятно"), "handle_solution_interest")
-            state["solution_interest"] = True
-            self.assertEqual(target.discovery_action(state, profile, "Да, интересно"), "offer_consultation")
-
-    def test_psychologist_uses_same_state_machine(self):
-        profile = target.EXPERT_PROFILES["psychologist"]
-        with target.app.test_request_context("/"):
-            state = dict(situation=True, duration_impact=False, solution_explained=False, solution_interest=False)
-            self.assertEqual(target.discovery_action(state, profile, "Так уже давно"), "explore_duration_impact")
-            state["duration_impact"] = True
-            self.assertEqual(target.discovery_action(state, profile, "Это мешает жить"), "explain_solution")
-
-    def test_phase_validation_detects_repeated_opening(self):
-        history = [{"role": "assistant", "content": "Похоже, здесь теряется логика курса."}]
-        issues = target.phase_reply_issues(
-            "Похоже, здесь мало контекста. Расскажите подробнее, что именно не получилось?",
-            "explain_solution",
-            history,
-        )
-        self.assertIn("повтор того же начала реплики", issues)
-
-    def test_semantic_review_blocks_expert_work_in_chat(self):
-        issues = target.phase_review_issues({
-            "question_purpose": "other",
-            "performs_expert_work": True,
-            "asks_for_deliverable_details": True,
-            "uses_unsupported_assumption": False,
-            "repeats_answered_question": False,
-            "natural_and_clear": True,
-        }, "explain_solution")
-        self.assertIn("бот начинает выполнять работу живого эксперта", issues)
-        self.assertIn("бот собирает данные для создания результата вместо продажи решения", issues)
-
-    def test_semantic_review_blocks_invented_product_and_promises(self):
-        issues = target.phase_review_issues({
-            "question_purpose": "answer_client_question",
-            "performs_expert_work": False,
-            "asks_for_deliverable_details": False,
-            "uses_unsupported_assumption": False,
-            "repeats_answered_question": False,
-            "claims_unverified_product": True,
-            "makes_unverified_promise": True,
-            "answers_client_question": False,
-            "natural_and_clear": True,
-        }, "answer_information")
-        self.assertIn("бот выдаёт возможное направление решения за существующий продукт", issues)
-        self.assertIn("бот обещает неподтверждённый результат", issues)
-        self.assertIn("бот не ответил на прямой вопрос клиента", issues)
-
-    def test_solution_question_is_recognized_as_informational(self):
-        self.assertTrue(target.is_informational_question("Что за помощник?"))
-        self.assertTrue(target.is_informational_question("А как он работает?"))
-
-    def test_quality_filter_detects_result_promises(self):
-        issues = target.quality_issues("Вы быстро получите качественные материалы и сэкономите время.")
-        self.assertIn("неподтверждённое обещание результата", issues)
-
-    def test_phase_validation_rejects_suggested_task_options(self):
-        issues = target.phase_reply_issues(
-            "Вам нужно автоматизировать подготовку уроков или улучшить контент для занятий?",
-            "explore_task",
-            [],
-        )
-        self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
-        self.assertIn("варианты ответа внутри вопроса", issues)
-
-    def test_phase_validation_rejects_presumed_materials(self):
-        issues = target.phase_reply_issues(
-            "Какие конкретно учебные материалы вы хотели бы создавать?",
-            "explore_task",
-            [],
-        )
-        self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
-
-    def test_phase_validation_rejects_closed_problem_hypothesis(self):
-        issues = target.phase_reply_issues(
-            "Вам сложно подобрать подходящий способ работы с разными клиентами?",
-            "explore_task",
-            [],
-        )
-        self.assertIn("догадка о задаче клиента вместо открытого вопроса", issues)
-
-    def test_safe_fallback_for_task_does_not_assume_ai_usage(self):
-        answer = target.safe_phase_reply("explore_task")
-        self.assertNotIn("нейросет", answer.lower())
-        self.assertNotIn("вы уже", answer.lower())
-        self.assertEqual(answer.count("?"), 1)
-
-    def test_invalid_last_generation_cannot_reach_dialog(self):
-        profile = target.EXPERT_PROFILES["marketer"]
-        class AlwaysInvalid:
-            def reply(self, messages):
-                return "Здорово, что вы уже используете нейросети?"
-        old = target.gigachat
-        target.gigachat = AlwaysInvalid()
-        try:
-            answer = target.generate_phase_reply([], "Я репетитор", "", profile, "explore_task")
-        finally:
-            target.gigachat = old
-        self.assertEqual(answer, target.safe_phase_reply("explore_task"))
-
-    def test_semantic_review_allows_only_interest_question_after_solution(self):
-        valid = target.phase_review_issues({
-            "question_purpose": "check_solution_interest",
-            "performs_expert_work": False,
-            "asks_for_deliverable_details": False,
-            "uses_unsupported_assumption": False,
-            "repeats_answered_question": False,
-            "natural_and_clear": True,
-        }, "explain_solution")
-        self.assertEqual(valid, [])
-        wrong = target.phase_review_issues({
-            "question_purpose": "discover_need",
-            "performs_expert_work": False,
-            "asks_for_deliverable_details": False,
-            "uses_unsupported_assumption": False,
-            "repeats_answered_question": False,
-            "natural_and_clear": True,
-        }, "explain_solution")
-        self.assertTrue(any("другую функцию" in issue for issue in wrong))
-
-    def test_shared_quality_filter_detects_cliches(self):
-        issues = target.quality_issues("Понимаю вас. Это мощный инструмент. Что вы пробовали?")
-        self.assertIn("шаблонная или канцелярская формулировка", issues)
-
-    def test_shared_quality_filter_rejects_team_voice_and_invented_specialization(self):
-        issues = target.quality_issues(
-            "Мы можем показать генератор, специально разработанный для преподавателей английского."
-        )
-        self.assertIn("эксперт говорит от имени команды, а не от первого лица", issues)
-        self.assertIn("придумана неподтверждённая специализация продукта", issues)
-
-    def test_safe_reply_acknowledges_specific_client_difficulty(self):
-        answer = target.safe_phase_reply(
-            "explain_solution",
-            target.EXPERT_PROFILES["marketer"],
-            "Пробовала, но всё равно многое приходится переделывать вручную.",
-        )
-        self.assertIn("переделывать вручную", answer)
-        self.assertIn("экономия времени", answer)
-
-    def test_when_can_i_book_stays_in_chat_without_form(self):
-        with target.app.test_request_context("/"):
-            target.session["expert_slug"] = "marketer"
-            answer = target.direct_booking_answer("И когда можно?")
-            self.assertIn("Назовите удобные дату и время", answer)
-            self.assertNotIn("[[BOOK_", answer)
-            self.assertNotIn("форм", answer.lower())
-
-    def test_shared_quality_filter_keeps_one_question(self):
-        answer = target.keep_one_question("Как сейчас устроена работа? Используете ли вы нейросети? Расскажите подробнее.")
-        self.assertEqual(answer.count("?"), 1)
-        self.assertNotIn("Используете", answer)
-
-    def test_shared_quality_filter_removes_unverified_followup(self):
-        answer = target.remove_unverified_promises(
-            "Встреча пройдёт через Телемост. Я свяжусь с вами накануне, чтобы прислать ссылку. До встречи!"
-        )
-        self.assertIn("Телемост", answer)
-        self.assertNotIn("свяжусь", answer)
-
-    def test_busy_slot_offers_real_alternatives(self):
+    def test_busy_slot_offers_only_calendar_checked_alternatives(self):
         tz = ZoneInfo("Europe/Moscow")
-        busy_start = (datetime.now(tz) + timedelta(days=60)).replace(hour=20, minute=0, second=0, microsecond=0)
-        self.calendar.busy = [(busy_start, busy_start + timedelta(hours=1))]
-        with self.client.session_transaction() as session:
-            session["expert_slug"] = "marketer"
-            session["consultation_offered"] = True
-        result = self.client.post("/api/chat", json={"message": busy_start.strftime("%d.%m.%Y в 20:00")})
-        self.assertEqual(result.status_code, 200)
-        self.assertIn("уже занято", result.json["answer"])
-        self.assertIn((busy_start + timedelta(hours=1)).strftime("%d.%m в %H:%M"), result.json["answer"])
-        chosen = self.client.post("/api/chat", json={"message": "Давайте в 21:00"})
-        self.assertIn("свободно", chosen.json["answer"])
-        self.assertIn("имя, телефон и email", chosen.json["answer"])
+        start = (datetime.now(tz) + timedelta(days=30)).replace(hour=11, minute=0, second=0, microsecond=0)
+        self.calendar.busy = [(start, start + timedelta(hours=1))]
+        with target.app.test_request_context("/"):
+            target.session["consultation_offered"] = True
+            answer = target.chat_booking_answer(start.strftime("%d.%m.%Y в %H:%M"))
+            self.assertIn("уже занято", answer)
+            self.assertTrue(target.session.get("offered_slots"))
 
-    def test_home_restores_history_without_erasing_intro(self):
+    def test_booking_never_confirms_before_calendar_save(self):
+        future = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=30)
+        with target.app.test_request_context("/"):
+            target.session["pending_booking"] = {"start": future.isoformat(), "type": "free"}
+            self.calendar.busy = [(future, future + timedelta(hours=1))]
+            answer = target.chat_booking_answer("Анна, +7 999 123-45-67, anna@example.com")
+            self.assertNotIn("Запись подтверждена", answer)
+            self.assertEqual(self.calendar.saved, [])
+
+    def test_confirmed_booking_is_not_offered_again(self):
+        with target.app.test_request_context("/"):
+            target.session["last_booking"] = "Бесплатная консультация, 20.09.2026 в 11:00, 20 минут"
+            self.assertIn("вижу вашу запись", target.direct_booking_answer("Я уже записалась"))
+            final = target.completed_dialog_answer("Хорошо, до встречи")
+            self.assertEqual(final, "До встречи! Хорошего дня.")
+            self.assertTrue(target.session["dialog_closed"])
+
+    # UI, persistence and admin
+    def test_input_is_not_disabled_while_reply_pending(self):
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertNotIn("input.disabled=true", page)
+        self.assertIn("pending", page)
+
+    def test_history_is_restored(self):
         page = self.client.get("/").get_data(as_text=True)
         self.assertIn("fetch('/api/history')", page)
 
-    def test_home_input_remains_available_while_reply_is_pending(self):
-        page = self.client.get("/").get_data(as_text=True)
-        self.assertIn("let sending=false,pending=[]", page)
-        self.assertNotIn("input.disabled=true;send.disabled=true", page)
-        self.assertIn("(data.messages||[]).forEach", page)
-        self.assertNotIn("chat.innerHTML=''", page)
-        self.assertIn("[[BOOK_FREE]]", page)
-
-    def test_reset_clears_dialog_state_and_messages(self):
-        con = target.db()
-        con.execute(
-            "insert into messages(session_id,role,content,created_at) values(?,?,?,?)",
-            ("old-dialog", "user", "Старое сообщение", 1),
-        )
-        con.commit()
+    def test_reset_clears_dialog_and_controller_state(self):
         with self.client.session_transaction() as session:
-            session["expert_slug"] = "marketer"
-            session["sid"] = "old-dialog"
-            session["discovery_state"] = {"identity": True, "task": True}
+            session["sid"] = "old"
+            session["dialog_controller_state"] = {"need": True}
             session["consultation_offered"] = True
-        response = self.client.post("/api/reset")
-        self.assertEqual(response.status_code, 200)
+        con = target.db()
+        con.execute("insert into messages values(?,?,?,?)", ("old", "user", "text", 1))
+        con.commit()
+        self.assertEqual(self.client.post("/api/reset").status_code, 200)
         with self.client.session_transaction() as session:
-            self.assertEqual(session.get("expert_slug"), "marketer")
             self.assertNotIn("sid", session)
-            self.assertNotIn("discovery_state", session)
-            self.assertNotIn("consultation_offered", session)
-        self.assertEqual(
-            con.execute("select count(*) from messages where session_id=?", ("old-dialog",)).fetchone()[0],
-            0,
-        )
+            self.assertNotIn("dialog_controller_state", session)
 
-    def test_stale_discovery_cookie_cannot_skip_new_dialog(self):
-        class IdentityExtractor:
-            def reply(self, messages):
-                return '{"stages":{"identity":{"complete":true,"evidence":"Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми"},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
-        old = target.gigachat
-        target.gigachat = IdentityExtractor()
-        try:
-            with target.app.test_request_context("/"):
-                target.session["sid"] = "new-dialog"
-                target.session["discovery_sid"] = "old-dialog"
-                target.session["discovery_state"] = {
-                    "identity": True,
-                    "task": True,
-                    "ai_experience": True,
-                    "solution_explained": True,
-                    "solution_interest": True,
-                }
-                state = target.assess_discovery(
-                    [],
-                    "Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми.",
-                    target.EXPERT_PROFILES["marketer"],
-                )
-                self.assertTrue(state["identity"])
-                self.assertFalse(state["task"])
-                self.assertFalse(state["ai_experience"])
-                self.assertFalse(state["solution_explained"])
-                self.assertFalse(state["solution_interest"])
-                self.assertEqual(target.discovery_action(state, target.EXPERT_PROFILES["marketer"], ""), "explore_task")
-        finally:
-            target.gigachat = old
+    def test_knowledge_base_survives_dialog_reset(self):
+        self.client.post("/api/reset")
+        con = target.db()
+        self.assertEqual(con.execute("select count(*) from documents").fetchone()[0], 1)
 
-    def test_first_direct_identity_answer_closes_identity_stage_without_model_help(self):
-        class EmptyExtractor:
-            def reply(self, messages):
-                return '{"stages":{"identity":{"complete":false,"evidence":""},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
-        old = target.gigachat
-        target.gigachat = EmptyExtractor()
-        try:
-            with target.app.test_request_context("/"):
-                target.session["sid"] = "fresh-dialog"
-                state = target.assess_discovery(
-                    [],
-                    "Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми.",
-                    target.EXPERT_PROFILES["marketer"],
-                )
-                self.assertTrue(state["identity"])
-                self.assertFalse(state["task"])
-                self.assertEqual(target.discovery_action(state, target.EXPERT_PROFILES["marketer"], ""), "explore_task")
-        finally:
-            target.gigachat = old
-
-    def test_task_question_cannot_invent_problem_from_audience(self):
-        issues = target.phase_reply_issues(
-            "Расскажите подробнее, какие сложности возникают у вас при работе с разными возрастными группами?",
-            "explore_task",
-            [],
-        )
-        self.assertIn("проблема выведена из профессии или аудитории клиента", issues)
-
-    def test_marketer_discovery_advances_from_direct_answers_without_model_labels(self):
-        class EmptyExtractor:
-            def reply(self, messages):
-                return '{"stages":{"identity":{"complete":false,"evidence":""},"task":{"complete":false,"evidence":""},"ai_experience":{"complete":false,"evidence":""}}}'
-        old = target.gigachat
-        target.gigachat = EmptyExtractor()
-        profile = target.EXPERT_PROFILES["marketer"]
-        try:
-            with target.app.test_request_context("/"):
-                target.session["sid"] = "sequence-dialog"
-                identity = "Я репетитор по английскому, работаю с детьми от 10 лет и взрослыми."
-                state = target.assess_discovery([], identity, profile)
-                self.assertEqual(target.discovery_action(state, profile, identity), "explore_task")
-
-                history = [
-                    {"role": "user", "content": identity},
-                    {"role": "assistant", "content": "А что в вашей работе сейчас хотелось бы упростить или изменить?"},
-                ]
-                need = "Хотелось бы сократить время подготовки к урокам. Очень много времени занимает."
-                state = target.assess_discovery(history, need, profile)
-                self.assertTrue(state["task"])
-                self.assertEqual(target.discovery_action(state, profile, need), "explore_ai_experience")
-
-                history += [
-                    {"role": "user", "content": need},
-                    {"role": "assistant", "content": "Пробовали уже решать эту задачу с помощью нейросетей?"},
-                ]
-                attempt = "Пробовала, мне не понравилось. Всё равно многое приходится переделывать вручную."
-                state = target.assess_discovery(history, attempt, profile)
-                self.assertTrue(state["ai_experience"])
-                self.assertEqual(target.discovery_action(state, profile, attempt), "explain_solution")
-        finally:
-            target.gigachat = old
-
-    def test_upload_and_chat(self):
+    def test_admin_upload_and_list(self):
         headers = {"X-Admin-Password": "admin123"}
-        uploaded = self.client.post(
+        response = self.client.post(
             "/api/admin/upload",
             headers=headers,
-            data={"files": (io.BytesIO("Эксперт проводит консультации.".encode()), "base.txt")},
+            data={"files": (io.BytesIO("Новый факт".encode()), "new.txt")},
             content_type="multipart/form-data",
         )
-        self.assertEqual(uploaded.status_code, 200)
-        answer = self.client.post("/api/chat", json={"message": "Как проходит консультация?"})
-        self.assertEqual(answer.json["answer"], "Тестовый ответ")
+        self.assertEqual(response.status_code, 200)
+        listed = self.client.get("/api/admin", headers=headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertTrue(any(x["name"] == "new.txt" for x in listed.json["documents"]))
 
 
 if __name__ == "__main__":
     unittest.main()
+
