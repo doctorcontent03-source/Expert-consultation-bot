@@ -412,7 +412,22 @@ def questions_are_similar(left, right):
         return False
     return len(a & b) / len(a | b) >= 0.72
 
-def controller_reply_issues(payload, expected_action, state):
+def reply_opening(reply, size=2):
+    words = normalized_words(reply)
+    return tuple(words[:size])
+
+def repeats_recent_opening(reply, history):
+    current = reply_opening(reply)
+    if not current:
+        return False
+    previous = next((row["content"] for row in reversed(history) if row["role"] == "assistant"), "")
+    return bool(previous) and current == reply_opening(previous)
+
+def uses_ungrounded_hypothesis(reply):
+    low = " ".join(normalized_words(reply))
+    return bool(re.search(r"^(?:похоже|возможно|вероятно|видимо|кажется) вы\b", low))
+
+def controller_reply_issues(payload, expected_action, state, history):
     reply = payload["reply"]
     low = reply.lower()
     action = payload["action"]
@@ -425,6 +440,10 @@ def controller_reply_issues(payload, expected_action, state):
         issues.append("задано больше одного вопроса")
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         issues.append("служебный комментарий")
+    if uses_ungrounded_hypothesis(reply):
+        issues.append("ответ начинается с предположения о состоянии клиента")
+    if repeats_recent_opening(reply, history):
+        issues.append("повторено начало предыдущей реплики")
     question = question_from_reply(reply)
     if action == "explore":
         if not question:
@@ -483,7 +502,7 @@ respect_boundary — принять границу без нового вопр�
 repair_interpretation — признать неверное понимание без нового диагностического вопроса;
 end_dialog — попрощаться только при явном завершении разговора.
 
-Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Не угадывайте профессию, проблему, чувства и намерения. Не повторяйте уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
+Не считайте описания состояния вроде «ничего не хочу» отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента и не начинайте ответ с гипотезы о том, что он якобы чувствует, думает или понимает. Не повторяйте начало предыдущей реплики и уже заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один вопрос.
 
 Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
 contact — понятен контекст жизни или ситуации клиента;
@@ -524,11 +543,13 @@ def fallback_action_instruction(action):
         "end_dialog": "Коротко и спокойно попрощайтесь без вопроса, анализа и предложения консультации.",
     }[action]
 
-def fallback_reply_is_usable(reply, action, state):
+def fallback_reply_is_usable(reply, action, state, history):
     if not reply or len(re.findall(r"\S+", reply)) > 55 or reply.count("?") > 1:
         return False
     low = reply.lower()
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
+        return False
+    if uses_ungrounded_hypothesis(reply) or repeats_recent_opening(reply, history):
         return False
     if action == "explore":
         question = question_from_reply(reply)
@@ -559,7 +580,7 @@ def generate_stateful_dialog_reply(history, text, context):
             state = apply_grounded_observations(original_state, payload["observations"], text)
             expected = expected_dialog_action(state, payload["intent"], payload["intent_evidence"], text)
             payload["action"] = expected
-            primary_issues = controller_reply_issues(payload, expected, original_state)
+            primary_issues = controller_reply_issues(payload, expected, original_state, history)
             if not primary_issues:
                 return payload["reply"], expected, advance_dialog_state(state, expected, payload["reply"])
     except Exception as exc:
@@ -571,7 +592,7 @@ def generate_stateful_dialog_reply(history, text, context):
 
 Создайте только следующую реплику эксперта, без JSON, пояснений и служебных комментариев.
 Назначенная функция реплики: {fallback_action_instruction(expected)}
-Учитывайте весь разговор. Не повторяйте уже заданный вопрос. Максимум 45 слов и один вопрос.
+Учитывайте весь разговор. Опирайтесь на конкретные слова клиента, не приписывайте ему чувства, мысли и причины, которых он не называл. Не начинайте так же, как предыдущую реплику, и не повторяйте уже заданный вопрос. Максимум 45 слов и один вопрос.
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -588,7 +609,7 @@ def generate_stateful_dialog_reply(history, text, context):
         if primary_error:
             raise primary_error
         raise
-    if not fallback_reply_is_usable(fallback_reply, expected, original_state):
+    if not fallback_reply_is_usable(fallback_reply, expected, original_state, history):
         raise RuntimeError("Резервная модель не смогла создать допустимую реплику")
     return fallback_reply, expected, advance_dialog_state(state, expected, fallback_reply)
 
