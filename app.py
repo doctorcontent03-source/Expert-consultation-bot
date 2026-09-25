@@ -369,9 +369,9 @@ def parse_controller_payload(raw):
     assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
         return None
-    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "answer_information", "respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog"}:
+    if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "start_booking", "answer_information", "respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog"}:
         return None
-    if intent not in {"continue", "interest", "decline", "question", "boundary", "end", "correction", "rupture"}:
+    if intent not in {"continue", "interest", "booking", "decline", "question", "boundary", "end", "correction", "rupture"}:
         return None
     if not isinstance(observations, dict):
         return None
@@ -413,6 +413,8 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "respect_boundary"
     if intent == "question" and grounded_intent:
         return "answer_information"
+    if state["consultation_offered"] and intent == "booking" and grounded_intent:
+        return "start_booking"
     if state["solution_explained"]:
         if intent == "interest" and grounded_intent:
             return "offer_consultation" if not state["consultation_offered"] else "check_interest"
@@ -578,6 +580,7 @@ explore — получить один недостающий факт;
 explain_solution — объяснить пользу встречи без вопроса и без записи;
 check_interest — проверить интерес без записи;
 offer_consultation — один раз предложить встречу;
+start_booking — после уже сделанного предложения передать явное согласие клиента или его просьбу начать запись календарному механизму;
 answer_information — ответить на прямой вопрос;
 respect_boundary — принять границу без нового вопроса и давления;
 respect_decline — принять отказ от предложенного направления или встречи, не переубеждать и не повторять предложение;
@@ -593,11 +596,12 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
+booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Простого интереса к консультации недостаточно. Если консультация ещё не предложена, не используйте booking.
 decline означает, что клиент отклоняет последнее предложение или приглашение, но не обязательно завершает весь разговор.
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -624,6 +628,7 @@ def fallback_action_instruction(action):
         "explain_solution": "Без вопроса кратко объясните от первого лица, чем встреча с вами может быть полезна в описанной ситуации. Не проводите консультацию в чате и не предлагайте запись.",
         "check_interest": "Нейтрально выясните отношение клиента к уже объяснённому направлению помощи. Не приписывайте ему сомнение, страх, отказ или препятствие и не предлагайте запись.",
         "offer_consultation": "Кратко свяжите уже понятный запрос с разбором на встрече и один раз ненавязчиво предложите первичную консультацию от первого лица. Не рекламируйте себя, не обещайте результат и не описывайте помощь общими продающими формулировками.",
+        "start_booking": "Передайте управление календарному механизму без самостоятельного описания ссылки, кнопки, формы или доступного времени.",
         "answer_information": "Прямо ответьте на последний вопрос клиента по базе знаний. Не заменяйте ответ приглашением.",
         "respect_boundary": "Коротко примите обозначенную клиентом границу. Не задавайте вопрос, не анализируйте и не уговаривайте.",
         "respect_decline": "Коротко и спокойно примите отказ от последнего предложения. Не задавайте вопрос, не переубеждайте и не повторяйте предложение.",
@@ -686,6 +691,8 @@ def generate_stateful_dialog_reply(history, text, context):
             first_client_turn,
         )
         payload["action"] = expected
+        if expected == "start_booking":
+            payload["reply"] = "Назовите удобные дату и время — я проверю их в календаре."
         payload["reply"] = normalize_reply_for_action(payload["reply"], expected)
         issues = controller_reply_issues(
             payload,
@@ -928,6 +935,8 @@ def chat():
         session["dialog_closed"] = True
     if action == "offer_consultation":
         session["consultation_offered"] = True
+    if action == "start_booking":
+        session["requested_booking_type"] = session.pop("offered_booking_type", "free")
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
     return jsonify(answer=answer, closed=bool(session.get("dialog_closed")))
 

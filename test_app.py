@@ -145,6 +145,21 @@ class TestBot(unittest.TestCase):
         state["consultation_offered"] = True
         self.assertEqual(target.expected_dialog_action(state, "interest", text, text), "check_interest")
 
+    def test_semantic_booking_intent_starts_calendar_after_offer(self):
+        state = self.state(consultation_offered=True)
+        for text in ("Да, начинаем запись", "Хорошо, подберите время", "Я готова записаться"):
+            self.assertEqual(
+                target.expected_dialog_action(state, "booking", text, text),
+                "start_booking",
+            )
+
+    def test_booking_intent_cannot_skip_consultation_offer(self):
+        text = "Я готова записаться"
+        self.assertNotEqual(
+            target.expected_dialog_action(self.state(), "booking", text, text),
+            "start_booking",
+        )
+
     def test_neutral_possible_is_not_interest_or_obstacle(self):
         state = self.state(solution_explained=True)
         self.assertEqual(target.expected_dialog_action(state, "continue", "", "Возможно"), "check_interest")
@@ -401,6 +416,28 @@ class TestBot(unittest.TestCase):
             )
         self.assertEqual(answer, "Первая встреча длится 20 минут.")
         self.assertEqual(action, "answer_information")
+
+    def test_booking_intent_transfers_dialogue_to_calendar_flow(self):
+        text = "Ну да, начинаем. Подберём время?"
+        target.gigachat = ScriptedGigaChat([
+            payload(
+                "Сейчас пришлю ссылку на календарь.",
+                action="start_booking",
+                intent="booking",
+                evidence=text,
+            ),
+        ])
+        with self.client.session_transaction() as session:
+            session["dialog_controller_state"] = self.state(consultation_offered=True)
+            session["consultation_offered"] = True
+        response = self.client.post("/api/chat", json={"message": text})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["answer"],
+            "Назовите удобные дату и время — я проверю их в календаре.",
+        )
+        with self.client.session_transaction() as session:
+            self.assertEqual(session["requested_booking_type"], "free")
 
     # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
