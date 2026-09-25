@@ -269,6 +269,23 @@ class TestBot(unittest.TestCase):
         self.assertEqual(answer.count("?"), 1)
         self.assertEqual(state["diagnostic_questions"], 1)
 
+    def test_failed_generation_exposes_only_safe_diagnostic_stages(self):
+        target.gigachat = ScriptedGigaChat([
+            "plain text",
+            "plain text",
+            "plain text",
+            "plain text",
+        ])
+        response = self.client.post(
+            "/api/chat",
+            json={"message": "Да ерунда какая-то, пустота, ничего не хочу."},
+        )
+        self.assertEqual(response.status_code, 502)
+        diagnostic = response.headers.get("X-Dialog-Failure", "")
+        self.assertIn("invalid_json", diagnostic)
+        self.assertNotIn("ерунда", diagnostic)
+        self.assertNotIn("plain text", diagnostic)
+
     def test_malformed_json_is_repaired_without_leaking_service_data(self):
         malformed = payload("Давно у вас такое состояние?").replace('":', '"\\:')
         target.gigachat = ScriptedGigaChat([malformed])
