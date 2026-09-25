@@ -318,6 +318,7 @@ PSYCHOLOGIST_STAGES = {
 def parse_json_object(value):
     value = str(value or "").strip()
     value = re.sub(r"^```(?:json)?\s*|\s*```$", "", value, flags=re.I)
+    value = value.replace('"\\:', '":')
     left, right = value.find("{"), value.rfind("}")
     if left < 0 or right <= left:
         return None
@@ -357,11 +358,7 @@ def parse_controller_payload(raw):
     fence = chr(96) * 3
     if cleaned.startswith(fence):
         cleaned = re.sub(r"^" + re.escape(fence) + r"(?:json)?\s*|\s*" + re.escape(fence) + r"$", "", cleaned, flags=re.I | re.S).strip()
-    cleaned = cleaned.replace("\\:", ":")
-    try:
-        data = json.loads(cleaned)
-    except (TypeError, json.JSONDecodeError):
-        return None
+    data = parse_json_object(cleaned)
     if not isinstance(data, dict):
         return None
     reply = data.get("reply")
@@ -376,7 +373,7 @@ def parse_controller_payload(raw):
         return None
     if intent not in {"continue", "interest", "decline", "question", "boundary", "end", "correction", "rupture"}:
         return None
-    if not isinstance(observations, dict):
+    if not isinstance(observations, dict) or not isinstance(assessment, dict):
         return None
     return {
         "reply": reply.strip(),
@@ -384,7 +381,7 @@ def parse_controller_payload(raw):
         "intent": intent,
         "intent_evidence": str(evidence or "").strip(),
         "observations": observations,
-        "reply_assessment": assessment if isinstance(assessment, dict) else {},
+        "reply_assessment": assessment,
     }
 
 def apply_grounded_observations(state, observations, text):
@@ -488,12 +485,10 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("бот давит на клиента")
     if assessment.get("gender_matches_expert") is not True:
         issues.append("грамматический род не соответствует эксперту")
-    if state.get("consultation_offered") and action != "offer_consultation" and assessment.get("adds_or_repeats_consultation_offer") is True:
-        issues.append("консультация предложена повторно")
-    if action == "answer_information" and assessment.get("answers_client_question") is not True:
-        issues.append("нет прямого ответа на вопрос клиента")
     if assessment.get("leaks_internal_instructions") is True:
         issues.append("в ответ попали служебные инструкции")
+    if state.get("consultation_offered") and assessment.get("adds_or_repeats_consultation_offer") is True:
+        issues.append("консультация предложена повторно")
     if action == "offer_consultation" and assessment.get("offers_consultation") is not True:
         issues.append("консультация не предложена")
     if action == "offer_consultation" and assessment.get("uses_generic_self_promotion") is True:
@@ -523,53 +518,6 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
     if re.search(r"(поставлю диагноз|гарантирую|точно поможет)", low):
         issues.append("неподтверждённое обещание")
     return issues
-
-def review_reply_semantics(reply, expected_action, state, history, text, context, model):
-    transcript = "\n".join(
-        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
-        for row in history[-10:]
-    )
-    prompt = f"""Вы — независимый контролёр одной реплики диалога. Оценивайте смысл,
-а не наличие отдельных слов. Ничего не исправляйте и не сочиняйте.
-
-Назначенное действие: {expected_action}
-Консультация уже предлагалась: {"да" if state.get("consultation_offered") else "нет"}
-
-Верните только JSON:
-{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,
-"asks_only_missing_information":true,"repeats_known_information":false,
-"performs_expert_work":false,"pressures_client":false,"offers_consultation":false,
-"uses_generic_self_promotion":false,"gender_matches_expert":true,
-"adds_or_repeats_consultation_offer":false,"answers_client_question":true,
-"leaks_internal_instructions":false,"question_count":0}}
-
-Правила оценки:
-- gender_matches_expert сверяйте с базой знаний; при нейтральной реплике ставьте true;
-- adds_or_repeats_consultation_offer=true, если к ответу добавлено новое приглашение,
-  напоминание о записи или подталкивание выбрать время;
-- answers_client_question=true, если прямой вопрос получил ответ; если вопроса нет, ставьте true;
-- question_count — число самостоятельных смысловых вопросов, даже если знаков вопроса меньше;
-- leaks_internal_instructions=true для JSON, схемы, названий действий, наблюдений или правил контроллера;
-- uses_generic_self_promotion=true, если вместо уместного приглашения эксперт рекламирует
-  себя или обещает общие результаты.
-
-БАЗА ЗНАНИЙ:
-{context[-10000:]}
-
-ДИАЛОГ:
-{transcript[-7000:]}
-Клиент: {text}
-ОТВЕТ ЭКСПЕРТА:
-{reply}"""
-    try:
-        assessment = parse_json_object(gigachat.reply(
-            [{"role": "system", "content": prompt}],
-            model=model,
-        ))
-    except Exception:
-        app.logger.exception("Independent reply review failed")
-        return None
-    return assessment if isinstance(assessment, dict) else None
 
 def controller_prompt(state, context, history, text, retry_issues=None, first_client_turn=False):
     transcript = "\n".join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])
@@ -624,7 +572,7 @@ decline означает, что клиент отклоняет последн�
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}},"reply_assessment":{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,"asks_only_missing_information":true,"repeats_known_information":false,"performs_expert_work":false,"pressures_client":false,"offers_consultation":false,"uses_generic_self_promotion":false,"question_count":1}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}},"reply_assessment":{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,"asks_only_missing_information":true,"repeats_known_information":false,"performs_expert_work":false,"pressures_client":false,"offers_consultation":false,"uses_generic_self_promotion":false,"gender_matches_expert":true,"adds_or_repeats_consultation_offer":false,"leaks_internal_instructions":false,"question_count":1}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -641,6 +589,8 @@ def plain_reply_from_model(raw):
     fence = chr(96) * 3
     if cleaned.startswith(fence):
         cleaned = re.sub(r"^" + re.escape(fence) + r"(?:json)?\s*|\s*" + re.escape(fence) + r"$", "", cleaned, flags=re.I | re.S).strip()
+    if cleaned.startswith("{") or '"reply"' in cleaned:
+        return ""
     return cleaned
 
 def fallback_action_instruction(action):
@@ -675,44 +625,14 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
         return False
     return True
 
-def recovery_reply_prompt(action, state, context, history, text):
-    transcript = "\n".join(
-        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
-        for row in history[-10:]
-    )
-    return SYSTEM_RULES + f"""
-
-Сформулируйте только следующую реплику эксперта обычным текстом, без JSON,
-служебных пояснений и названий состояний.
-
-Состояние разговора: {json.dumps(state, ensure_ascii=False)}
-Назначенное действие: {action}
-Требование к действию: {fallback_action_instruction(action)}
-
-Опирайтесь на смысл последнего сообщения в контексте диалога. Не повторяйте уже
-заданные вопросы и известные выводы. Максимум 45 слов и один смысловой вопрос.
-
-БАЗА ЗНАНИЙ:
-{context[-10000:]}
-
-ДИАЛОГ:
-{transcript[-7000:]}
-Клиент: {text}
-Эксперт:"""
-
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
     primary_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
     fallback_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
-    review_model = fallback_model
     issues = []
     last_error = None
-    recovery_candidates = []
-    last_dialog_state = original_state
-    last_expected_action = None
-    models = (primary_model, fallback_model, primary_model)
-    for model in models:
+    for model in (primary_model, fallback_model, primary_model, fallback_model):
         prompt = controller_prompt(
             original_state,
             context,
@@ -741,34 +661,6 @@ def generate_stateful_dialog_reply(history, text, context):
             first_client_turn,
         )
         payload["action"] = expected
-        last_dialog_state = state
-        last_expected_action = expected
-        if fallback_reply_is_usable(
-            payload["reply"],
-            expected,
-            original_state,
-            history,
-            first_client_turn,
-        ):
-            recovery_candidates.append((
-                payload["reply"],
-                expected,
-                state,
-                len(issues),
-            ))
-        assessment = review_reply_semantics(
-            payload["reply"],
-            expected,
-            original_state,
-            history,
-            text,
-            context,
-            review_model,
-        )
-        if assessment is None:
-            issues = ["не удалось независимо проверить ответ"]
-            continue
-        payload["reply_assessment"] = assessment
         issues = controller_reply_issues(
             payload,
             expected,
@@ -782,66 +674,9 @@ def generate_stateful_dialog_reply(history, text, context):
                 expected,
                 payload["reply"],
             )
-        if fallback_reply_is_usable(
-            payload["reply"],
-            expected,
-            original_state,
-            history,
-            first_client_turn,
-        ):
-            recovery_candidates[-1] = (
-                payload["reply"],
-                expected,
-                state,
-                len(issues),
-            )
-    if recovery_candidates:
-        reply, action, state, _ = min(recovery_candidates, key=lambda item: item[3])
-        app.logger.warning(
-            "Using structurally safe dialog reply after semantic validation exhausted retries"
-        )
-        return reply, action, advance_dialog_state(state, action, reply)
-    recovery_action = last_expected_action or expected_dialog_action(
-        original_state,
-        "continue",
-        "",
-        text,
-        first_client_turn,
-    )
-    recovery_state = last_dialog_state
-    for model in (fallback_model, primary_model):
-        try:
-            raw = gigachat.reply(
-                [{"role": "system", "content": recovery_reply_prompt(
-                    recovery_action,
-                    recovery_state,
-                    context,
-                    history,
-                    text,
-                )}],
-                model=model,
-            )
-        except Exception as exc:
-            last_error = exc
-            app.logger.exception("Plain dialog recovery failed with model %s", model)
-            continue
-        reply = clean_fallback_reply(plain_reply_from_model(raw), recovery_action)
-        if fallback_reply_is_usable(
-            reply,
-            recovery_action,
-            original_state,
-            history,
-            first_client_turn,
-        ):
-            app.logger.warning("Using plain model recovery reply")
-            return reply, recovery_action, advance_dialog_state(
-                recovery_state,
-                recovery_action,
-                reply,
-            )
     if last_error:
         raise last_error
-    raise RuntimeError("Models did not return a validated dialog reply")
+    raise RuntimeError("Models did not return a valid dialog reply")
 
 def advance_dialog_state(state, action, reply):
     updated = dict(state)
