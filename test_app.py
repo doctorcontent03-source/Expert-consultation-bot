@@ -253,6 +253,41 @@ class TestBot(unittest.TestCase):
         issues = target.controller_reply_issues(data, "explain_solution", self.state(), [])
         self.assertIn("эксперт говорит о себе в третьем лице", issues)
 
+    def test_informal_address_is_rejected(self):
+        data = target.parse_controller_payload(payload("Давай попробуем разобраться?"))
+        issues = target.controller_reply_issues(data, "explore", self.state(), [])
+        self.assertIn("нарушено обращение на вы", issues)
+
+    def test_offer_does_not_repeat_clients_desired_result(self):
+        client_text = "Вернуть веру в себя и радость жизни."
+        data = target.parse_controller_payload(payload(
+            "Моя помощь направлена на возвращение веры в себя и радости жизни. Предлагаю встретиться.",
+            action="offer_consultation",
+        ))
+        issues = target.controller_reply_issues(
+            data,
+            "offer_consultation",
+            self.state(),
+            [],
+            client_text=client_text,
+        )
+        self.assertIn("дословно пересказан ответ клиента", issues)
+
+    def test_offer_may_connect_situation_with_expert_specialization(self):
+        client_text = "Вернуть веру в себя и радость жизни."
+        data = target.parse_controller_payload(payload(
+            "Я работаю с такими ситуациями. Предлагаю обсудить вашу ситуацию на первой встрече.",
+            action="offer_consultation",
+        ))
+        issues = target.controller_reply_issues(
+            data,
+            "offer_consultation",
+            self.state(),
+            [],
+            client_text=client_text,
+        )
+        self.assertNotIn("дословно пересказан ответ клиента", issues)
+
     def test_team_voice_is_forbidden_by_system_rules(self):
         self.assertIn("не организация и не команда", target.SYSTEM_RULES)
         self.assertIn("будем рады", target.SYSTEM_RULES)
