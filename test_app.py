@@ -281,7 +281,7 @@ class TestBot(unittest.TestCase):
             json={"message": "Да ерунда какая-то, пустота, ничего не хочу."},
         )
         self.assertEqual(response.status_code, 502)
-        diagnostic = response.headers.get("X-Dialog-Failure", "")
+        diagnostic = response.get_json().get("diagnostic", "")
         self.assertIn("invalid_json", diagnostic)
         self.assertNotIn("ерунда", diagnostic)
         self.assertNotIn("plain text", diagnostic)
