@@ -297,6 +297,19 @@ class TestBot(unittest.TestCase):
         self.assertEqual(action, "explore")
         self.assertFalse(answer.startswith("{"))
 
+    def test_pr8_payload_without_new_assessment_fields_remains_valid(self):
+        old_payload = __import__("json").loads(payload("Давно у вас такое состояние?"))
+        old_payload["reply_assessment"].pop("gender_matches_expert")
+        old_payload["reply_assessment"].pop("adds_or_repeats_consultation_offer")
+        old_payload["reply_assessment"].pop("leaks_internal_instructions")
+        parsed = target.parse_controller_payload(
+            __import__("json").dumps(old_payload, ensure_ascii=False)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertTrue(parsed["reply_assessment"]["gender_matches_expert"])
+        self.assertFalse(parsed["reply_assessment"]["adds_or_repeats_consultation_offer"])
+        self.assertFalse(parsed["reply_assessment"]["leaks_internal_instructions"])
+
     def test_wrong_expert_gender_is_retried_in_same_pipeline(self):
         wrong = payload("Готова ответить на ваши вопросы.", action="answer_information", intent="question", evidence="Сколько стоит?")
         wrong_data = __import__("json").loads(wrong)
