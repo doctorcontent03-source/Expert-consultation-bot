@@ -607,6 +607,25 @@ class DialogGenerationError(RuntimeError):
         super().__init__("Models did not return a valid dialog reply")
         self.diagnostics = list(diagnostics)
 
+def diagnostic_issue_code(issue):
+    codes = {
+        "назначено неверное действие": "wrong_action",
+        "ответ длиннее 45 слов": "too_long",
+        "задано больше одного вопроса": "multiple_questions",
+        "служебный комментарий": "service_comment",
+        "повторена предыдущая реплика": "duplicate_reply",
+        "на этапе уточнения нет вопроса": "missing_question",
+        "преждевременно предложена встреча": "early_meeting",
+        "повторён уже заданный вопрос": "repeated_question",
+        "задан вопрос на этапе без вопросов": "unexpected_question",
+        "ответ на вопрос заменён записью": "booking_in_answer",
+        "интерес подменён записью": "booking_in_interest",
+        "маркер записи появился не на том этапе": "wrong_booking_marker",
+        "эксперт говорит о себе в третьем лице": "third_person",
+        "неподтверждённое обещание": "unsupported_promise",
+    }
+    return codes.get(issue, "other")
+
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
@@ -659,7 +678,9 @@ def generate_stateful_dialog_reply(history, text, context):
                 expected,
                 payload["reply"],
             )
-        diagnostics.append(f"{model}:rejected:{'|'.join(issues)}")
+        diagnostics.append(
+            f"{model}:rejected:{'|'.join(diagnostic_issue_code(issue) for issue in issues)}"
+        )
     raise DialogGenerationError(diagnostics or [
         f"unknown:{type(last_error).__name__}" if last_error else "unknown"
     ])
@@ -881,10 +902,10 @@ def chat():
         answer, action, dialog_state = generate_stateful_dialog_reply(history, text, context)
     except Exception as exc:
         app.logger.exception("Stateful dialog generation failed")
-        response = jsonify(error="Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз.")
+        payload = {"error": "Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."}
         if isinstance(exc, DialogGenerationError):
-            response.headers["X-Dialog-Failure"] = ";".join(exc.diagnostics)[:1800]
-        return response, 502
+            payload["diagnostic"] = ";".join(exc.diagnostics)[:1800]
+        return jsonify(payload), 502
     session["dialog_controller_state"] = dialog_state
     if action == "end_dialog":
         session["dialog_closed"] = True
