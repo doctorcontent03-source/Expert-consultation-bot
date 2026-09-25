@@ -24,9 +24,11 @@ class ScriptedGigaChat:
     def __init__(self, replies):
         self.replies = list(replies)
         self.prompts = []
+        self.models = []
 
     def reply(self, messages, model=None):
         self.prompts.append(messages[0]["content"])
+        self.models.append(model)
         if not self.replies:
             raise RuntimeError("No scripted reply")
         value = self.replies.pop(0)
@@ -318,6 +320,19 @@ class TestBot(unittest.TestCase):
         self.assertEqual(action, "explore")
         self.assertEqual(answer.count("?"), 1)
         self.assertEqual(state["diagnostic_questions"], 1)
+
+    def test_structured_dialog_uses_reliable_model_first(self):
+        scripted = ScriptedGigaChat([
+            payload("Давно у вас такое состояние?"),
+        ])
+        target.gigachat = scripted
+        with target.app.test_request_context("/"):
+            target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, ничего не хочу.",
+                "База",
+            )
+        self.assertEqual(scripted.models, ["GigaChat-2-Max"])
 
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
