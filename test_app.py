@@ -337,6 +337,24 @@ class TestBot(unittest.TestCase):
         self.assertEqual(scripted.models, ["GigaChat"])
         self.assertEqual(scripted.response_formats, [target.CONTROLLER_RESPONSE_FORMAT])
 
+    def test_dialog_timing_logs_do_not_change_generated_reply(self):
+        target.gigachat = ScriptedGigaChat([
+            payload("Давно у вас такое состояние?"),
+        ])
+        with target.app.test_request_context("/"), self.assertLogs(target.app.logger, level="INFO") as captured:
+            answer, action, state = target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, ничего не хочу.",
+                "База",
+            )
+        self.assertEqual(answer, "Давно у вас такое состояние?")
+        self.assertEqual(action, "explore")
+        self.assertEqual(state["diagnostic_questions"], 1)
+        joined = "\n".join(captured.output)
+        self.assertIn("Dialog generation completed", joined)
+        self.assertIn("attempts=1", joined)
+        self.assertIn("prompt_chars=", joined)
+
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
             "invalid json",
