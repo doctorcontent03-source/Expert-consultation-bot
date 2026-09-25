@@ -446,7 +446,7 @@ def repeats_recent_reply(reply, history):
             return True
     return False
 
-def clean_fallback_reply(reply, action):
+def normalize_reply_for_action(reply, action):
     cleaned = str(reply or "").strip()
     if action == "explore" and cleaned.count("?") > 1:
         positions = [match.start() for match in re.finditer(r"\?", cleaned)]
@@ -602,30 +602,6 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
         return False
     return True
 
-class DialogGenerationError(RuntimeError):
-    def __init__(self, diagnostics):
-        super().__init__("Models did not return a valid dialog reply")
-        self.diagnostics = list(diagnostics)
-
-def diagnostic_issue_code(issue):
-    codes = {
-        "назначено неверное действие": "wrong_action",
-        "ответ длиннее 45 слов": "too_long",
-        "задано больше одного вопроса": "multiple_questions",
-        "служебный комментарий": "service_comment",
-        "повторена предыдущая реплика": "duplicate_reply",
-        "на этапе уточнения нет вопроса": "missing_question",
-        "преждевременно предложена встреча": "early_meeting",
-        "повторён уже заданный вопрос": "repeated_question",
-        "задан вопрос на этапе без вопросов": "unexpected_question",
-        "ответ на вопрос заменён записью": "booking_in_answer",
-        "интерес подменён записью": "booking_in_interest",
-        "маркер записи появился не на том этапе": "wrong_booking_marker",
-        "эксперт говорит о себе в третьем лице": "third_person",
-        "неподтверждённое обещание": "unsupported_promise",
-    }
-    return codes.get(issue, "other")
-
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
@@ -633,7 +609,6 @@ def generate_stateful_dialog_reply(history, text, context):
     fallback_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     issues = []
     last_error = None
-    diagnostics = []
     for model in (primary_model, fallback_model, primary_model, fallback_model):
         prompt = controller_prompt(
             original_state,
@@ -648,13 +623,11 @@ def generate_stateful_dialog_reply(history, text, context):
         except Exception as exc:
             last_error = exc
             issues = ["модель не вернула ответ"]
-            diagnostics.append(f"{model}:exception:{type(exc).__name__}")
             app.logger.exception("Dialog generation failed with model %s", model)
             continue
         payload = parse_controller_payload(raw)
         if payload is None:
             issues = ["ответ не соответствует JSON-схеме"]
-            diagnostics.append(f"{model}:invalid_json")
             continue
         state = apply_grounded_observations(original_state, payload["observations"], text)
         expected = expected_dialog_action(
@@ -665,6 +638,7 @@ def generate_stateful_dialog_reply(history, text, context):
             first_client_turn,
         )
         payload["action"] = expected
+        payload["reply"] = normalize_reply_for_action(payload["reply"], expected)
         issues = controller_reply_issues(
             payload,
             expected,
@@ -678,12 +652,9 @@ def generate_stateful_dialog_reply(history, text, context):
                 expected,
                 payload["reply"],
             )
-        diagnostics.append(
-            f"{model}:rejected:{'|'.join(diagnostic_issue_code(issue) for issue in issues)}"
-        )
-    raise DialogGenerationError(diagnostics or [
-        f"unknown:{type(last_error).__name__}" if last_error else "unknown"
-    ])
+    if last_error:
+        raise last_error
+    raise RuntimeError("Models did not return a valid dialog reply")
 
 def advance_dialog_state(state, action, reply):
     updated = dict(state)
@@ -902,10 +873,7 @@ def chat():
         answer, action, dialog_state = generate_stateful_dialog_reply(history, text, context)
     except Exception as exc:
         app.logger.exception("Stateful dialog generation failed")
-        payload = {"error": "Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."}
-        if isinstance(exc, DialogGenerationError):
-            payload["diagnostic"] = ";".join(exc.diagnostics)[:1800]
-        return jsonify(payload), 502
+        return jsonify(error="Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."), 502
     session["dialog_controller_state"] = dialog_state
     if action == "end_dialog":
         session["dialog_closed"] = True
