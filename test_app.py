@@ -25,10 +25,12 @@ class ScriptedGigaChat:
         self.replies = list(replies)
         self.prompts = []
         self.models = []
+        self.response_formats = []
 
-    def reply(self, messages, model=None):
+    def reply(self, messages, model=None, response_format=None):
         self.prompts.append(messages[0]["content"])
         self.models.append(model)
+        self.response_formats.append(response_format)
         if not self.replies:
             raise RuntimeError("No scripted reply")
         value = self.replies.pop(0)
@@ -321,7 +323,7 @@ class TestBot(unittest.TestCase):
         self.assertEqual(answer.count("?"), 1)
         self.assertEqual(state["diagnostic_questions"], 1)
 
-    def test_structured_dialog_uses_reliable_model_first(self):
+    def test_structured_dialog_uses_lite_with_native_schema_first(self):
         scripted = ScriptedGigaChat([
             payload("Давно у вас такое состояние?"),
         ])
@@ -332,7 +334,8 @@ class TestBot(unittest.TestCase):
                 "Да ерунда какая-то, ничего не хочу.",
                 "База",
             )
-        self.assertEqual(scripted.models, ["GigaChat-2-Max"])
+        self.assertEqual(scripted.models, ["GigaChat"])
+        self.assertEqual(scripted.response_formats, [target.CONTROLLER_RESPONSE_FORMAT])
 
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
