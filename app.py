@@ -373,11 +373,10 @@ def parse_controller_payload(raw):
         return None
     if intent not in {"continue", "interest", "decline", "question", "boundary", "end", "correction", "rupture"}:
         return None
-    if not isinstance(observations, dict) or not isinstance(assessment, dict):
+    if not isinstance(observations, dict):
         return None
-    assessment.setdefault("gender_matches_expert", True)
-    assessment.setdefault("adds_or_repeats_consultation_offer", False)
-    assessment.setdefault("leaks_internal_instructions", False)
+    if not isinstance(assessment, dict):
+        assessment = {}
     return {
         "reply": reply.strip(),
         "action": action,
@@ -465,7 +464,6 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
     low = reply.lower()
     action = payload["action"]
     issues = []
-    assessment = payload.get("reply_assessment") or {}
     if action != expected_action:
         issues.append("назначено неверное действие")
     if len(re.findall(r"\S+", reply)) > 45:
@@ -474,30 +472,6 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("задано больше одного вопроса")
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         issues.append("служебный комментарий")
-    if assessment.get("based_on_client_meaning") is not True:
-        issues.append("ответ не опирается на смысл слов клиента")
-    if assessment.get("treats_message_as_feedback_to_expert") is True and first_client_turn:
-        issues.append("первая реплика ошибочно представлена как оценка слов эксперта")
-    if assessment.get("asks_only_missing_information") is not True:
-        issues.append("запрошена уже известная или ненужная информация")
-    if assessment.get("repeats_known_information") is True:
-        issues.append("повторена уже подтверждённая информация")
-    if assessment.get("performs_expert_work") is True:
-        issues.append("бот начинает проводить консультацию в чате")
-    if assessment.get("pressures_client") is True:
-        issues.append("бот давит на клиента")
-    if assessment.get("gender_matches_expert") is not True:
-        issues.append("грамматический род не соответствует эксперту")
-    if assessment.get("leaks_internal_instructions") is True:
-        issues.append("в ответ попали служебные инструкции")
-    if state.get("consultation_offered") and assessment.get("adds_or_repeats_consultation_offer") is True:
-        issues.append("консультация предложена повторно")
-    if action == "offer_consultation" and assessment.get("offers_consultation") is not True:
-        issues.append("консультация не предложена")
-    if action == "offer_consultation" and assessment.get("uses_generic_self_promotion") is True:
-        issues.append("вместо приглашения используется общая реклама помощи")
-    if int(assessment.get("question_count", reply.count("?")) or 0) > 1:
-        issues.append("задано больше одного смыслового вопроса")
     if repeats_recent_reply(reply, history):
         issues.append("повторена предыдущая реплика")
     question = question_from_reply(reply)
@@ -575,7 +549,7 @@ decline означает, что клиент отклоняет последн�
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}},"reply_assessment":{{"based_on_client_meaning":true,"treats_message_as_feedback_to_expert":false,"asks_only_missing_information":true,"repeats_known_information":false,"performs_expert_work":false,"pressures_client":false,"offers_consultation":false,"uses_generic_self_promotion":false,"gender_matches_expert":true,"adds_or_repeats_consultation_offer":false,"leaks_internal_instructions":false,"question_count":1}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}

@@ -201,12 +201,6 @@ class TestBot(unittest.TestCase):
         text = "Сколько стоит консультация?"
         self.assertEqual(target.expected_dialog_action(state, "question", text, text, first_client_turn=True), "answer_information")
 
-    def test_first_turn_validator_uses_semantic_assessment(self):
-        bad = target.parse_controller_payload(payload("Ответ эксперта?"))
-        bad["reply_assessment"]["treats_message_as_feedback_to_expert"] = True
-        issues = target.controller_reply_issues(bad, "explore", self.state(), [], first_client_turn=True)
-        self.assertIn("первая реплика ошибочно представлена как оценка слов эксперта", issues)
-
     def test_first_turn_prompt_marks_neutral_greeting_context(self):
         prompt = target.controller_prompt(self.state(), "База", [], "Да ерунда какая-то", first_client_turn=True)
         self.assertIn("ПЕРВАЯ РЕПЛИКА КЛИЕНТА", prompt)
@@ -220,17 +214,6 @@ class TestBot(unittest.TestCase):
             diagnostic_questions=2,
         )
         self.assertEqual(target.expected_dialog_action(state, "continue", "", "Вернуть смысл жизни"), "offer_consultation")
-
-    def test_generic_self_promotion_is_rejected_at_invitation_stage(self):
-        data = target.parse_controller_payload(payload(
-            "Моя помощь направлена на возвращение жизненной энергии.",
-            action="offer_consultation",
-        ))
-        data["reply_assessment"]["offers_consultation"] = False
-        data["reply_assessment"]["uses_generic_self_promotion"] = True
-        issues = target.controller_reply_issues(data, "offer_consultation", self.state(), [])
-        self.assertIn("консультация не предложена", issues)
-        self.assertIn("вместо приглашения используется общая реклама помощи", issues)
 
     def test_repeated_assistant_reply_is_rejected_generically(self):
         previous = "Краткое отражение запроса и один вопрос?"
@@ -297,39 +280,18 @@ class TestBot(unittest.TestCase):
         self.assertEqual(action, "explore")
         self.assertFalse(answer.startswith("{"))
 
-    def test_pr8_payload_without_new_assessment_fields_remains_valid(self):
+    def test_pr8_payload_without_reply_assessment_remains_valid(self):
         old_payload = __import__("json").loads(payload("Давно у вас такое состояние?"))
-        old_payload["reply_assessment"].pop("gender_matches_expert")
-        old_payload["reply_assessment"].pop("adds_or_repeats_consultation_offer")
-        old_payload["reply_assessment"].pop("leaks_internal_instructions")
+        old_payload.pop("reply_assessment")
         parsed = target.parse_controller_payload(
             __import__("json").dumps(old_payload, ensure_ascii=False)
         )
         self.assertIsNotNone(parsed)
-        self.assertTrue(parsed["reply_assessment"]["gender_matches_expert"])
-        self.assertFalse(parsed["reply_assessment"]["adds_or_repeats_consultation_offer"])
-        self.assertFalse(parsed["reply_assessment"]["leaks_internal_instructions"])
-
-    def test_wrong_expert_gender_is_retried_in_same_pipeline(self):
-        wrong = payload("Готова ответить на ваши вопросы.", action="answer_information", intent="question", evidence="Сколько стоит?")
-        wrong_data = __import__("json").loads(wrong)
-        wrong_data["reply_assessment"]["gender_matches_expert"] = False
-        correct = payload("Стоимость указана в базе знаний.", action="answer_information", intent="question", evidence="Сколько стоит?")
-        target.gigachat = ScriptedGigaChat([
-            __import__("json").dumps(wrong_data, ensure_ascii=False),
-            correct,
-        ])
-        with target.app.test_request_context("/"):
-            answer, action, _ = target.generate_stateful_dialog_reply(
-                [], "Сколько стоит?", "Кирилл — психолог."
-            )
-        self.assertEqual(answer, "Стоимость указана в базе знаний.")
-        self.assertEqual(action, "answer_information")
+        self.assertEqual(parsed["reply_assessment"], {})
 
     def test_repeated_consultation_offer_is_retried_in_same_pipeline(self):
         repeated = payload("Хотите записаться?", action="answer_information", intent="question", evidence="Сколько длится?")
         repeated_data = __import__("json").loads(repeated)
-        repeated_data["reply_assessment"]["adds_or_repeats_consultation_offer"] = True
         answer_payload = payload("Первая встреча длится 20 минут.", action="answer_information", intent="question", evidence="Сколько длится?")
         target.gigachat = ScriptedGigaChat([
             __import__("json").dumps(repeated_data, ensure_ascii=False),
