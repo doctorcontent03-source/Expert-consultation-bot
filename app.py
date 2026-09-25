@@ -26,6 +26,46 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Вопросы «зачем бесплатная встреча», «нужно ли потом сразу записываться», «как часто встречаться» и подобные являются информационными: отвечайте на них без кнопок и без призыва записаться. Кнопку показывайте только после явного согласия клиента записаться или прямого вопроса о доступном времени. Если клиент впервые согласился на ознакомительную консультацию, добавьте маркер [[BOOK_FREE]]. Если клиент явно хочет обычную или повторную встречу, добавьте маркер [[BOOK_REGULAR]]. Если клиент просит показать оба варианта, добавьте оба маркера. После подтверждённой записи поздравьте клиента с записью и больше не показывайте кнопки, если он не просит изменить или создать ещё одну встречу. Не упоминайте «наш сайт», раздел сайта, форму или технические адреса.
 Отвечайте кратко и естественно, без служебных комментариев о правилах."""
 
+CONTROLLER_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "reply": {"type": "string"},
+            "action": {"type": "string", "enum": [
+                "explore", "explain_solution", "check_interest", "offer_consultation",
+                "start_booking", "answer_information", "respect_boundary", "respect_decline",
+                "repair_interpretation", "repair_contact", "end_dialog",
+            ]},
+            "intent": {"type": "string", "enum": [
+                "continue", "interest", "booking", "decline", "question",
+                "boundary", "end", "correction", "rupture",
+            ]},
+            "intent_evidence": {"type": "string"},
+            "observations": {
+                "type": "object",
+                "properties": {
+                    key: {
+                        "type": "object",
+                        "properties": {
+                            "present": {"type": "boolean"},
+                            "evidence": {"type": "string"},
+                        },
+                        "required": ["present", "evidence"],
+                        "additionalProperties": False,
+                    }
+                    for key in ("contact", "need", "previous_experience", "desired_result")
+                },
+                "required": ["contact", "need", "previous_experience", "desired_result"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["reply", "action", "intent", "intent_evidence", "observations"],
+        "additionalProperties": False,
+    },
+    "strict": True,
+}
+
 STYLE = """<style>:root{--g:#285c45;--o:#d97932;--bg:#faf8f1;--soft:#e7f0eb;--ink:#22312a;--line:#d8e1dc}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}.shell{width:min(760px,100%);min-height:100vh;margin:auto;background:#fff;padding:28px clamp(16px,4vw,38px)}header{display:flex;justify-content:space-between;gap:20px;align-items:start}h1{margin:2px 0;font-size:clamp(25px,4vw,36px)}.eyebrow{margin:0;color:var(--o);font-weight:800;text-transform:uppercase;font-size:12px;letter-spacing:.08em}a{color:var(--g)}.chat{height:65vh;min-height:420px;overflow:auto;padding:25px 0;display:flex;flex-direction:column;gap:12px}.bubble{max-width:84%;padding:12px 15px;border-radius:18px;white-space:pre-wrap}.bot{align-self:flex-start;background:var(--soft)}.user{align-self:flex-end;background:var(--g);color:#fff}form{display:flex;gap:10px}input{width:100%;padding:13px;border:1px solid var(--line);border-radius:12px;font:inherit}button{padding:12px 16px;border:0;border-radius:12px;background:var(--g);color:#fff;font-weight:750;cursor:pointer}.secondary{background:#fff;color:var(--g);border:1px solid var(--g);margin-top:12px}.card{border:1px solid var(--line);border-radius:16px;padding:16px;margin:18px 0}.card label{display:block;font-weight:700;margin:12px 0}.card input{display:block;margin-top:6px}.row{display:flex;justify-content:space-between;align-items:center}</style>"""
 
 HOME_HTML = """<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Консультация</title>__STYLE__</head><body><main class='shell'><header><div><p class='eyebrow'>Консультация</p><h1>Диалог с экспертом</h1><p>Расскажите о своей ситуации или задайте вопрос.</p></div><a href='/admin'>База знаний</a></header><section id='chat' class='chat'><div class='bubble bot'>Здравствуйте! Расскажите, пожалуйста, что вас сейчас беспокоит и с чем вы хотели бы разобраться?</div></section><form id='form'><input id='message' autocomplete='off' placeholder='Напишите сообщение…'><button>Отправить</button></form><button id='reset' class='secondary'>Начать заново</button></main><script>const chat=document.querySelector('#chat'),form=document.querySelector('#form'),input=document.querySelector('#message');function add(t,c){const d=document.createElement('div');d.className='bubble '+c;d.textContent=t;chat.append(d);chat.scrollTop=chat.scrollHeight}form.onsubmit=async e=>{e.preventDefault_QUESTION_MARK_;const m=input.value.trim();if(!m)return;add(m,'user');input.value='';input.disabled=true;const w=document.createElement('div');w.className='bubble bot';w.textContent='…';chat.append(w);try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});const v=await r.json();w.textContent=v.answer||v.error}catch{w.textContent='Не удалось получить ответ. Попробуйте ещё раз.'}input.disabled=false;input.focus()};document.querySelector('#reset').onclick=async()=>{await fetch('/api/reset',{method:'POST'});location.reload()}</script></body></html>""".replace("__STYLE__", STYLE).replace("preventDefault_QUESTION_MARK_", "preventDefault()")
@@ -658,8 +698,8 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
-    backup_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
-    preferred_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
+    preferred_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
+    backup_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     issues = []
     last_error = None
     for model in (preferred_model, backup_model, preferred_model, backup_model):
@@ -672,7 +712,11 @@ def generate_stateful_dialog_reply(history, text, context):
             first_client_turn=first_client_turn,
         )
         try:
-            raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
+            raw = gigachat.reply(
+                [{"role": "system", "content": prompt}],
+                model=model,
+                response_format=CONTROLLER_RESPONSE_FORMAT,
+            )
         except Exception as exc:
             last_error = exc
             issues = ["модель не вернула ответ"]
@@ -821,8 +865,10 @@ class GigaChat:
         if not r.ok:
             raise RuntimeError(f"OAuth GigaChat: HTTP {r.status_code}; {r.text[:500]}")
         payload=r.json(); self.token=payload["access_token"]; self.expires=payload.get("expires_at",int((time.time()+1500)*1000))/1000; return self.token
-    def reply(self, messages, model=None):
+    def reply(self, messages, model=None, response_format=None):
         payload = {"model": model or os.getenv("GIGACHAT_MODEL", "GigaChat"), "messages": messages, "temperature": 0.2, "max_tokens": 700}
+        if response_format:
+            payload["response_format"] = response_format
         r=requests.post("https://gigachat.devices.sberbank.ru/api/v1/chat/completions",headers={"Authorization":f"Bearer {self.access_token()}","Content-Type":"application/json"},json=payload,timeout=60,verify=os.getenv("GIGACHAT_VERIFY_SSL","true").lower()=="true")
         r.raise_for_status(); return r.json()["choices"][0]["message"]["content"]
 gigachat=GigaChat()
