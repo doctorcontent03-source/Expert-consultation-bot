@@ -683,6 +683,7 @@ def generate_stateful_dialog_reply(history, text, context):
     review_model = fallback_model
     issues = []
     last_error = None
+    recovery_candidates = []
     models = (primary_model, fallback_model, primary_model)
     for model in models:
         prompt = controller_prompt(
@@ -713,6 +714,19 @@ def generate_stateful_dialog_reply(history, text, context):
             first_client_turn,
         )
         payload["action"] = expected
+        if fallback_reply_is_usable(
+            payload["reply"],
+            expected,
+            original_state,
+            history,
+            first_client_turn,
+        ):
+            recovery_candidates.append((
+                payload["reply"],
+                expected,
+                state,
+                len(issues),
+            ))
         assessment = review_reply_semantics(
             payload["reply"],
             expected,
@@ -739,6 +753,25 @@ def generate_stateful_dialog_reply(history, text, context):
                 expected,
                 payload["reply"],
             )
+        if fallback_reply_is_usable(
+            payload["reply"],
+            expected,
+            original_state,
+            history,
+            first_client_turn,
+        ):
+            recovery_candidates[-1] = (
+                payload["reply"],
+                expected,
+                state,
+                len(issues),
+            )
+    if recovery_candidates:
+        reply, action, state, _ = min(recovery_candidates, key=lambda item: item[3])
+        app.logger.warning(
+            "Using structurally safe dialog reply after semantic validation exhausted retries"
+        )
+        return reply, action, advance_dialog_state(state, action, reply)
     if last_error:
         raise last_error
     raise RuntimeError("Models did not return a validated dialog reply")

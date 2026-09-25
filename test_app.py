@@ -334,6 +334,48 @@ class TestBot(unittest.TestCase):
         self.assertFalse(answer.lstrip().startswith("{"))
         self.assertEqual(state["diagnostic_questions"], 1)
 
+    def test_semantic_reviewer_cannot_leave_dialog_without_expert_reply(self):
+        generated = payload("Давно у вас сохраняется это состояние?")
+        rejected_review = review(based_on_client_meaning=False)
+        target.gigachat = ScriptedGigaChat([
+            generated,
+            rejected_review,
+            generated,
+            rejected_review,
+            generated,
+            rejected_review,
+        ])
+        with target.app.test_request_context("/"):
+            answer, action, state = target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, пустота, ничего не хочу.",
+                "Кирилл — психолог.",
+            )
+        self.assertEqual(answer, "Давно у вас сохраняется это состояние?")
+        self.assertEqual(action, "explore")
+        self.assertEqual(state["diagnostic_questions"], 1)
+
+    def test_chat_returns_expert_reply_when_strict_reviews_reject_all_candidates(self):
+        generated = payload("Давно у вас сохраняется это состояние?")
+        rejected_review = review(asks_only_missing_information=False)
+        target.gigachat = ScriptedGigaChat([
+            generated,
+            rejected_review,
+            generated,
+            rejected_review,
+            generated,
+            rejected_review,
+        ])
+        response = self.client.post(
+            "/api/chat",
+            json={"message": "Да ерунда какая-то, пустота, ничего не хочу."},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["answer"],
+            "Давно у вас сохраняется это состояние?",
+        )
+
     # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
         now = datetime(2026, 9, 17, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
