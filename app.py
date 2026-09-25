@@ -446,6 +446,46 @@ def repeats_recent_reply(reply, history):
             return True
     return False
 
+def comparison_words(value):
+    stop_words = {"и", "в", "во", "на", "к", "с", "со", "за", "для", "о", "об", "это"}
+    suffixes = (
+        "иями", "ями", "ами", "ого", "его", "ому", "ему", "ыми", "ими",
+        "ение", "ения", "остью", "ости", "ать", "ять", "ить", "уть",
+        "ой", "ей", "ый", "ий", "ая", "яя", "ое", "ее", "ые", "ие",
+        "ов", "ев", "ам", "ям", "ах", "ях", "ы", "и", "а", "я", "у", "ю", "е", "о", "ь",
+    )
+    result = []
+    for word in normalized_words(value):
+        if word in stop_words:
+            continue
+        stem = word
+        for suffix in suffixes:
+            if stem.endswith(suffix) and len(stem) - len(suffix) >= 3:
+                stem = stem[:-len(suffix)]
+                break
+        result.append(stem)
+    return result
+
+def substantially_repeats_client_message(reply, text):
+    source = set(comparison_words(text))
+    if len(source) < 4:
+        return False
+    for sentence in re.split(r"(?<=[.!?])\s+", str(reply)):
+        candidate = set(comparison_words(sentence))
+        if len(candidate) < 4:
+            continue
+        shared = len(source & candidate)
+        if shared >= 3 and shared / min(len(source), len(candidate)) >= 0.6:
+            return True
+    return False
+
+def uses_informal_address(reply):
+    low = str(reply or "").lower().replace("ё", "е")
+    return bool(re.search(
+        r"(?<![а-яa-z])(ты|тебя|тебе|тобой|твой|твоя|твое|твои|давай)(?![а-яa-z])",
+        low,
+    ))
+
 def normalize_reply_for_action(reply, action):
     cleaned = str(reply or "").strip()
     if action == "explore" and cleaned.count("?") > 1:
@@ -461,7 +501,7 @@ def normalize_reply_for_action(reply, action):
     cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
     return re.sub(r"\s+", " ", cleaned).strip()
 
-def controller_reply_issues(payload, expected_action, state, history, first_client_turn=False):
+def controller_reply_issues(payload, expected_action, state, history, first_client_turn=False, client_text=""):
     reply = payload["reply"]
     low = reply.lower()
     action = payload["action"]
@@ -478,6 +518,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("служебный комментарий")
     if repeats_recent_reply(reply, history):
         issues.append("повторена предыдущая реплика")
+    if uses_informal_address(reply):
+        issues.append("нарушено обращение на вы")
     question = question_from_reply(reply)
     if action == "explore":
         if not question:
@@ -492,6 +534,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("ответ на вопрос заменён записью")
     if action == "check_interest" and re.search(r"(запис|когда вам удобно|\[\[book_)", low):
         issues.append("интерес подменён записью")
+    if action == "offer_consultation" and substantially_repeats_client_message(reply, client_text):
+        issues.append("дословно пересказан ответ клиента")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         issues.append("маркер записи появился не на том этапе")
     if re.search(r"\b(психолог|специалист|эксперт) (?:поможет|сможет|проводит)\b", low):
@@ -649,6 +693,7 @@ def generate_stateful_dialog_reply(history, text, context):
             original_state,
             history,
             first_client_turn,
+            text,
         )
         if not issues:
             return payload["reply"], expected, advance_dialog_state(
