@@ -375,6 +375,9 @@ def parse_controller_payload(raw):
         return None
     if not isinstance(observations, dict) or not isinstance(assessment, dict):
         return None
+    assessment.setdefault("gender_matches_expert", True)
+    assessment.setdefault("adds_or_repeats_consultation_offer", False)
+    assessment.setdefault("leaks_internal_instructions", False)
     return {
         "reply": reply.strip(),
         "action": action,
