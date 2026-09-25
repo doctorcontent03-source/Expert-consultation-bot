@@ -284,6 +284,53 @@ class TestBot(unittest.TestCase):
         self.assertEqual(answer.count("?"), 1)
         self.assertEqual(state["diagnostic_questions"], 1)
 
+    def test_information_answer_keeps_facts_and_removes_follow_up_question(self):
+        target.gigachat = ScriptedGigaChat([
+            payload(
+                "Первая консультация проходит онлайн и длится 15–20 минут. "
+                "Хотите записаться?",
+                action="answer_information",
+                intent="question",
+                evidence="как проходит первая консультация и сколько она длится",
+            ),
+        ])
+        with target.app.test_request_context("/"):
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [],
+                "А как проходит первая консультация и сколько она длится?",
+                "Первая консультация проходит онлайн и длится 15–20 минут.",
+            )
+        self.assertEqual(action, "answer_information")
+        self.assertEqual(
+            answer,
+            "Первая консультация проходит онлайн и длится 15–20 минут.",
+        )
+        self.assertNotIn("?", answer)
+
+    def test_information_reply_containing_only_follow_up_question_is_retried(self):
+        target.gigachat = ScriptedGigaChat([
+            payload(
+                "Хотите записаться?",
+                action="answer_information",
+                intent="question",
+                evidence="сколько она длится",
+            ),
+            payload(
+                "Первая консультация длится 15–20 минут.",
+                action="answer_information",
+                intent="question",
+                evidence="сколько она длится",
+            ),
+        ])
+        with target.app.test_request_context("/"):
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [],
+                "А сколько она длится?",
+                "Первая консультация длится 15–20 минут.",
+            )
+        self.assertEqual(action, "answer_information")
+        self.assertEqual(answer, "Первая консультация длится 15–20 минут.")
+
     def test_malformed_json_is_repaired_without_leaking_service_data(self):
         malformed = payload("Давно у вас такое состояние?").replace('":', '"\\:')
         target.gigachat = ScriptedGigaChat([malformed])
