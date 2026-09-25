@@ -675,6 +675,31 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
         return False
     return True
 
+def recovery_reply_prompt(action, state, context, history, text):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-10:]
+    )
+    return SYSTEM_RULES + f"""
+
+Сформулируйте только следующую реплику эксперта обычным текстом, без JSON,
+служебных пояснений и названий состояний.
+
+Состояние разговора: {json.dumps(state, ensure_ascii=False)}
+Назначенное действие: {action}
+Требование к действию: {fallback_action_instruction(action)}
+
+Опирайтесь на смысл последнего сообщения в контексте диалога. Не повторяйте уже
+заданные вопросы и известные выводы. Максимум 45 слов и один смысловой вопрос.
+
+БАЗА ЗНАНИЙ:
+{context[-10000:]}
+
+ДИАЛОГ:
+{transcript[-7000:]}
+Клиент: {text}
+Эксперт:"""
+
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
@@ -684,6 +709,8 @@ def generate_stateful_dialog_reply(history, text, context):
     issues = []
     last_error = None
     recovery_candidates = []
+    last_dialog_state = original_state
+    last_expected_action = None
     models = (primary_model, fallback_model, primary_model)
     for model in models:
         prompt = controller_prompt(
@@ -714,6 +741,8 @@ def generate_stateful_dialog_reply(history, text, context):
             first_client_turn,
         )
         payload["action"] = expected
+        last_dialog_state = state
+        last_expected_action = expected
         if fallback_reply_is_usable(
             payload["reply"],
             expected,
@@ -772,6 +801,44 @@ def generate_stateful_dialog_reply(history, text, context):
             "Using structurally safe dialog reply after semantic validation exhausted retries"
         )
         return reply, action, advance_dialog_state(state, action, reply)
+    recovery_action = last_expected_action or expected_dialog_action(
+        original_state,
+        "continue",
+        "",
+        text,
+        first_client_turn,
+    )
+    recovery_state = last_dialog_state
+    for model in (fallback_model, primary_model):
+        try:
+            raw = gigachat.reply(
+                [{"role": "system", "content": recovery_reply_prompt(
+                    recovery_action,
+                    recovery_state,
+                    context,
+                    history,
+                    text,
+                )}],
+                model=model,
+            )
+        except Exception as exc:
+            last_error = exc
+            app.logger.exception("Plain dialog recovery failed with model %s", model)
+            continue
+        reply = clean_fallback_reply(plain_reply_from_model(raw), recovery_action)
+        if fallback_reply_is_usable(
+            reply,
+            recovery_action,
+            original_state,
+            history,
+            first_client_turn,
+        ):
+            app.logger.warning("Using plain model recovery reply")
+            return reply, recovery_action, advance_dialog_state(
+                recovery_state,
+                recovery_action,
+                reply,
+            )
     if last_error:
         raise last_error
     raise RuntimeError("Models did not return a validated dialog reply")
