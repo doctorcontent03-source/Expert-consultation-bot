@@ -376,6 +376,28 @@ class TestBot(unittest.TestCase):
             "Давно у вас сохраняется это состояние?",
         )
 
+    def test_plain_model_recovery_after_all_structured_replies_are_unusable(self):
+        unusable = payload("Я завершаю разговор.", action="explore")
+        target.gigachat = ScriptedGigaChat([
+            unusable,
+            review(),
+            unusable,
+            review(),
+            unusable,
+            review(),
+            "Давно у вас сохраняется это состояние?",
+        ])
+        with target.app.test_request_context("/"):
+            answer, action, state = target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, пустота, ничего не хочу.",
+                "Кирилл — психолог.",
+            )
+        self.assertEqual(answer, "Давно у вас сохраняется это состояние?")
+        self.assertEqual(action, "explore")
+        self.assertEqual(state["diagnostic_questions"], 1)
+        self.assertIn("без JSON", target.gigachat.prompts[-1])
+
     # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
         now = datetime(2026, 9, 17, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
