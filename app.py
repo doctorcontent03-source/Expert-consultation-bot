@@ -734,7 +734,7 @@ def generate_stateful_dialog_reply(history, text, context):
         payload = parse_controller_payload(raw)
         if payload is None:
             issues = ["ответ не соответствует JSON-схеме"]
-            app.logger.info(
+            app.logger.warning(
                 "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=json_schema",
                 model, attempts, round((time.perf_counter() - attempt_started) * 1000), len(prompt),
             )
@@ -760,7 +760,7 @@ def generate_stateful_dialog_reply(history, text, context):
             text,
         )
         if not issues:
-            app.logger.info(
+            app.logger.warning(
                 "Dialog generation completed model=%s attempts=%s model_attempt_ms=%s total_ms=%s prompt_chars=%s context_chars=%s history_chars=%s action=%s",
                 model, attempts,
                 round((time.perf_counter() - attempt_started) * 1000),
@@ -774,7 +774,7 @@ def generate_stateful_dialog_reply(history, text, context):
                 expected,
                 payload["reply"],
             )
-        app.logger.info(
+        app.logger.warning(
             "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=validation issue_count=%s",
             model, attempts, round((time.perf_counter() - attempt_started) * 1000),
             len(prompt), len(issues),
