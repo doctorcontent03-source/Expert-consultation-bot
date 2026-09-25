@@ -696,13 +696,16 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
     return True
 
 def generate_stateful_dialog_reply(history, text, context):
+    generation_started = time.perf_counter()
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
     preferred_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
     backup_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     issues = []
     last_error = None
+    attempts = 0
     for model in (preferred_model, backup_model, preferred_model, backup_model):
+        attempts += 1
         prompt = controller_prompt(
             original_state,
             context,
@@ -711,6 +714,7 @@ def generate_stateful_dialog_reply(history, text, context):
             retry_issues=issues or None,
             first_client_turn=first_client_turn,
         )
+        attempt_started = time.perf_counter()
         try:
             raw = gigachat.reply(
                 [{"role": "system", "content": prompt}],
@@ -718,13 +722,22 @@ def generate_stateful_dialog_reply(history, text, context):
                 response_format=CONTROLLER_RESPONSE_FORMAT,
             )
         except Exception as exc:
+            attempt_ms = round((time.perf_counter() - attempt_started) * 1000)
             last_error = exc
             issues = ["модель не вернула ответ"]
-            app.logger.exception("Dialog generation failed with model %s", model)
+            app.logger.exception(
+                "Dialog model attempt failed model=%s attempt=%s elapsed_ms=%s prompt_chars=%s context_chars=%s history_chars=%s",
+                model, attempts, attempt_ms, len(prompt), len(context),
+                sum(len(str(row.get("content", ""))) for row in history),
+            )
             continue
         payload = parse_controller_payload(raw)
         if payload is None:
             issues = ["ответ не соответствует JSON-схеме"]
+            app.logger.info(
+                "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=json_schema",
+                model, attempts, round((time.perf_counter() - attempt_started) * 1000), len(prompt),
+            )
             continue
         state = apply_grounded_observations(original_state, payload["observations"], text)
         expected = expected_dialog_action(
@@ -747,11 +760,30 @@ def generate_stateful_dialog_reply(history, text, context):
             text,
         )
         if not issues:
+            app.logger.info(
+                "Dialog generation completed model=%s attempts=%s model_attempt_ms=%s total_ms=%s prompt_chars=%s context_chars=%s history_chars=%s action=%s",
+                model, attempts,
+                round((time.perf_counter() - attempt_started) * 1000),
+                round((time.perf_counter() - generation_started) * 1000),
+                len(prompt), len(context),
+                sum(len(str(row.get("content", ""))) for row in history),
+                expected,
+            )
             return payload["reply"], expected, advance_dialog_state(
                 state,
                 expected,
                 payload["reply"],
             )
+        app.logger.info(
+            "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=validation issue_count=%s",
+            model, attempts, round((time.perf_counter() - attempt_started) * 1000),
+            len(prompt), len(issues),
+        )
+    app.logger.error(
+        "Dialog generation exhausted attempts=%s total_ms=%s context_chars=%s history_chars=%s",
+        attempts, round((time.perf_counter() - generation_started) * 1000), len(context),
+        sum(len(str(row.get("content", ""))) for row in history),
+    )
     if last_error:
         raise last_error
     raise RuntimeError("Models did not return a valid dialog reply")
