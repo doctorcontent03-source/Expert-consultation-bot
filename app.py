@@ -658,11 +658,11 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
 def generate_stateful_dialog_reply(history, text, context):
     original_state = controller_state()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
-    primary_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
-    fallback_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
+    backup_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
+    preferred_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     issues = []
     last_error = None
-    for model in (primary_model, fallback_model, primary_model, fallback_model):
+    for model in (preferred_model, backup_model, preferred_model, backup_model):
         prompt = controller_prompt(
             original_state,
             context,
