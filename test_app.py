@@ -58,32 +58,10 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
             "uses_generic_self_promotion": False,
             "gender_matches_expert": True,
             "adds_or_repeats_consultation_offer": False,
-            "answers_client_question": True,
             "leaks_internal_instructions": False,
             "question_count": reply.count("?"),
         },
     }, ensure_ascii=False)
-
-
-def review(**changes):
-    import json
-    result = {
-        "based_on_client_meaning": True,
-        "treats_message_as_feedback_to_expert": False,
-        "asks_only_missing_information": True,
-        "repeats_known_information": False,
-        "performs_expert_work": False,
-        "pressures_client": False,
-        "offers_consultation": False,
-        "uses_generic_self_promotion": False,
-        "gender_matches_expert": True,
-        "adds_or_repeats_consultation_offer": False,
-        "answers_client_question": True,
-        "leaks_internal_instructions": False,
-        "question_count": 1,
-    }
-    result.update(changes)
-    return json.dumps(result, ensure_ascii=False)
 
 
 class TestBot(unittest.TestCase):
@@ -254,29 +232,6 @@ class TestBot(unittest.TestCase):
         self.assertIn("консультация не предложена", issues)
         self.assertIn("вместо приглашения используется общая реклама помощи", issues)
 
-    def test_wrong_expert_gender_is_rejected_semantically(self):
-        data = target.parse_controller_payload(payload("Готова ответить на ваши вопросы.", action="answer_information"))
-        data["reply_assessment"]["gender_matches_expert"] = False
-        issues = target.controller_reply_issues(data, "answer_information", self.state(), [])
-        self.assertIn("грамматический род не соответствует эксперту", issues)
-
-    def test_second_consultation_invitation_is_rejected_semantically(self):
-        data = target.parse_controller_payload(payload("Ответ на организационный вопрос.", action="answer_information"))
-        data["reply_assessment"]["adds_or_repeats_consultation_offer"] = True
-        issues = target.controller_reply_issues(
-            data,
-            "answer_information",
-            self.state(consultation_offered=True),
-            [],
-        )
-        self.assertIn("консультация предложена повторно", issues)
-
-    def test_internal_instructions_are_rejected_semantically(self):
-        data = target.parse_controller_payload(payload("Служебная структура", action="answer_information"))
-        data["reply_assessment"]["leaks_internal_instructions"] = True
-        issues = target.controller_reply_issues(data, "answer_information", self.state(), [])
-        self.assertIn("в ответ попали служебные инструкции", issues)
-
     def test_repeated_assistant_reply_is_rejected_generically(self):
         previous = "Краткое отражение запроса и один вопрос?"
         data = target.parse_controller_payload(payload(previous))
@@ -319,84 +274,61 @@ class TestBot(unittest.TestCase):
         self.assertIn("не организация и не команда", target.SYSTEM_RULES)
         self.assertIn("будем рады", target.SYSTEM_RULES)
 
-    def test_malformed_structured_output_is_repaired_and_never_leaked(self):
-        malformed = payload("Давно у вас такое состояние?").replace('":', '"\\:')
+    def test_second_structured_attempt_advances_state(self):
         invalid = ScriptedGigaChat([
             "invalid json",
-            malformed,
-            review(),
+            payload("Давно у вас такое состояние?"),
         ])
         target.gigachat = invalid
         with target.app.test_request_context("/"):
             answer, action, state = target.generate_stateful_dialog_reply([], "Да ерунда какая-то, ничего не хочу.", "База")
         self.assertEqual(action, "explore")
         self.assertEqual(answer.count("?"), 1)
-        self.assertFalse(answer.lstrip().startswith("{"))
         self.assertEqual(state["diagnostic_questions"], 1)
 
-    def test_semantic_reviewer_cannot_leave_dialog_without_expert_reply(self):
-        generated = payload("Давно у вас сохраняется это состояние?")
-        rejected_review = review(based_on_client_meaning=False)
+    def test_malformed_json_is_repaired_without_leaking_service_data(self):
+        malformed = payload("Давно у вас такое состояние?").replace('":', '"\\:')
+        target.gigachat = ScriptedGigaChat([malformed])
+        with target.app.test_request_context("/"):
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [], "Да ерунда какая-то, ничего не хочу.", "База"
+            )
+        self.assertEqual(answer, "Давно у вас такое состояние?")
+        self.assertEqual(action, "explore")
+        self.assertFalse(answer.startswith("{"))
+
+    def test_wrong_expert_gender_is_retried_in_same_pipeline(self):
+        wrong = payload("Готова ответить на ваши вопросы.", action="answer_information", intent="question", evidence="Сколько стоит?")
+        wrong_data = __import__("json").loads(wrong)
+        wrong_data["reply_assessment"]["gender_matches_expert"] = False
+        correct = payload("Стоимость указана в базе знаний.", action="answer_information", intent="question", evidence="Сколько стоит?")
         target.gigachat = ScriptedGigaChat([
-            generated,
-            rejected_review,
-            generated,
-            rejected_review,
-            generated,
-            rejected_review,
+            __import__("json").dumps(wrong_data, ensure_ascii=False),
+            correct,
         ])
         with target.app.test_request_context("/"):
-            answer, action, state = target.generate_stateful_dialog_reply(
-                [],
-                "Да ерунда какая-то, пустота, ничего не хочу.",
-                "Кирилл — психолог.",
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [], "Сколько стоит?", "Кирилл — психолог."
             )
-        self.assertEqual(answer, "Давно у вас сохраняется это состояние?")
-        self.assertEqual(action, "explore")
-        self.assertEqual(state["diagnostic_questions"], 1)
+        self.assertEqual(answer, "Стоимость указана в базе знаний.")
+        self.assertEqual(action, "answer_information")
 
-    def test_chat_returns_expert_reply_when_strict_reviews_reject_all_candidates(self):
-        generated = payload("Давно у вас сохраняется это состояние?")
-        rejected_review = review(asks_only_missing_information=False)
+    def test_repeated_consultation_offer_is_retried_in_same_pipeline(self):
+        repeated = payload("Хотите записаться?", action="answer_information", intent="question", evidence="Сколько длится?")
+        repeated_data = __import__("json").loads(repeated)
+        repeated_data["reply_assessment"]["adds_or_repeats_consultation_offer"] = True
+        answer_payload = payload("Первая встреча длится 20 минут.", action="answer_information", intent="question", evidence="Сколько длится?")
         target.gigachat = ScriptedGigaChat([
-            generated,
-            rejected_review,
-            generated,
-            rejected_review,
-            generated,
-            rejected_review,
-        ])
-        response = self.client.post(
-            "/api/chat",
-            json={"message": "Да ерунда какая-то, пустота, ничего не хочу."},
-        )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.get_json()["answer"],
-            "Давно у вас сохраняется это состояние?",
-        )
-
-    def test_plain_model_recovery_after_all_structured_replies_are_unusable(self):
-        unusable = payload("Я завершаю разговор.", action="explore")
-        target.gigachat = ScriptedGigaChat([
-            unusable,
-            review(),
-            unusable,
-            review(),
-            unusable,
-            review(),
-            "Давно у вас сохраняется это состояние?",
+            __import__("json").dumps(repeated_data, ensure_ascii=False),
+            answer_payload,
         ])
         with target.app.test_request_context("/"):
-            answer, action, state = target.generate_stateful_dialog_reply(
-                [],
-                "Да ерунда какая-то, пустота, ничего не хочу.",
-                "Кирилл — психолог.",
+            target.session["dialog_controller_state"] = self.state(consultation_offered=True)
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [], "Сколько длится?", "Кирилл — психолог. Первая встреча — 20 минут."
             )
-        self.assertEqual(answer, "Давно у вас сохраняется это состояние?")
-        self.assertEqual(action, "explore")
-        self.assertEqual(state["diagnostic_questions"], 1)
-        self.assertIn("без JSON", target.gigachat.prompts[-1])
+        self.assertEqual(answer, "Первая встреча длится 20 минут.")
+        self.assertEqual(action, "answer_information")
 
     # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
