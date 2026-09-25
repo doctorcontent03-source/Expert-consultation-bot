@@ -454,6 +454,8 @@ def normalize_reply_for_action(reply, action):
         for position in positions[:-1]:
             chars[position] = "."
         cleaned = "".join(chars)
+    if action == "answer_information":
+        cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
     if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"}:
         cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
     cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
@@ -464,6 +466,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
     low = reply.lower()
     action = payload["action"]
     issues = []
+    if not reply.strip():
+        issues.append("пустой ответ после нормализации")
     if action != expected_action:
         issues.append("назначено неверное действие")
     if len(re.findall(r"\S+", reply)) > 45:
