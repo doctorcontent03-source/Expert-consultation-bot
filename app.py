@@ -548,7 +548,7 @@ def semantic_information_request_count(reply):
     ]
     return sum(is_information_request_sentence(sentence) for sentence in sentences)
 
-def keep_last_information_request(reply):
+def keep_first_information_request(reply):
     sentences = [
         sentence.strip()
         for sentence in re.split(r"(?<=[.!?])\s+", str(reply or ""))
@@ -560,16 +560,20 @@ def keep_last_information_request(reply):
     ]
     if len(request_indexes) <= 1:
         return str(reply or "").strip()
-    keep = request_indexes[-1]
-    return " ".join(
-        sentence for index, sentence in enumerate(sentences)
-        if index == keep or index not in request_indexes
-    ).strip()
+    keep = request_indexes[0]
+    kept = []
+    for index, sentence in enumerate(sentences):
+        if index in request_indexes and index != keep:
+            continue
+        if index == keep and "?" not in sentence:
+            sentence = sentence.rstrip(".!") + "?"
+        kept.append(sentence)
+    return " ".join(kept).strip()
 
 def normalize_reply_for_action(reply, action):
     cleaned = str(reply or "").strip()
     if action == "explore":
-        cleaned = keep_last_information_request(cleaned)
+        cleaned = keep_first_information_request(cleaned)
     if action == "explore" and cleaned.count("?") > 1:
         positions = [match.start() for match in re.finditer(r"\?", cleaned)]
         chars = list(cleaned)
