@@ -398,6 +398,30 @@ class TestBot(unittest.TestCase):
         self.assertTrue(state["previous_experience"])
         self.assertIn('"previous_experience": true', scripted.prompts[1])
 
+    def test_empty_assistant_history_ignores_stale_session_state(self):
+        scripted = ScriptedGigaChat([
+            payload("Давно у вас такое состояние?"),
+        ])
+        target.gigachat = scripted
+        with target.app.test_request_context("/"):
+            target.session["dialog_controller_state"] = self.state(
+                need=True,
+                previous_experience=True,
+                desired_result=True,
+                diagnostic_questions=3,
+                asked_questions=["Давно у вас такое состояние?"],
+                consultation_offered=True,
+            )
+            answer, action, state = target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, ничего не хочу.",
+                "База",
+            )
+        self.assertEqual(answer, "Давно у вас такое состояние?")
+        self.assertEqual(action, "explore")
+        self.assertEqual(state["diagnostic_questions"], 1)
+        self.assertFalse(state["consultation_offered"])
+
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
             "invalid json",
@@ -507,8 +531,15 @@ class TestBot(unittest.TestCase):
             ),
         ])
         with self.client.session_transaction() as session:
+            session["sid"] = "booking-dialog"
             session["dialog_controller_state"] = self.state(consultation_offered=True)
             session["consultation_offered"] = True
+        con = target.db()
+        con.execute(
+            "insert into messages values(?,?,?,?)",
+            ("booking-dialog", "assistant", "Предлагаю первую консультацию.", 1),
+        )
+        con.commit()
         response = self.client.post("/api/chat", json={"message": text})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
