@@ -343,7 +343,12 @@ def completed_dialog_answer(text):
     asks_new_booking = bool(re.search(r"(перенес|отмен|измен|друг(ая|ое|ую).{0,15}(дат|врем)|ещ[её].{0,20}(запис|встреч)|повторн.{0,15}(запис|встреч))", low))
     if asks_new_booking:
         return None
-    closing = bool(re.search(r"(^|\s)(до встречи|до завтра|спасибо|благодарю|хорошо|понятно|ладно|записал(ась|ся))([.!\s]|$)", low))
+    words = normalized_words(low)
+    closing_words = {
+        "до", "встречи", "завтра", "спасибо", "благодарю",
+        "хорошо", "понятно", "ладно", "записалась", "записался",
+    }
+    closing = bool(words) and all(word in closing_words for word in words)
     if closing:
         session["dialog_closed"] = True
         return "До встречи! Хорошего дня."
