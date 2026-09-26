@@ -950,6 +950,9 @@ def chat_history():
         "select role,content from messages where session_id=? order by created_at",
         (sid,)
     ).fetchall()
+    if not rows:
+        session.clear()
+        return jsonify(messages=[], closed=False)
     return jsonify(messages=[{"role":x["role"], "content":x["content"]} for x in rows], closed=bool(session.get("dialog_closed")))
 
 @app.post("/api/booking")
@@ -1010,6 +1013,9 @@ def chat():
     docs=con.execute("select name,text from documents where expert_slug='psychologist'").fetchall()
     if not docs: return jsonify(error="Сначала загрузите базу знаний в разделе «Настройки»"),409
     history=con.execute("select role,content from messages where session_id=? order by created_at desc limit 12",(sid,)).fetchall()[::-1]
+    if not history:
+        session.clear()
+        sid=str(uuid.uuid4()); session["sid"]=sid
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
     if session.get("dialog_closed"):
         return jsonify(answer="", closed=True)
