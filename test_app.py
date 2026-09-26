@@ -355,6 +355,21 @@ class TestBot(unittest.TestCase):
         self.assertIn("attempts=1", joined)
         self.assertIn("prompt_chars=", joined)
 
+    def test_rejected_dialog_log_contains_validation_reason(self):
+        target.gigachat = ScriptedGigaChat([
+            payload("Давайте запишемся на консультацию?"),
+            payload("Давно у вас такое состояние?"),
+        ])
+        with target.app.test_request_context("/"), self.assertLogs(target.app.logger, level="WARNING") as captured:
+            target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, ничего не хочу.",
+                "База",
+            )
+        joined = "\n".join(captured.output)
+        self.assertIn("reason=validation", joined)
+        self.assertIn("преждевременно предложена встреча", joined)
+
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
             "invalid json",
