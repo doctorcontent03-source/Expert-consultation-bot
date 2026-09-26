@@ -422,6 +422,29 @@ class TestBot(unittest.TestCase):
         self.assertEqual(state["diagnostic_questions"], 1)
         self.assertFalse(state["consultation_offered"])
 
+    def test_retry_prompt_keeps_controller_action_and_missing_state(self):
+        client_text = "Никаких мыслей о будущем. Нет надежды."
+        scripted = ScriptedGigaChat([
+            payload("Предлагаю встретиться на консультации.", action="offer_consultation"),
+            payload("Что хотелось бы изменить?"),
+        ])
+        target.gigachat = scripted
+        with target.app.test_request_context("/"):
+            target.session["dialog_controller_state"] = self.state(
+                need=True,
+                previous_experience=True,
+                diagnostic_questions=2,
+            )
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [{"role": "assistant", "content": "Какие мысли возникают о будущем?"}],
+                client_text,
+                "База",
+            )
+        self.assertEqual(answer, "Что хотелось бы изменить?")
+        self.assertEqual(action, "explore")
+        self.assertIn("обязательное следующее действие: explore", scripted.prompts[1])
+        self.assertIn("Недостающие элементы состояния: desired_result", scripted.prompts[1])
+
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
             "invalid json",

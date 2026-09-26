@@ -587,11 +587,23 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("неподтверждённое обещание")
     return issues
 
-def controller_prompt(state, context, history, text, retry_issues=None, first_client_turn=False):
+def controller_prompt(state, context, history, text, retry_issues=None, first_client_turn=False, required_action=None):
     transcript = "\n".join(("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"] for row in history[-10:])
     correction = ""
     if retry_issues:
         correction = "\nПредыдущий вариант отклонён по причинам: " + "; ".join(retry_issues) + ". Исправьте механизм перехода и создайте другой ответ."
+    if required_action:
+        missing = [
+            field for field in ("need", "previous_experience", "desired_result")
+            if not state.get(field)
+        ]
+        correction += (
+            "\nКонтроллер уже определил обязательное следующее действие: "
+            + required_action
+            + ". Не выбирайте другое действие."
+        )
+        if required_action == "explore":
+            correction += " Недостающие элементы состояния: " + ", ".join(missing) + ". Получите только один недостающий элемент."
     first_turn_rule = ""
     if first_client_turn:
         first_turn_rule = """
@@ -705,6 +717,7 @@ def generate_stateful_dialog_reply(history, text, context):
     backup_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     issues = []
     last_error = None
+    required_action = None
     attempts = 0
     for model in (preferred_model, backup_model, preferred_model, backup_model):
         attempts += 1
@@ -715,6 +728,7 @@ def generate_stateful_dialog_reply(history, text, context):
             text,
             retry_issues=issues or None,
             first_client_turn=first_client_turn,
+            required_action=required_action,
         )
         attempt_started = time.perf_counter()
         try:
@@ -750,6 +764,7 @@ def generate_stateful_dialog_reply(history, text, context):
             text,
             first_client_turn,
         )
+        required_action = expected
         payload["action"] = expected
         if expected == "start_booking":
             payload["reply"] = "Назовите удобные дату и время — я проверю их в календаре."
