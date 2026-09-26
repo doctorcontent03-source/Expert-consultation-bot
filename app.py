@@ -775,9 +775,9 @@ def generate_stateful_dialog_reply(history, text, context):
                 payload["reply"],
             )
         app.logger.warning(
-            "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=validation issue_count=%s",
+            "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=validation issues=%s",
             model, attempts, round((time.perf_counter() - attempt_started) * 1000),
-            len(prompt), len(issues),
+            len(prompt), " | ".join(issues),
         )
     app.logger.error(
         "Dialog generation exhausted attempts=%s total_ms=%s context_chars=%s history_chars=%s",
