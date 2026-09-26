@@ -643,6 +643,29 @@ class TestBot(unittest.TestCase):
         page = self.client.get("/").get_data(as_text=True)
         self.assertIn("fetch('/api/history')", page)
 
+    def test_post_booking_question_uses_simple_text_reply_without_controller_schema(self):
+        target.gigachat = ScriptedGigaChat([
+            "Один регулярный сеанс стоит 3500 рублей.",
+        ])
+        with self.client.session_transaction() as session:
+            session["sid"] = "booked-dialog"
+            session["last_booking"] = "Бесплатная консультация, 28.09.2026 в 15:00, 20 минут"
+            session["consultation_offered"] = True
+        con = target.db()
+        con.execute(
+            "insert into messages values(?,?,?,?)",
+            ("booked-dialog", "assistant", "Запись подтверждена.", 1),
+        )
+        con.commit()
+        response = self.client.post(
+            "/api/chat",
+            json={"message": "Хорошо, спасибо. А сколько стоят сеансы?"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["answer"], "Один регулярный сеанс стоит 3500 рублей.")
+        self.assertEqual(target.gigachat.response_formats, [None])
+        self.assertIn("Запись клиента уже подтверждена", target.gigachat.prompts[0])
+
     def test_empty_server_history_clears_stale_closed_session(self):
         with self.client.session_transaction() as session:
             session["sid"] = "missing-history"

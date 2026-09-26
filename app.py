@@ -680,6 +680,54 @@ def plain_reply_from_model(raw):
         return ""
     return cleaned
 
+def generate_post_booking_reply(history, text, context):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-4:]
+    )
+    prompt = SYSTEM_RULES + f"""
+
+Запись клиента уже подтверждена. Ответьте от имени эксперта только на последнее сообщение клиента.
+Если клиент задаёт организационный или информационный вопрос, дайте прямой краткий ответ по базе знаний.
+Не предлагайте запись повторно, не просите выбрать время и не задавайте встречный вопрос.
+Верните только текст реплики без JSON, служебных полей и комментариев.
+
+БАЗА ЗНАНИЙ:
+{context[-6000:]}
+
+ПОСЛЕДНИЕ РЕПЛИКИ:
+{transcript[-2500:]}
+Клиент: {text}
+"""
+    preferred_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
+    backup_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
+    last_error = None
+    for model in (preferred_model, backup_model):
+        started = time.perf_counter()
+        try:
+            raw = gigachat.reply(
+                [{"role": "system", "content": prompt}],
+                model=model,
+            )
+        except Exception as exc:
+            last_error = exc
+            app.logger.exception("Post-booking reply failed model=%s", model)
+            continue
+        reply = normalize_reply_for_action(plain_reply_from_model(raw), "answer_information")
+        if reply and len(re.findall(r"\S+", reply)) <= 55:
+            app.logger.warning(
+                "Post-booking reply completed model=%s elapsed_ms=%s prompt_chars=%s",
+                model, round((time.perf_counter() - started) * 1000), len(prompt),
+            )
+            return reply
+        app.logger.warning(
+            "Post-booking reply rejected model=%s elapsed_ms=%s reason=empty_or_too_long",
+            model, round((time.perf_counter() - started) * 1000),
+        )
+    if last_error:
+        raise last_error
+    raise RuntimeError("Models did not return a usable post-booking reply")
+
 def fallback_action_instruction(action):
     return {
         "explore": "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации. Не завершайте разговор и не предлагайте встречу.",
@@ -1032,6 +1080,14 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
+    if session.get("last_booking"):
+        try:
+            answer = generate_post_booking_reply(history, text, context)
+        except Exception:
+            app.logger.exception("Post-booking answer generation failed")
+            return jsonify(error="Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."), 502
+        con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
+        return jsonify(answer=answer, closed=False)
     try:
         answer, action, dialog_state = generate_stateful_dialog_reply(history, text, context)
     except Exception as exc:
