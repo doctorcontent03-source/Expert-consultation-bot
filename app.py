@@ -537,7 +537,7 @@ def uses_informal_address(reply):
 def semantic_information_request_count(reply):
     sentences = [
         sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\\s+", str(reply or ""))
+        for sentence in re.split(r"(?<=[.!?])\s+", str(reply or ""))
         if sentence.strip()
     ]
     explicit_questions = str(reply or "").count("?")
@@ -545,7 +545,7 @@ def semantic_information_request_count(reply):
         1
         for sentence in sentences
         if "?" not in sentence and re.match(
-            r"^(?:пожалуйста[, ]+)?(?:расскажите|уточните|опишите|объясните|поделитесь|скажите)\\b",
+            r"^(?:пожалуйста[, ]+)?(?:расскажите|уточните|опишите|объясните|поделитесь|скажите)\b",
             sentence.lower(),
         )
     )
