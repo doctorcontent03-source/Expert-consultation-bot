@@ -270,17 +270,19 @@ class TestBot(unittest.TestCase):
         issues = target.controller_reply_issues(data, "explore", state, [])
         self.assertIn("повторён уже заданный вопрос", issues)
 
-    def test_directive_and_question_count_as_two_semantic_requests(self):
+    def test_directive_and_question_are_normalized_to_one_request(self):
         reply = (
             "Расскажите подробнее, давно это ощущение появилось. "
             "Оно мешает повседневной жизни?"
         )
         self.assertEqual(target.semantic_information_request_count(reply), 2)
-        data = target.parse_controller_payload(payload(reply))
+        normalized = target.normalize_reply_for_action(reply, "explore")
+        self.assertEqual(normalized, "Оно мешает повседневной жизни?")
+        data = target.parse_controller_payload(payload(normalized))
         issues = target.controller_reply_issues(
             data, "explore", self.state(), []
         )
-        self.assertIn("задано больше одного смыслового вопроса", issues)
+        self.assertNotIn("задано больше одного смыслового вопроса", issues)
 
     def test_no_early_consultation_offer(self):
         data = target.parse_controller_payload(payload("Давайте запишемся на консультацию?"))
