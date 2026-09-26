@@ -38,7 +38,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "repair_interpretation", "repair_contact", "end_dialog",
             ]},
             "intent": {"type": "string", "enum": [
-                "continue", "interest", "booking", "decline", "question",
+                "continue", "interest", "booking", "decline", "question", "concern",
                 "boundary", "end", "correction", "rupture",
             ]},
             "intent_evidence": {"type": "string"},
@@ -417,7 +417,7 @@ def parse_controller_payload(raw):
         return None
     if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "start_booking", "answer_information", "respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog"}:
         return None
-    if intent not in {"continue", "interest", "booking", "decline", "question", "boundary", "end", "correction", "rupture"}:
+    if intent not in {"continue", "interest", "booking", "decline", "question", "concern", "boundary", "end", "correction", "rupture"}:
         return None
     if not isinstance(observations, dict):
         return None
@@ -457,7 +457,7 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "end_dialog"
     if intent == "boundary" and grounded_intent:
         return "respect_boundary"
-    if intent == "question" and grounded_intent:
+    if intent in {"question", "concern"} and grounded_intent:
         return "answer_information"
     if state["consultation_offered"] and intent == "booking" and grounded_intent:
         return "start_booking"
@@ -534,8 +534,46 @@ def uses_informal_address(reply):
         low,
     ))
 
+def is_information_request_sentence(sentence):
+    return "?" in sentence or bool(re.match(
+        r"^(?:пожалуйста[, ]+)?(?:расскажите|уточните|опишите|объясните|поделитесь|скажите)\b",
+        sentence.lower().strip(),
+    ))
+
+def semantic_information_request_count(reply):
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", str(reply or ""))
+        if sentence.strip()
+    ]
+    return sum(is_information_request_sentence(sentence) for sentence in sentences)
+
+def keep_first_information_request(reply):
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", str(reply or ""))
+        if sentence.strip()
+    ]
+    request_indexes = [
+        index for index, sentence in enumerate(sentences)
+        if is_information_request_sentence(sentence)
+    ]
+    if len(request_indexes) <= 1:
+        return str(reply or "").strip()
+    keep = request_indexes[0]
+    kept = []
+    for index, sentence in enumerate(sentences):
+        if index in request_indexes and index != keep:
+            continue
+        if index == keep and "?" not in sentence:
+            sentence = sentence.rstrip(".!") + "?"
+        kept.append(sentence)
+    return " ".join(kept).strip()
+
 def normalize_reply_for_action(reply, action):
     cleaned = str(reply or "").strip()
+    if action == "explore":
+        cleaned = keep_first_information_request(cleaned)
     if action == "explore" and cleaned.count("?") > 1:
         positions = [match.start() for match in re.finditer(r"\?", cleaned)]
         chars = list(cleaned)
@@ -560,8 +598,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("назначено неверное действие")
     if len(re.findall(r"\S+", reply)) > 45:
         issues.append("ответ длиннее 45 слов")
-    if reply.count("?") > 1:
-        issues.append("задано больше одного вопроса")
+    if semantic_information_request_count(reply) > 1:
+        issues.append("задано больше одного смыслового вопроса")
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):
         issues.append("служебный комментарий")
     if repeats_recent_reply(reply, history):
@@ -646,7 +684,9 @@ repair_interpretation — признать неверное понимание �
 repair_contact — признать, что предыдущий ход разговора был неуместным, остановить диагностику и не оправдываться;
 end_dialog — попрощаться только при явном завершении разговора.
 
-Не считайте описание состояния отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не выдвигайте неподтверждённых гипотез, не повторяйте уже полученную информацию и заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один смысловой вопрос.
+Высказывание опасения, ожидания, предположения или сомнения об условиях, сроках, цене, формате или последствиях работы продолжает информационный цикл, даже если сформулировано без вопросительного знака. Для него используйте concern и ответьте по существу. Не завершайте разговор и не считайте такую реплику отказом. end означает только явно выраженное намерение клиента прекратить текущий разговор, а не паузу, сомнение или отсутствие вопросительного знака.
+
+Не считайте описание состояния отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не выдвигайте неподтверждённых гипотез, не повторяйте уже полученную информацию и заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один смысловой запрос информации. Просьба рассказать, уточнить, описать, объяснить или поделиться считается вопросом даже без вопросительного знака.
 
 Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
 contact — понятен контекст жизни или ситуации клиента;
@@ -654,12 +694,13 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
+concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
 booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Простого интереса к консультации недостаточно. Если консультация ещё не предложена, не используйте booking.
 decline означает, что клиент отклоняет последнее предложение или приглашение, но не обязательно завершает весь разговор.
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|decline|question|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -747,7 +788,7 @@ def fallback_action_instruction(action):
     }[action]
 
 def fallback_reply_is_usable(reply, action, state, history, first_client_turn=False):
-    if not reply or len(re.findall(r"\S+", reply)) > 55 or reply.count("?") > 1:
+    if not reply or len(re.findall(r"\S+", reply)) > 55 or semantic_information_request_count(reply) > 1:
         return False
     low = reply.lower()
     if any(x in low for x in ("похоже, клиент", "клиент испытывает", "следует уточнить", "не удалось сформировать", "попробуйте отправить сообщение")):

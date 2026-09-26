@@ -181,6 +181,24 @@ class TestBot(unittest.TestCase):
         text = "На этом закончим"
         self.assertEqual(target.expected_dialog_action(self.state(), "end", text, text), "end_dialog")
 
+    def test_concern_about_conditions_stays_in_information_cycle(self):
+        text = "Надеюсь, это не растянется на годы."
+        state = self.state(consultation_offered=True)
+        self.assertEqual(
+            target.expected_dialog_action(state, "concern", text, text),
+            "answer_information",
+        )
+
+    def test_controller_prompt_distinguishes_concern_from_end(self):
+        prompt = target.controller_prompt(
+            self.state(consultation_offered=True),
+            "База",
+            [],
+            "Надеюсь, это не растянется на годы.",
+        )
+        self.assertIn("продолжает информационный цикл", prompt)
+        self.assertIn("end означает только явно выраженное намерение", prompt)
+
     def test_semantic_rupture_repairs_contact_independent_of_wording(self):
         for text in ("Этот вопрос здесь неуместен", "Вы вообще меня слышите?", "Так беседовать невозможно"):
             self.assertEqual(target.expected_dialog_action(self.state(), "rupture", text, text), "repair_contact")
@@ -251,6 +269,23 @@ class TestBot(unittest.TestCase):
         data = target.parse_controller_payload(payload("Давно у вас такое состояние?"))
         issues = target.controller_reply_issues(data, "explore", state, [])
         self.assertIn("повторён уже заданный вопрос", issues)
+
+    def test_directive_and_question_are_normalized_to_one_request(self):
+        reply = (
+            "Расскажите подробнее, давно это ощущение появилось. "
+            "Оно мешает повседневной жизни?"
+        )
+        self.assertEqual(target.semantic_information_request_count(reply), 2)
+        normalized = target.normalize_reply_for_action(reply, "explore")
+        self.assertEqual(
+            normalized,
+            "Расскажите подробнее, давно это ощущение появилось?",
+        )
+        data = target.parse_controller_payload(payload(normalized))
+        issues = target.controller_reply_issues(
+            data, "explore", self.state(), []
+        )
+        self.assertNotIn("задано больше одного смыслового вопроса", issues)
 
     def test_no_early_consultation_offer(self):
         data = target.parse_controller_payload(payload("Давайте запишемся на консультацию?"))
