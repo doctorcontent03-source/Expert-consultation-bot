@@ -666,6 +666,30 @@ class TestBot(unittest.TestCase):
         self.assertEqual(target.gigachat.response_formats, [None])
         self.assertIn("Запись клиента уже подтверждена", target.gigachat.prompts[0])
 
+    def test_post_booking_retrieval_uses_full_knowledge_base_for_unresolved_question(self):
+        target.gigachat = ScriptedGigaChat([
+            "Один регулярный сеанс стоит 3500 рублей.",
+        ])
+        documents = [{
+            "name": "FAQ.txt",
+            "text": (
+                "Сколько стоят регулярные сеансы? Один сеанс стоит 3500 рублей.\n\n"
+                + "\n\n".join("Другой раздел базы знаний без сведений о цене." for _ in range(250))
+            ),
+        }]
+        history = [
+            {"role": "user", "content": "Сколько стоят регулярные сеансы?"},
+            {"role": "assistant", "content": "Стоимость можно уточнить позднее."},
+        ]
+        with target.app.test_request_context("/"):
+            answer = target.generate_post_booking_reply(
+                history,
+                "Я у вас и спрашиваю. Сколько стоят сеансы?",
+                documents,
+            )
+        self.assertEqual(answer, "Один регулярный сеанс стоит 3500 рублей.")
+        self.assertIn("Один сеанс стоит 3500 рублей", target.gigachat.prompts[0])
+
     def test_empty_server_history_clears_stale_closed_session(self):
         with self.client.session_transaction() as session:
             session["sid"] = "missing-history"
