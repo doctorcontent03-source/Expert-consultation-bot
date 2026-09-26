@@ -376,8 +376,9 @@ def grounded_in_current_message(evidence, text):
     source = " ".join(normalized_words(text))
     return bool(evidence) and evidence in source
 
-def controller_state():
-    saved = session.get("dialog_controller_state")
+def controller_state(saved=None):
+    if saved is None:
+        saved = session.get("dialog_controller_state")
     if not isinstance(saved, dict):
         saved = {}
     return {
@@ -697,9 +698,9 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
 
 def generate_stateful_dialog_reply(history, text, context):
     generation_started = time.perf_counter()
-    original_state = controller_state()
-    working_state = dict(original_state)
     first_client_turn = not any(row["role"] == "assistant" for row in history)
+    original_state = controller_state({}) if first_client_turn else controller_state()
+    working_state = dict(original_state)
     preferred_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
     backup_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
     issues = []
@@ -729,7 +730,7 @@ def generate_stateful_dialog_reply(history, text, context):
             app.logger.exception(
                 "Dialog model attempt failed model=%s attempt=%s elapsed_ms=%s prompt_chars=%s context_chars=%s history_chars=%s",
                 model, attempts, attempt_ms, len(prompt), len(context),
-                sum(len(str(row.get("content", ""))) for row in history),
+                sum(len(str(row["content"])) for row in history),
             )
             continue
         payload = parse_controller_payload(raw)
@@ -768,7 +769,7 @@ def generate_stateful_dialog_reply(history, text, context):
                 round((time.perf_counter() - attempt_started) * 1000),
                 round((time.perf_counter() - generation_started) * 1000),
                 len(prompt), len(context),
-                sum(len(str(row.get("content", ""))) for row in history),
+                sum(len(str(row["content"])) for row in history),
                 expected,
             )
             return payload["reply"], expected, advance_dialog_state(
@@ -784,7 +785,7 @@ def generate_stateful_dialog_reply(history, text, context):
     app.logger.error(
         "Dialog generation exhausted attempts=%s total_ms=%s context_chars=%s history_chars=%s",
         attempts, round((time.perf_counter() - generation_started) * 1000), len(context),
-        sum(len(str(row.get("content", ""))) for row in history),
+        sum(len(str(row["content"])) for row in history),
     )
     if last_error:
         raise last_error
