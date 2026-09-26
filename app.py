@@ -680,20 +680,23 @@ def plain_reply_from_model(raw):
         return ""
     return cleaned
 
-def generate_post_booking_reply(history, text, context):
+def generate_post_booking_reply(history, text, documents):
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history[-4:]
     )
+    retrieval_query = "\n".join([row["content"] for row in history[-4:]] + [text])
+    context = relevant(retrieval_query, documents, limit=7000)
     prompt = SYSTEM_RULES + f"""
 
 Запись клиента уже подтверждена. Ответьте от имени эксперта только на последнее сообщение клиента.
 Если клиент задаёт организационный или информационный вопрос, дайте прямой краткий ответ по базе знаний.
+Если последнее сообщение вызвано предыдущим неполным ответом, ответьте на незакрытый вопрос из недавнего диалога.
 Не предлагайте запись повторно, не просите выбрать время и не задавайте встречный вопрос.
 Верните только текст реплики без JSON, служебных полей и комментариев.
 
 БАЗА ЗНАНИЙ:
-{context[-6000:]}
+{context}
 
 ПОСЛЕДНИЕ РЕПЛИКИ:
 {transcript[-2500:]}
@@ -1082,7 +1085,7 @@ def chat():
         return jsonify(answer=direct_answer)
     if session.get("last_booking"):
         try:
-            answer = generate_post_booking_reply(history, text, context)
+            answer = generate_post_booking_reply(history, text, docs)
         except Exception:
             app.logger.exception("Post-booking answer generation failed")
             return jsonify(error="Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."), 502
