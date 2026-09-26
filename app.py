@@ -698,6 +698,7 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
 def generate_stateful_dialog_reply(history, text, context):
     generation_started = time.perf_counter()
     original_state = controller_state()
+    working_state = dict(original_state)
     first_client_turn = not any(row["role"] == "assistant" for row in history)
     preferred_model = os.getenv("GIGACHAT_MODEL", "GigaChat").strip() or "GigaChat"
     backup_model = os.getenv("GIGACHAT_FALLBACK_MODEL", "GigaChat-2-Max").strip() or "GigaChat-2-Max"
@@ -707,7 +708,7 @@ def generate_stateful_dialog_reply(history, text, context):
     for model in (preferred_model, backup_model, preferred_model, backup_model):
         attempts += 1
         prompt = controller_prompt(
-            original_state,
+            working_state,
             context,
             history,
             text,
@@ -739,7 +740,8 @@ def generate_stateful_dialog_reply(history, text, context):
                 model, attempts, round((time.perf_counter() - attempt_started) * 1000), len(prompt),
             )
             continue
-        state = apply_grounded_observations(original_state, payload["observations"], text)
+        state = apply_grounded_observations(working_state, payload["observations"], text)
+        working_state = state
         expected = expected_dialog_action(
             state,
             payload["intent"],
@@ -754,7 +756,7 @@ def generate_stateful_dialog_reply(history, text, context):
         issues = controller_reply_issues(
             payload,
             expected,
-            original_state,
+            working_state,
             history,
             first_client_turn,
             text,

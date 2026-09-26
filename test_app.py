@@ -370,6 +370,34 @@ class TestBot(unittest.TestCase):
         self.assertIn("reason=validation", joined)
         self.assertIn("преждевременно предложена встреча", joined)
 
+    def test_grounded_observations_survive_a_rejected_attempt(self):
+        client_text = "Года два, но бывает то лучше, то хуже."
+        scripted = ScriptedGigaChat([
+            payload(
+                "Давно у вас такое состояние?",
+                observations={
+                    "previous_experience": {"present": True, "evidence": "Года два"},
+                },
+            ),
+            payload("Что хотелось бы изменить?"),
+        ])
+        target.gigachat = scripted
+        with target.app.test_request_context("/"):
+            target.session["dialog_controller_state"] = self.state(
+                need=True,
+                diagnostic_questions=1,
+                asked_questions=["Давно у вас такое состояние?"],
+            )
+            answer, action, state = target.generate_stateful_dialog_reply(
+                [{"role": "assistant", "content": "Давно у вас такое состояние?"}],
+                client_text,
+                "База",
+            )
+        self.assertEqual(answer, "Что хотелось бы изменить?")
+        self.assertEqual(action, "explore")
+        self.assertTrue(state["previous_experience"])
+        self.assertIn('"previous_experience": true', scripted.prompts[1])
+
     def test_two_question_marks_are_normalized_in_main_pipeline(self):
         target.gigachat = ScriptedGigaChat([
             "invalid json",
