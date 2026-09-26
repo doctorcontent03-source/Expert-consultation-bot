@@ -626,6 +626,13 @@ class TestBot(unittest.TestCase):
             self.assertEqual(final, "До встречи! Хорошего дня.")
             self.assertTrue(target.session["dialog_closed"])
 
+    def test_post_booking_question_is_not_mistaken_for_farewell(self):
+        with target.app.test_request_context("/"):
+            target.session["last_booking"] = "Бесплатная консультация, 28.09.2026 в 14:00, 20 минут"
+            answer = target.completed_dialog_answer("Хорошо, спасибо. А сколько стоят сеансы?")
+            self.assertIsNone(answer)
+            self.assertFalse(target.session.get("dialog_closed"))
+
     # UI, persistence and admin
     def test_input_is_not_disabled_while_reply_pending(self):
         page = self.client.get("/").get_data(as_text=True)
