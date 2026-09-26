@@ -277,7 +277,10 @@ class TestBot(unittest.TestCase):
         )
         self.assertEqual(target.semantic_information_request_count(reply), 2)
         normalized = target.normalize_reply_for_action(reply, "explore")
-        self.assertEqual(normalized, "Оно мешает повседневной жизни?")
+        self.assertEqual(
+            normalized,
+            "Расскажите подробнее, давно это ощущение появилось?",
+        )
         data = target.parse_controller_payload(payload(normalized))
         issues = target.controller_reply_issues(
             data, "explore", self.state(), []
