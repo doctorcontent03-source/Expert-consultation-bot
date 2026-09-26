@@ -643,6 +643,34 @@ class TestBot(unittest.TestCase):
         page = self.client.get("/").get_data(as_text=True)
         self.assertIn("fetch('/api/history')", page)
 
+    def test_empty_server_history_clears_stale_closed_session(self):
+        with self.client.session_transaction() as session:
+            session["sid"] = "missing-history"
+            session["dialog_closed"] = True
+            session["last_booking"] = "Старая запись"
+        response = self.client.get("/api/history")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"messages": [], "closed": False})
+        with self.client.session_transaction() as session:
+            self.assertNotIn("dialog_closed", session)
+            self.assertNotIn("last_booking", session)
+
+    def test_first_message_is_not_blocked_by_stale_closed_session(self):
+        target.gigachat = ScriptedGigaChat([
+            payload("Давно у вас такое состояние?"),
+        ])
+        with self.client.session_transaction() as session:
+            session["sid"] = "missing-history"
+            session["dialog_closed"] = True
+            session["last_booking"] = "Старая запись"
+        response = self.client.post(
+            "/api/chat",
+            json={"message": "Да ерунда какая-то, пустота, ничего не хочу."},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["answer"], "Давно у вас такое состояние?")
+        self.assertFalse(response.get_json()["closed"])
+
     def test_reset_clears_dialog_and_controller_state(self):
         with self.client.session_transaction() as session:
             session["sid"] = "old"
