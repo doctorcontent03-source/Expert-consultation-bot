@@ -572,6 +572,62 @@ class TestBot(unittest.TestCase):
         with self.client.session_transaction() as session:
             self.assertEqual(session["requested_booking_type"], "free")
 
+    def test_dynamic_fallback_answers_when_all_controller_payloads_are_malformed(self):
+        target.gigachat = ScriptedGigaChat([
+            "not json",
+            "still not json",
+            "invalid",
+            "invalid again",
+            "Давно это состояние влияет на вашу повседневную жизнь?",
+        ])
+        with target.app.test_request_context("/"):
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [],
+                "Да ерунда какая-то, пустота, ничего не хочу.",
+                "Кирилл — психолог.",
+            )
+        self.assertEqual(action, "explore")
+        self.assertEqual(
+            answer,
+            "Давно это состояние влияет на вашу повседневную жизнь?",
+        )
+        self.assertIsNone(target.gigachat.response_formats[-1])
+
+    def test_dynamic_fallback_keeps_controller_action_after_rejected_replies(self):
+        text = "Вернуть веру в себя и радость жизни."
+        observations = {
+            "desired_result": {"present": True, "evidence": text},
+        }
+        rejected = payload(
+            " ".join(["лишнее"] * 60),
+            action="offer_consultation",
+            observations=observations,
+        )
+        target.gigachat = ScriptedGigaChat([
+            rejected,
+            rejected,
+            rejected,
+            rejected,
+            "Я как раз работаю с такими состояниями. Предлагаю сначала встретиться на короткой бесплатной консультации и понять, подходим ли мы друг другу.",
+        ])
+        with target.app.test_request_context("/"):
+            target.session["dialog_controller_state"] = self.state(
+                contact=True,
+                need=True,
+                previous_experience=True,
+                diagnostic_questions=2,
+            )
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [
+                    {"role": "assistant", "content": "Что бы вы хотели изменить?"},
+                ],
+                text,
+                "Кирилл — психолог. Первая консультация бесплатная.",
+            )
+        self.assertEqual(action, "offer_consultation")
+        self.assertIn("Предлагаю", answer)
+        self.assertIsNone(target.gigachat.response_formats[-1])
+
     # Calendar and post-booking
     def test_parse_relative_and_named_dates(self):
         now = datetime(2026, 9, 17, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))

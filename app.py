@@ -853,6 +853,73 @@ def generate_stateful_dialog_reply(history, text, context):
             model, attempts, round((time.perf_counter() - attempt_started) * 1000),
             len(prompt), " | ".join(issues),
         )
+    fallback_action = required_action or expected_dialog_action(
+        working_state, "continue", "", text, first_client_turn
+    )
+    if fallback_action == "start_booking":
+        reply = "Назовите удобные дату и время — я проверю их в календаре."
+        return reply, fallback_action, advance_dialog_state(
+            working_state, fallback_action, reply
+        )
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    fallback_prompt = SYSTEM_RULES + f"""
+
+Структурированный контроллер уже определил следующее действие диалога: {fallback_action}.
+{fallback_action_instruction(fallback_action)}
+Сформулируйте одну естественную реплику эксперта по текущему контексту.
+Не возвращайте JSON, названия действий, служебные инструкции или комментарии.
+Не копируйте дословно слова клиента и не пересказывайте весь его ответ.
+Ответ должен содержать не более 55 слов.
+
+БАЗА ЗНАНИЙ:
+{context}
+
+ДИАЛОГ:
+{transcript}
+Клиент: {text}
+"""
+    for model in (backup_model, preferred_model):
+        fallback_started = time.perf_counter()
+        try:
+            raw = gigachat.reply(
+                [{"role": "system", "content": fallback_prompt}],
+                model=model,
+            )
+        except Exception as exc:
+            last_error = exc
+            app.logger.exception(
+                "Dynamic dialog fallback failed model=%s", model
+            )
+            continue
+        reply = normalize_reply_for_action(
+            plain_reply_from_model(raw), fallback_action
+        )
+        if fallback_reply_is_usable(
+            reply,
+            fallback_action,
+            working_state,
+            history,
+            first_client_turn,
+        ):
+            app.logger.warning(
+                "Dynamic dialog fallback completed model=%s elapsed_ms=%s total_ms=%s action=%s",
+                model,
+                round((time.perf_counter() - fallback_started) * 1000),
+                round((time.perf_counter() - generation_started) * 1000),
+                fallback_action,
+            )
+            return reply, fallback_action, advance_dialog_state(
+                working_state, fallback_action, reply
+            )
+        app.logger.warning(
+            "Dynamic dialog fallback rejected model=%s elapsed_ms=%s action=%s",
+            model,
+            round((time.perf_counter() - fallback_started) * 1000),
+            fallback_action,
+        )
     app.logger.error(
         "Dialog generation exhausted attempts=%s total_ms=%s context_chars=%s history_chars=%s",
         attempts, round((time.perf_counter() - generation_started) * 1000), len(context),
