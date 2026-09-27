@@ -38,7 +38,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "repair_interpretation", "repair_contact", "end_dialog",
             ]},
             "intent": {"type": "string", "enum": [
-                "continue", "interest", "booking", "decline", "question", "concern",
+                "continue", "interest", "booking", "booking_question", "decline", "question", "concern",
                 "boundary", "end", "correction", "rupture",
             ]},
             "intent_evidence": {"type": "string"},
@@ -417,7 +417,7 @@ def parse_controller_payload(raw):
         return None
     if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "start_booking", "answer_information", "respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog"}:
         return None
-    if intent not in {"continue", "interest", "booking", "decline", "question", "concern", "boundary", "end", "correction", "rupture"}:
+    if intent not in {"continue", "interest", "booking", "booking_question", "decline", "question", "concern", "boundary", "end", "correction", "rupture"}:
         return None
     if not isinstance(observations, dict):
         return None
@@ -457,12 +457,12 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "end_dialog"
     if intent == "boundary" and grounded_intent:
         return "respect_boundary"
-    if intent in {"question", "concern"} and grounded_intent:
+    if intent in {"question", "concern", "booking_question"} and grounded_intent:
         return "answer_information"
     if (
         intent == "booking"
         and grounded_intent
-        and semantic_information_request_count(text) > 0
+        and semantic_information_request_count(text) > 1
     ):
         return "answer_information"
     if state["consultation_offered"] and intent == "booking" and grounded_intent:
@@ -701,12 +701,12 @@ previous_experience — понятны длительность, влияние 
 desired_result — понятно желаемое изменение.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
 concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
-booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Простого интереса к консультации недостаточно. Если вместе с согласием клиент задаёт информационный или организационный вопрос, intent может оставаться booking, но обязательное действие — answer_information; к записи можно перейти после следующей реплики клиента. Если консультация ещё не предложена, не используйте booking.
+booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Вопрос о выборе даты или времени является частью booking. Простого интереса к консультации недостаточно. booking_question означает, что клиент согласился записаться, но в той же реплике задал вопрос об условиях встречи — формате, платформе, продолжительности, стоимости, подготовке или дальнейшей работе. Для booking_question сначала ответьте на вопрос; к записи можно перейти после следующей реплики клиента. Если консультация ещё не предложена, не используйте booking или booking_question.
 decline означает, что клиент отклоняет последнее предложение или приглашение, но не обязательно завершает весь разговор.
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
