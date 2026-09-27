@@ -19,7 +19,7 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
 Цель: установить контакт, бережно выявить потребность, ответить на вопросы и только при уместности один раз предложить консультацию.
 Задавайте строго по одному вопросу за раз и не более трёх уточняющих вопросов за весь этап выявления потребности. Не предлагайте консультацию после первой общей реплики клиента. За 2–3 вопроса выясните суть ситуации, её длительность или влияние на жизнь и желаемое изменение. Как только запрос в целом понятен, прекратите расспросы: кратко отразите услышанное и предложите консультацию. После первого предложения не повторяйте его, пока клиент сам явно не согласится записаться. Если клиент просит не торопить его, хочет сначала получить информацию, сомневается или задаёт вопрос об условиях, отвечайте только на вопрос и не завершайте ответ новым предложением консультации.
-Используйте факты только из предоставленной базы знаний и фактов текущего разговора. Если сведений нет, прямо скажите, что не можете точно ответить, и не додумывайте.
+Используйте факты только из предоставленной базы знаний и фактов текущего разговора. Если сведений нет, прямо скажите, что не можете точно ответить, и не додумывайте. Если клиент называет конкретный сервис, платформу, формат или другой вариант, сохраняйте это название точно и не заменяйте его похожим названием. Если база не подтверждает названный вариант, повторите его точное название и честно скажите, что не можете подтвердить.
 Не придумывайте очный приём, города, адреса или платформы связи. Сведения о формате работы берите только из базы знаний. Точно сохраняйте расстановку акцентов: различайте основной формат и дополнительный вариант, доступный по договорённости. Не представляйте дополнительный вариант как равноправный или основной.
 Не ставьте диагнозов, не обещайте результат и не давите. При признаках непосредственной опасности задайте прямой вопрос о безопасности и посоветуйте срочно обратиться в местную экстренную службу или к близкому человеку.
 Не проводите консультацию внутри чата: не интерпретируйте причины состояния, не анализируйте личность и цели, не предлагайте упражнения, техники, способы лечения или последовательность изменений. Задача чата — понять общий запрос, дать информацию о работе эксперта и привести к записи. Содержательный разбор проводит живой эксперт на встрече.
@@ -533,6 +533,26 @@ def substantially_repeats_client_message(reply, text):
             return True
     return False
 
+def requested_named_option(text):
+    value = str(text or "").strip()
+    patterns = (
+        r"(?:^|[.!?,]\s*)(?:а\s+)?(?:через|в|на)\s+([a-zа-яё0-9][\w.-]*(?:\s+[a-zа-яё0-9][\w.-]*){0,1})\s+можно\b",
+        r"\bможно\s+(?:через|в|на)\s+([a-zа-яё0-9][\w.-]*(?:\s+[a-zа-яё0-9][\w.-]*){0,1})(?=[.!?,]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, re.I)
+        if match:
+            return match.group(1).strip()
+    return ""
+
+def named_option_is_preserved(client_text, reply):
+    option = requested_named_option(client_text)
+    if not option:
+        return True
+    option_words = set(comparison_words(option))
+    reply_words = set(comparison_words(reply))
+    return bool(option_words) and option_words.issubset(reply_words)
+
 def uses_informal_address(reply):
     low = str(reply or "").lower().replace("ё", "е")
     return bool(re.search(
@@ -651,6 +671,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("задан вопрос на этапе без вопросов")
     if action == "answer_information" and re.search(r"(хотите записаться|давайте запиш|когда вам удобно)", low):
         issues.append("ответ на вопрос заменён записью")
+    if action == "answer_information" and not named_option_is_preserved(client_text, reply):
+        issues.append("подменено название варианта из вопроса клиента")
     if action == "check_interest" and re.search(r"(запис|когда вам удобно|\[\[book_)", low):
         issues.append("интерес подменён записью")
     if action == "offer_consultation" and substantially_repeats_client_message(reply, client_text):
@@ -820,7 +842,7 @@ def fallback_action_instruction(action):
         "end_dialog": "Коротко и спокойно попрощайтесь без вопроса, анализа и предложения консультации.",
     }[action]
 
-def fallback_reply_is_usable(reply, action, state, history, first_client_turn=False):
+def fallback_reply_is_usable(reply, action, state, history, first_client_turn=False, client_text=""):
     if not reply or len(re.findall(r"\S+", reply)) > 55 or semantic_information_request_count(reply) > 1:
         return False
     low = reply.lower()
@@ -833,6 +855,8 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
             return False
     if action in {"respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and "?" in reply:
+        return False
+    if action == "answer_information" and not named_option_is_preserved(client_text, reply):
         return False
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         return False
@@ -977,6 +1001,7 @@ def generate_stateful_dialog_reply(history, text, context):
             working_state,
             history,
             first_client_turn,
+            text,
         ):
             app.logger.warning(
                 "Dynamic dialog fallback completed model=%s elapsed_ms=%s total_ms=%s action=%s",
