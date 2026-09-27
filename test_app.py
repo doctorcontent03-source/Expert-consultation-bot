@@ -175,7 +175,9 @@ class TestBot(unittest.TestCase):
         )
         target.gigachat = ScriptedGigaChat([
             payload(
-                "Встреча проходит онлайн и длится 15–20 минут.",
+                "Да, можно встретиться через Телемост. "
+                "Бесплатная консультация длится 15–20 минут. "
+                "Подходящее время выберите сами в календаре.",
                 action="start_booking",
                 intent="booking_question",
                 evidence=text,
@@ -193,8 +195,10 @@ class TestBot(unittest.TestCase):
         self.assertEqual(action, "answer_information")
         self.assertEqual(
             answer,
-            "Встреча проходит онлайн и длится 15–20 минут.",
+            "Да, можно встретиться через Телемост. "
+            "Бесплатная консультация длится 15–20 минут.",
         )
+        self.assertNotIn("календар", answer.lower())
         self.assertNotIn("дату и время", answer)
 
     def test_booking_intent_cannot_skip_consultation_offer(self):

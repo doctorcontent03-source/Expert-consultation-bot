@@ -576,6 +576,32 @@ def keep_first_information_request(reply):
         kept.append(sentence)
     return " ".join(kept).strip()
 
+def remove_booking_transition_sentences(reply):
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", str(reply or ""))
+        if sentence.strip()
+    ]
+    result = []
+    for sentence in sentences:
+        low = sentence.lower()
+        direct_booking = bool(re.search(
+            r"\b(?:записывайтесь|запишитесь|запишемся|запишу|записаться)\b",
+            low,
+        ))
+        transition_action = bool(re.search(
+            r"\b(?:выберите|назовите|укажите|перейдите|нажмите|пришлите)\b",
+            low,
+        ))
+        transition_object = bool(re.search(
+            r"\b(?:календар|дат|врем|кноп|ссыл|форм|имя|телефон|email|почт)",
+            low,
+        ))
+        if direct_booking or (transition_action and transition_object):
+            continue
+        result.append(sentence)
+    return " ".join(result).strip()
+
 def normalize_reply_for_action(reply, action):
     cleaned = str(reply or "").strip()
     if action == "explore":
@@ -587,6 +613,7 @@ def normalize_reply_for_action(reply, action):
             chars[position] = "."
         cleaned = "".join(chars)
     if action == "answer_information":
+        cleaned = remove_booking_transition_sentences(cleaned)
         cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
     if action in {"respect_boundary", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"}:
         cleaned = re.sub(r"[^.!?]*\?+", " ", cleaned)
@@ -674,7 +701,7 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 4. Если сведений достаточно, прекратить диагностику.
 5. Для психолога после достаточных 2–3 уточнений кратко связать запрос с работой на встрече и ненавязчиво предложить первичную консультацию. Не вставлять отдельную рекламную презентацию помощи.
 6. Если консультация уже была предложена, учитывать согласие, вопросы или отказ клиента без повторного предложения.
-7. Сначала отвечать на прямые вопросы и учитывать сомнения. Если в одной реплике клиент одновременно согласился записаться и задал информационный или организационный вопрос, сначала ответить на вопрос и не начинать запись в этой же реплике.
+7. Сначала отвечать на все прямые вопросы и учитывать явно указанное предпочтение клиента, используя только сведения базы знаний. Если в одной реплике клиент одновременно согласился записаться и задал информационный или организационный вопрос, ответить только на эти вопросы: не начинать запись, не предлагать выбрать время и не направлять к календарю, форме, кнопке или ссылке.
 8. Для экспертов, продающих отдельный продукт или решение, предлагать консультацию после объяснения решения и проявленного интереса. Для психолога консультация является самой услугой и предлагается сразу после завершённого выявления потребности.
 
 Выберите ровно одно действие:
