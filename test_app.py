@@ -157,6 +157,46 @@ class TestBot(unittest.TestCase):
                 "start_booking",
             )
 
+    def test_information_question_has_priority_over_booking_consent(self):
+        text = (
+            "Давайте. В зуме? Я предпочитаю Телемост. "
+            "Сколько длится такая встреча?"
+        )
+        state = self.state(consultation_offered=True)
+        self.assertEqual(
+            target.expected_dialog_action(state, "booking_question", text, text),
+            "answer_information",
+        )
+
+    def test_mixed_booking_reply_answers_questions_without_starting_calendar(self):
+        text = (
+            "Давайте. В зуме? Я предпочитаю Телемост. "
+            "Сколько длится такая встреча?"
+        )
+        target.gigachat = ScriptedGigaChat([
+            payload(
+                "Встреча проходит онлайн и длится 15–20 минут.",
+                action="start_booking",
+                intent="booking_question",
+                evidence=text,
+            ),
+        ])
+        with target.app.test_request_context("/"):
+            target.session["dialog_controller_state"] = self.state(
+                consultation_offered=True,
+            )
+            answer, action, _ = target.generate_stateful_dialog_reply(
+                [{"role": "assistant", "content": "Записаться можно?"}],
+                text,
+                "Встреча проходит онлайн и длится 15–20 минут.",
+            )
+        self.assertEqual(action, "answer_information")
+        self.assertEqual(
+            answer,
+            "Встреча проходит онлайн и длится 15–20 минут.",
+        )
+        self.assertNotIn("дату и время", answer)
+
     def test_booking_intent_cannot_skip_consultation_offer(self):
         text = "Я готова записаться"
         self.assertNotEqual(
