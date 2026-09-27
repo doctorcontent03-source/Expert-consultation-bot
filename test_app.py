@@ -39,7 +39,7 @@ class ScriptedGigaChat:
         return value
 
 
-def payload(reply, action="explore", intent="continue", evidence="", observations=None, question_target=None):
+def payload(reply, action="explore", intent="continue", evidence="", observations=None, question_target=None, conversation_effect="continue"):
     observations = observations or {}
     fields = {}
     for key in ("contact", "need", "previous_experience", "desired_result"):
@@ -51,6 +51,7 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
         "intent": intent,
         "intent_evidence": evidence,
         "question_target": question_target or ("need" if action == "explore" else "none"),
+        "conversation_effect": conversation_effect,
         "observations": fields,
         "reply_assessment": {
             "based_on_client_meaning": True,
@@ -418,6 +419,41 @@ class TestBot(unittest.TestCase):
         data = target.parse_controller_payload(payload("Хотите записаться?","answer_information","question","Сколько стоит?"))
         issues = target.controller_reply_issues(data, "answer_information", self.state(), [])
         self.assertIn("ответ на вопрос заменён записью", issues)
+
+    def test_information_answer_cannot_close_active_dialogue(self):
+        client_text = "Как часто проходят встречи?"
+        data = target.parse_controller_payload(payload(
+            "Обычно встречи проходят раз в неделю. До встречи! Хорошего дня.",
+            action="answer_information",
+            intent="question",
+            evidence=client_text,
+            conversation_effect="close",
+        ))
+        issues = target.controller_reply_issues(
+            data,
+            "answer_information",
+            self.state(consultation_offered=True),
+            [],
+            client_text=client_text,
+        )
+        self.assertIn("реплика преждевременно завершает продолжающийся разговор", issues)
+
+    def test_information_answer_keeps_dialogue_open_without_forced_follow_up(self):
+        client_text = "Как часто проходят встречи?"
+        data = target.parse_controller_payload(payload(
+            "Обычно встречи проходят раз в неделю.",
+            action="answer_information",
+            intent="question",
+            evidence=client_text,
+        ))
+        issues = target.controller_reply_issues(
+            data,
+            "answer_information",
+            self.state(consultation_offered=True),
+            [],
+            client_text=client_text,
+        )
+        self.assertNotIn("реплика преждевременно завершает продолжающийся разговор", issues)
 
     def test_expert_cannot_speak_in_third_person(self):
         data = target.parse_controller_payload(payload("Психолог поможет разобраться.","explain_solution"))

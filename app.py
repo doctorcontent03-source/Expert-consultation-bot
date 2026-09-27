@@ -16,7 +16,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 APP_VERSION = "v11.0-simplified-controller"
 
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
-Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним: «буду рад» или «буду рада». Если пол неясен, выбирайте нейтральные фразы без родового окончания, например «До встречи! Хорошего дня».
+Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним. Если пол неясен, выбирайте нейтральную грамматическую конструкцию без родового окончания.
 Цель: установить контакт, бережно выявить потребность, ответить на вопросы и только при уместности один раз предложить консультацию.
 Задавайте строго по одному вопросу за раз и не более трёх уточняющих вопросов за весь этап выявления потребности. Не предлагайте консультацию после первой общей реплики клиента. За 2–3 вопроса выясните суть ситуации, её длительность или влияние на жизнь и желаемое изменение. Как только запрос в целом понятен, прекратите расспросы: кратко отразите услышанное и предложите консультацию. После первого предложения не повторяйте его, пока клиент сам явно не согласится записаться. Если клиент просит не торопить его, хочет сначала получить информацию, сомневается или задаёт вопрос об условиях, отвечайте только на вопрос и не завершайте ответ новым предложением консультации.
 Используйте факты только из предоставленной базы знаний и фактов текущего разговора. Если сведений нет, прямо скажите, что не можете точно ответить, и не додумывайте. Отвечая на текущее сообщение о конкретном сервисе, платформе, формате или другом названном варианте, сохраняйте это название точно и не заменяйте его похожим названием. Если база не подтверждает названный вариант, повторите его точное название и честно скажите, что не можете подтвердить. В следующих ответах не повторяйте название варианта, если новый вопрос не относится к нему.
@@ -45,6 +45,7 @@ CONTROLLER_RESPONSE_FORMAT = {
             "question_target": {"type": "string", "enum": [
                 "none", "contact", "need", "previous_experience", "desired_result",
             ]},
+            "conversation_effect": {"type": "string", "enum": ["continue", "close"]},
             "observations": {
                 "type": "object",
                 "properties": {
@@ -63,7 +64,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "additionalProperties": False,
             },
         },
-        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "observations"],
+        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "conversation_effect", "observations"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -415,6 +416,7 @@ def parse_controller_payload(raw):
     intent = data.get("intent")
     evidence = data.get("intent_evidence", "")
     question_target = data.get("question_target", "none")
+    conversation_effect = data.get("conversation_effect", "continue")
     observations = data.get("observations")
     assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
@@ -424,6 +426,8 @@ def parse_controller_payload(raw):
     if intent not in {"continue", "interest", "booking", "booking_question", "decline", "question", "concern", "boundary", "end", "correction", "rupture"}:
         return None
     if question_target not in {"none", "contact", "need", "previous_experience", "desired_result"}:
+        return None
+    if conversation_effect not in {"continue", "close"}:
         return None
     if not isinstance(observations, dict):
         return None
@@ -435,6 +439,7 @@ def parse_controller_payload(raw):
         "intent": intent,
         "intent_evidence": str(evidence or "").strip(),
         "question_target": question_target,
+        "conversation_effect": conversation_effect,
         "observations": observations,
         "reply_assessment": assessment,
     }
@@ -584,6 +589,14 @@ def uses_informal_address(reply):
         low,
     ))
 
+def contains_conversation_closing(reply):
+    low = str(reply or "").lower().replace("ё", "е")
+    return bool(re.search(
+        r"(?:\bдо\s+(?:встречи|свидания)\b|\bвсего\s+доброго\b|"
+        r"\bхорошего\s+(?:дня|вечера)\b|\bобращайтесь(?:\s|[.!?,]|$))",
+        low,
+    ))
+
 def is_information_request_sentence(sentence):
     return "?" in sentence or bool(re.match(
         r"^(?:пожалуйста[, ]+)?(?:расскажите|уточните|опишите|объясните|поделитесь|скажите)\b",
@@ -683,6 +696,14 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("повторена предыдущая реплика")
     if uses_informal_address(reply):
         issues.append("нарушено обращение на вы")
+    active_actions = {
+        "explore", "explain_solution", "check_interest", "offer_consultation",
+        "start_booking", "answer_information", "repair_interpretation", "repair_contact",
+    }
+    if action in active_actions and (
+        payload.get("conversation_effect") == "close" or contains_conversation_closing(reply)
+    ):
+        issues.append("реплика преждевременно завершает продолжающийся разговор")
     question = question_from_reply(reply)
     if action == "explore":
         if not question:
@@ -787,6 +808,7 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 question_target — элемент состояния, который выясняет вопрос в reply. Для explore выберите ровно один элемент из НЕДОСТАЮЩИХ ЭЛЕМЕНТОВ. Для остальных действий укажите none. Нельзя снова выяснять элемент, который уже отмечен true.
+conversation_effect — фактическая функция готовой реплики: continue, если она оставляет текущий разговор открытым; close, если прощается или завершает его. Для explore, explain_solution, check_interest, offer_consultation, start_booking, answer_information, repair_interpretation и repair_contact допустимо только continue.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
 concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
 booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Вопрос о выборе даты или времени является частью booking. Простого интереса к консультации недостаточно. booking_question означает, что клиент согласился записаться, но в той же реплике задал вопрос об условиях встречи — формате, платформе, продолжительности, стоимости, подготовке или дальнейшей работе. Для booking_question сначала ответьте на вопрос; к записи можно перейти после следующей реплики клиента. Если консультация ещё не предложена, не используйте booking или booking_question.
@@ -794,7 +816,7 @@ decline означает, что клиент отклоняет последн�
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","conversation_effect":"continue|close","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -896,6 +918,11 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
     if action in {"respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog", "explain_solution"} and "?" in reply:
         return False
     if action == "answer_information" and not named_option_is_preserved(client_text, reply):
+        return False
+    if action in {
+        "explore", "explain_solution", "check_interest", "offer_consultation",
+        "start_booking", "answer_information", "repair_interpretation", "repair_contact",
+    } and contains_conversation_closing(reply):
         return False
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         return False
