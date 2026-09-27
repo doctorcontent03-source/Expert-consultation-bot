@@ -945,6 +945,28 @@ class TestBot(unittest.TestCase):
         self.assertEqual(target.gigachat.response_formats, [None])
         self.assertIn("Запись клиента уже подтверждена", target.gigachat.prompts[0])
 
+    def test_post_booking_reply_does_not_address_client_by_name(self):
+        target.gigachat = ScriptedGigaChat([
+            "Пожалуйста, Евгений. До свидания!",
+            "Пожалуйста. До свидания!",
+        ])
+        history = [
+            {
+                "role": "user",
+                "content": "Евгения, +79111234567, testclient14@yandex.ru",
+            },
+            {"role": "assistant", "content": "Запись подтверждена."},
+        ]
+        with target.app.test_request_context("/"):
+            answer = target.generate_post_booking_reply(
+                history,
+                "Ясно, спасибо. До встречи!",
+                [{"name": "FAQ.txt", "text": "Подготовка не требуется."}],
+            )
+        self.assertEqual(answer, "Пожалуйста. До свидания!")
+        self.assertEqual(len(target.gigachat.prompts), 2)
+        self.assertIn("Не обращайтесь к клиенту по имени", target.gigachat.prompts[0])
+
     def test_post_booking_retrieval_uses_full_knowledge_base_for_unresolved_question(self):
         target.gigachat = ScriptedGigaChat([
             "Один регулярный сеанс стоит 3500 рублей.",
