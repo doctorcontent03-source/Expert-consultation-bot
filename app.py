@@ -42,6 +42,9 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "boundary", "end", "correction", "rupture",
             ]},
             "intent_evidence": {"type": "string"},
+            "question_target": {"type": "string", "enum": [
+                "none", "contact", "need", "previous_experience", "desired_result",
+            ]},
             "observations": {
                 "type": "object",
                 "properties": {
@@ -60,7 +63,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "additionalProperties": False,
             },
         },
-        "required": ["reply", "action", "intent", "intent_evidence", "observations"],
+        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "observations"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -411,6 +414,7 @@ def parse_controller_payload(raw):
     action = data.get("action")
     intent = data.get("intent")
     evidence = data.get("intent_evidence", "")
+    question_target = data.get("question_target", "none")
     observations = data.get("observations")
     assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
@@ -418,6 +422,8 @@ def parse_controller_payload(raw):
     if action not in {"explore", "explain_solution", "check_interest", "offer_consultation", "start_booking", "answer_information", "respect_boundary", "respect_decline", "repair_interpretation", "repair_contact", "end_dialog"}:
         return None
     if intent not in {"continue", "interest", "booking", "booking_question", "decline", "question", "concern", "boundary", "end", "correction", "rupture"}:
+        return None
+    if question_target not in {"none", "contact", "need", "previous_experience", "desired_result"}:
         return None
     if not isinstance(observations, dict):
         return None
@@ -428,6 +434,7 @@ def parse_controller_payload(raw):
         "action": action,
         "intent": intent,
         "intent_evidence": str(evidence or "").strip(),
+        "question_target": question_target,
         "observations": observations,
         "reply_assessment": assessment,
     }
@@ -472,8 +479,8 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
             return "offer_consultation" if not state["consultation_offered"] else "check_interest"
         return "check_interest"
     required_complete = state["need"] and state["previous_experience"] and state["desired_result"]
-    if state["diagnostic_questions"] < 2:
-        return "explore"
+    if required_complete:
+        return "offer_consultation"
     if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
     return "offer_consultation"
@@ -680,6 +687,15 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
     if action == "explore":
         if not question:
             issues.append("на этапе уточнения нет вопроса")
+        question_target = payload.get("question_target", "none")
+        missing_targets = {
+            field for field in ("need", "previous_experience", "desired_result")
+            if not state.get(field)
+        }
+        if question_target == "none":
+            issues.append("не указан недостающий элемент для вопроса")
+        elif question_target not in missing_targets:
+            issues.append("вопрос относится к уже полученной информации")
         if re.search(r"(запис|консультац|встреч)", low):
             issues.append("преждевременно предложена встреча")
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
@@ -726,12 +742,17 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 Определяйте её функцию с учётом этого контекста: содержательного высказывания, предложения
 или объяснения эксперта до неё ещё не было.
 """
+    missing = [
+        field for field in ("need", "previous_experience", "desired_result")
+        if not state.get(field)
+    ]
     return SYSTEM_RULES + first_turn_rule + f"""
 
 Вы управляете одной следующей репликой по состояниям, а не по заготовленному скрипту.
 
 ТЕКУЩЕЕ СОСТОЯНИЕ:
 {json.dumps(state, ensure_ascii=False)}
+НЕДОСТАЮЩИЕ ЭЛЕМЕНТЫ: {json.dumps(missing, ensure_ascii=False)}
 
 ПОСЛЕДОВАТЕЛЬНОСТЬ:
 1. Установить контекст клиента.
@@ -765,6 +786,7 @@ contact — понятен контекст жизни или ситуации �
 need — понятно, что не устраивает или причиняет трудность;
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
+question_target — элемент состояния, который выясняет вопрос в reply. Для explore выберите ровно один элемент из НЕДОСТАЮЩИХ ЭЛЕМЕНТОВ. Для остальных действий укажите none. Нельзя снова выяснять элемент, который уже отмечен true.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
 concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
 booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Вопрос о выборе даты или времени является частью booking. Простого интереса к консультации недостаточно. booking_question означает, что клиент согласился записаться, но в той же реплике задал вопрос об условиях встречи — формате, платформе, продолжительности, стоимости, подготовке или дальнейшей работе. Для booking_question сначала ответьте на вопрос; к записи можно перейти после следующей реплики клиента. Если консультация ещё не предложена, не используйте booking или booking_question.
@@ -772,7 +794,7 @@ decline означает, что клиент отклоняет последн�
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -980,10 +1002,22 @@ def generate_stateful_dialog_reply(history, text, context):
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history[-8:]
     )
+    fallback_missing = [
+        field for field in ("need", "previous_experience", "desired_result")
+        if not working_state.get(field)
+    ]
+    fallback_missing_rule = ""
+    if fallback_action == "explore":
+        fallback_missing_rule = (
+            "\nЗадайте вопрос только об одном из этих недостающих элементов: "
+            + ", ".join(fallback_missing)
+            + ". Не спрашивайте о заполненных элементах."
+        )
     fallback_prompt = SYSTEM_RULES + f"""
 
 Структурированный контроллер уже определил следующее действие диалога: {fallback_action}.
 {fallback_action_instruction(fallback_action)}
+{fallback_missing_rule}
 Сформулируйте одну естественную реплику эксперта по текущему контексту.
 Не возвращайте JSON, названия действий, служебные инструкции или комментарии.
 Не копируйте дословно слова клиента и не пересказывайте весь его ответ.
