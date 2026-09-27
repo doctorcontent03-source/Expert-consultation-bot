@@ -137,6 +137,31 @@ class TestBot(unittest.TestCase):
         text = "Сколько длится консультация?"
         self.assertEqual(target.expected_dialog_action(state, "question", text, text), "answer_information")
 
+    def test_question_after_offer_is_answered_even_if_intent_was_misclassified(self):
+        state = self.state(
+            need=True,
+            previous_experience=True,
+            desired_result=True,
+            consultation_offered=True,
+        )
+        text = "Как часто проходят встречи?"
+        self.assertEqual(
+            target.expected_dialog_action(state, "continue", "", text),
+            "answer_information",
+        )
+
+    def test_consultation_is_not_offered_again_after_first_offer(self):
+        state = self.state(
+            need=True,
+            previous_experience=True,
+            desired_result=True,
+            consultation_offered=True,
+        )
+        self.assertEqual(
+            target.expected_dialog_action(state, "continue", "", "Понятно"),
+            "check_interest",
+        )
+
     def test_interest_does_not_block_offer_when_psychologist_request_is_complete(self):
         text = "Да, мне интересно"
         state = self.state(contact=True, need=True, previous_experience=True, desired_result=True, diagnostic_questions=1)
@@ -832,6 +857,15 @@ class TestBot(unittest.TestCase):
             answer = target.direct_booking_answer("Когда можно записаться на бесплатную консультацию?")
             self.assertIn("дату и время", answer)
             self.assertEqual(target.session["requested_booking_type"], "free")
+
+    def test_booking_condition_question_does_not_start_calendar_flow(self):
+        with target.app.test_request_context("/"):
+            target.session["consultation_offered"] = True
+            answer = target.direct_booking_answer(
+                "То есть можно сначала записаться на бесплатную консультацию, а потом решить, хочу ли я продолжать?"
+            )
+            self.assertIsNone(answer)
+            self.assertNotIn("awaiting_booking_type", target.session)
 
     def test_free_slot_requests_contacts_and_rechecks_on_save(self):
         future = datetime.now(ZoneInfo("Europe/Moscow")) + timedelta(days=30)
