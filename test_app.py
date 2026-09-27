@@ -39,7 +39,7 @@ class ScriptedGigaChat:
         return value
 
 
-def payload(reply, action="explore", intent="continue", evidence="", observations=None):
+def payload(reply, action="explore", intent="continue", evidence="", observations=None, question_target=None):
     observations = observations or {}
     fields = {}
     for key in ("contact", "need", "previous_experience", "desired_result"):
@@ -50,6 +50,7 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
         "action": action,
         "intent": intent,
         "intent_evidence": evidence,
+        "question_target": question_target or ("need" if action == "explore" else "none"),
         "observations": fields,
         "reply_assessment": {
             "based_on_client_meaning": True,
@@ -120,10 +121,8 @@ class TestBot(unittest.TestCase):
         self.assertTrue(updated["contact"])
         self.assertFalse(updated["need"])
 
-    def test_two_questions_required_before_consultation_invitation(self):
+    def test_complete_information_allows_consultation_after_one_question(self):
         state = self.state(contact=True, need=True, previous_experience=True, desired_result=True)
-        self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "explore")
-        state["diagnostic_questions"] = 2
         self.assertEqual(target.expected_dialog_action(state, "continue", "", "Года два"), "offer_consultation")
 
     def test_missing_information_allows_only_three_questions(self):
@@ -137,10 +136,10 @@ class TestBot(unittest.TestCase):
         text = "Сколько длится консультация?"
         self.assertEqual(target.expected_dialog_action(state, "question", text, text), "answer_information")
 
-    def test_interest_cannot_trigger_offer_before_solution(self):
+    def test_interest_does_not_block_offer_when_psychologist_request_is_complete(self):
         text = "Да, мне интересно"
         state = self.state(contact=True, need=True, previous_experience=True, desired_result=True, diagnostic_questions=1)
-        self.assertEqual(target.expected_dialog_action(state, "interest", text, text), "explore")
+        self.assertEqual(target.expected_dialog_action(state, "interest", text, text), "offer_consultation")
 
     def test_interest_after_solution_triggers_one_offer(self):
         text = "Да, мне интересно"
@@ -295,6 +294,46 @@ class TestBot(unittest.TestCase):
             diagnostic_questions=2,
         )
         self.assertEqual(target.expected_dialog_action(state, "continue", "", "Вернуть смысл жизни"), "offer_consultation")
+
+    def test_complete_information_does_not_force_second_diagnostic_question(self):
+        state = self.state(
+            need=True,
+            previous_experience=True,
+            desired_result=True,
+            diagnostic_questions=1,
+        )
+        self.assertEqual(
+            target.expected_dialog_action(state, "continue", "", "Хочу вернуть радость"),
+            "offer_consultation",
+        )
+
+    def test_explore_question_cannot_target_information_already_received(self):
+        state = self.state(
+            need=True,
+            previous_experience=True,
+            desired_result=False,
+            diagnostic_questions=2,
+        )
+        data = target.parse_controller_payload(payload(
+            "Давно ли это продолжается?",
+            question_target="previous_experience",
+        ))
+        issues = target.controller_reply_issues(data, "explore", state, [])
+        self.assertIn("вопрос относится к уже полученной информации", issues)
+
+    def test_explore_question_may_target_only_missing_information(self):
+        state = self.state(
+            need=True,
+            previous_experience=True,
+            desired_result=False,
+            diagnostic_questions=2,
+        )
+        data = target.parse_controller_payload(payload(
+            "Что вы хотели бы изменить?",
+            question_target="desired_result",
+        ))
+        issues = target.controller_reply_issues(data, "explore", state, [])
+        self.assertNotIn("вопрос относится к уже полученной информации", issues)
 
     def test_repeated_assistant_reply_is_rejected_generically(self):
         previous = "Краткое отражение запроса и один вопрос?"
@@ -491,8 +530,9 @@ class TestBot(unittest.TestCase):
                 observations={
                     "previous_experience": {"present": True, "evidence": "Года два"},
                 },
+                question_target="previous_experience",
             ),
-            payload("Что хотелось бы изменить?"),
+            payload("Что хотелось бы изменить?", question_target="desired_result"),
         ])
         target.gigachat = scripted
         with target.app.test_request_context("/"):
@@ -539,7 +579,7 @@ class TestBot(unittest.TestCase):
         client_text = "Никаких мыслей о будущем. Нет надежды."
         scripted = ScriptedGigaChat([
             payload("Предлагаю встретиться на консультации.", action="offer_consultation"),
-            payload("Что хотелось бы изменить?"),
+            payload("Что хотелось бы изменить?", question_target="desired_result"),
         ])
         target.gigachat = scripted
         with target.app.test_request_context("/"):
