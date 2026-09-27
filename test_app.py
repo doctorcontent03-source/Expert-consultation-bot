@@ -307,6 +307,40 @@ class TestBot(unittest.TestCase):
         )
         self.assertIn("повторена предыдущая реплика", issues)
 
+    def test_repeated_sentence_is_rejected_when_new_answer_is_appended(self):
+        previous = "Предлагаю встретиться в Телемосте. Выберите удобное время."
+        data = target.parse_controller_payload(payload(
+            "Предлагаю встретиться в Телемосте. Бесплатная консультация длится 15-20 минут.",
+            action="answer_information",
+            intent="question",
+            evidence="Сколько длится консультация?",
+        ))
+        issues = target.controller_reply_issues(
+            data,
+            "answer_information",
+            self.state(consultation_offered=True),
+            [{"role": "assistant", "content": previous}],
+            client_text="Сколько длится консультация?",
+        )
+        self.assertIn("повторена предыдущая реплика", issues)
+
+    def test_new_information_answer_without_old_platform_is_accepted(self):
+        previous = "Предлагаю встретиться в Телемосте. Выберите удобное время."
+        data = target.parse_controller_payload(payload(
+            "Бесплатная консультация длится 15-20 минут.",
+            action="answer_information",
+            intent="question",
+            evidence="Сколько длится консультация?",
+        ))
+        issues = target.controller_reply_issues(
+            data,
+            "answer_information",
+            self.state(consultation_offered=True),
+            [{"role": "assistant", "content": previous}],
+            client_text="Сколько длится консультация?",
+        )
+        self.assertNotIn("повторена предыдущая реплика", issues)
+
     # Reply validation
     def test_no_repeated_question(self):
         state = self.state(asked_questions=["Давно у вас такое состояние?"])
