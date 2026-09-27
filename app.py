@@ -860,6 +860,32 @@ def plain_reply_from_model(raw):
         return ""
     return cleaned
 
+def client_name_from_history(history):
+    for row in reversed(history):
+        if row["role"] != "user":
+            continue
+        details = contact_details(row["content"])
+        if details:
+            return details[0].strip()
+    return ""
+
+def reply_uses_client_name(reply, client_name):
+    if not client_name:
+        return False
+    reply_tokens = re.findall(r"\b[А-ЯЁ][а-яё-]+\b", str(reply or ""))
+    for name_part in re.findall(r"[А-ЯЁа-яё-]+", client_name):
+        source = name_part.lower().replace("ё", "е")
+        for token in reply_tokens:
+            candidate = token.lower().replace("ё", "е")
+            common = 0
+            for left, right in zip(source, candidate):
+                if left != right:
+                    break
+                common += 1
+            if candidate == source or common >= max(4, min(len(source), len(candidate)) - 2):
+                return True
+    return False
+
 def generate_post_booking_reply(history, text, documents):
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
@@ -867,12 +893,14 @@ def generate_post_booking_reply(history, text, documents):
     )
     retrieval_query = "\n".join([row["content"] for row in history[-4:]] + [text])
     context = relevant(retrieval_query, documents, limit=7000)
+    client_name = client_name_from_history(history)
     prompt = SYSTEM_RULES + f"""
 
 Запись клиента уже подтверждена. Ответьте от имени эксперта только на последнее сообщение клиента.
 Если клиент задаёт организационный или информационный вопрос, дайте прямой краткий ответ по базе знаний.
 Если последнее сообщение вызвано предыдущим неполным ответом, ответьте на незакрытый вопрос из недавнего диалога.
 Не предлагайте запись повторно, не просите выбрать время и не задавайте встречный вопрос.
+Не обращайтесь к клиенту по имени и не переносите контактные данные из истории в ответ.
 Верните только текст реплики без JSON, служебных полей и комментариев.
 
 БАЗА ЗНАНИЙ:
@@ -897,15 +925,16 @@ def generate_post_booking_reply(history, text, documents):
             app.logger.exception("Post-booking reply failed model=%s", model)
             continue
         reply = normalize_reply_for_action(plain_reply_from_model(raw), "answer_information")
-        if reply and len(re.findall(r"\S+", reply)) <= 55:
+        if reply and len(re.findall(r"\S+", reply)) <= 55 and not reply_uses_client_name(reply, client_name):
             app.logger.warning(
                 "Post-booking reply completed model=%s elapsed_ms=%s prompt_chars=%s",
                 model, round((time.perf_counter() - started) * 1000), len(prompt),
             )
             return reply
         app.logger.warning(
-            "Post-booking reply rejected model=%s elapsed_ms=%s reason=empty_or_too_long",
+            "Post-booking reply rejected model=%s elapsed_ms=%s reason=%s",
             model, round((time.perf_counter() - started) * 1000),
+            "client_name" if reply_uses_client_name(reply, client_name) else "empty_or_too_long",
         )
     if last_error:
         raise last_error
