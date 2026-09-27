@@ -871,6 +871,40 @@ class TestBot(unittest.TestCase):
         con = target.db()
         self.assertEqual(con.execute("select count(*) from documents").fetchone()[0], 1)
 
+    def test_named_platform_cannot_be_replaced_by_similar_service(self):
+        client_text = "А в Телемосте можно?"
+        response = target.parse_controller_payload(payload(
+            "Да, можно в Телеграме.",
+            action="answer_information",
+            intent="question",
+            evidence=client_text,
+        ))
+        issues = target.controller_reply_issues(
+            response,
+            "answer_information",
+            target.controller_state({}),
+            [],
+            client_text=client_text,
+        )
+        self.assertIn("подменено название варианта из вопроса клиента", issues)
+
+    def test_named_platform_is_accepted_when_preserved(self):
+        client_text = "А в Телемосте можно?"
+        response = target.parse_controller_payload(payload(
+            "Да, через Телемост можно провести встречу.",
+            action="answer_information",
+            intent="question",
+            evidence=client_text,
+        ))
+        issues = target.controller_reply_issues(
+            response,
+            "answer_information",
+            target.controller_state({}),
+            [],
+            client_text=client_text,
+        )
+        self.assertNotIn("подменено название варианта из вопроса клиента", issues)
+
     def test_admin_upload_and_list(self):
         headers = {"X-Admin-Password": "admin123"}
         response = self.client.post(
