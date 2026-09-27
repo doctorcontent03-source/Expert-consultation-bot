@@ -164,7 +164,7 @@ class TestBot(unittest.TestCase):
         )
         state = self.state(consultation_offered=True)
         self.assertEqual(
-            target.expected_dialog_action(state, "booking", text, text),
+            target.expected_dialog_action(state, "booking_question", text, text),
             "answer_information",
         )
 
@@ -177,7 +177,7 @@ class TestBot(unittest.TestCase):
             payload(
                 "Встреча проходит онлайн и длится 15–20 минут.",
                 action="start_booking",
-                intent="booking",
+                intent="booking_question",
                 evidence=text,
             ),
         ])
