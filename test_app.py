@@ -1084,6 +1084,64 @@ class TestBot(unittest.TestCase):
         self.assertEqual(listed.status_code, 200)
         self.assertTrue(any(x["name"] == "new.txt" for x in listed.json["documents"]))
 
+    # Marketer profile remains separate from the psychologist profile.
+    def test_marketer_has_separate_page_and_greeting(self):
+        response = self.client.get("/marketer")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("чем вы занимаетесь и с кем работаете", response.get_data(as_text=True))
+        self.assertIn("/api/marketer/chat", response.get_data(as_text=True))
+
+    def test_marketer_knowledge_base_is_isolated(self):
+        headers = {"X-Admin-Password": "admin123"}
+        response = self.client.post(
+            "/api/marketer/admin/upload",
+            headers=headers,
+            data={"files": (io.BytesIO("Екатерина — маркетолог".encode()), "marketing.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        marketer_docs = self.client.get("/api/marketer/admin", headers=headers).json["documents"]
+        psychologist_docs = self.client.get("/api/admin", headers=headers).json["documents"]
+        self.assertTrue(any(x["name"] == "marketing.txt" for x in marketer_docs))
+        self.assertFalse(any(x["name"] == "marketing.txt" for x in psychologist_docs))
+
+    def test_marketer_explains_solution_before_consultation(self):
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            self.assertEqual(
+                target.expected_dialog_action(state, "continue", "", "Хочу наладить контент"),
+                "explain_solution",
+            )
+            state["solution_explained"] = True
+            text = "Да, это мне подходит"
+            self.assertEqual(
+                target.expected_dialog_action(state, "interest", text, text),
+                "offer_consultation",
+            )
+
+    def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            target.sset("consultation_offered", True)
+            self.assertEqual(
+                target.direct_booking_answer("Давайте."),
+                "Назовите удобные дату и время — я проверю их в календаре.",
+            )
+            self.assertEqual(target.booking_config("free")[1], 60)
+            self.assertEqual(target.booking_config("regular")[1], 60)
+        page = self.client.get("/marketer/booking")
+        body = page.get_data(as_text=True)
+        self.assertIn("обычно занимает 30–40 минут", body)
+        self.assertIn("календаре резервируется 60 минут", body)
+
+    def test_marketer_and_psychologist_session_states_are_separate(self):
+        with target.app.test_request_context("/"):
+            target.g.expert_slug = "psychologist"
+            target.sset("dialog_closed", True)
+            target.g.expert_slug = "marketer"
+            self.assertIsNone(target.sget("dialog_closed"))
+
 
 if __name__ == "__main__":
     unittest.main()

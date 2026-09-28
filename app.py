@@ -2,7 +2,7 @@ import io, json, os, re, sqlite3, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from flask import Flask, jsonify, request, session, render_template_string
+from flask import Flask, jsonify, request, session, render_template_string, g, has_app_context
 import requests
 import caldav
 from docx import Document
@@ -15,6 +15,59 @@ app.secret_key = os.getenv("FLASK_SECRET", "change-me-before-publication")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 APP_VERSION = "v11.0-simplified-controller"
 
+EXPERT_PROFILES = {
+    "psychologist": {
+        "document_slug": "psychologist",
+        "greeting": "Здравствуйте! Расскажите, пожалуйста, что вас сейчас беспокоит и с чем вы хотели бы разобраться?",
+        "previous_experience": "как давно существует проблема или как она влияет на жизнь клиента",
+        "consultation_is_service": True,
+        "single_booking_type": False,
+        "free_title": "Бесплатная консультация",
+        "free_duration": 20,
+    },
+    "marketer": {
+        "document_slug": "marketer",
+        "greeting": "Здравствуйте! Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
+        "previous_experience": "как клиент решает задачу сейчас, что уже пробовал и что его не устраивает",
+        "consultation_is_service": False,
+        "single_booking_type": True,
+        "free_title": "Бесплатная консультация",
+        "free_duration": 60,
+    },
+}
+
+def active_expert_slug():
+    return getattr(g, "expert_slug", "psychologist") if has_app_context() else "psychologist"
+
+def active_expert_profile():
+    return EXPERT_PROFILES[active_expert_slug()]
+
+def session_key(name, slug=None):
+    slug = slug or active_expert_slug()
+    return name if slug == "psychologist" else f"{slug}:{name}"
+
+def sget(name, default=None):
+    return session.get(session_key(name), default)
+
+def sset(name, value):
+    session[session_key(name)] = value
+
+def spop(name, default=None):
+    return session.pop(session_key(name), default)
+
+def ssetdefault(name, default):
+    return session.setdefault(session_key(name), default)
+
+def clear_profile_session(slug=None):
+    slug = slug or active_expert_slug()
+    if slug == "psychologist":
+        keys = [key for key in session.keys() if ":" not in key]
+    else:
+        prefix = f"{slug}:"
+        keys = [key for key in session.keys() if key.startswith(prefix)]
+    for key in keys:
+        session.pop(key, None)
+
 SYSTEM_RULES = """Вы ведёте диалог от первого лица от имени эксперта из базы знаний. Обращайтесь на «вы».
 Эксперт — один человек, а не организация и не команда. Говорите только от первого лица единственного числа: «я», «мне», «со мной», «моя консультация». Не используйте о себе «мы», «нам», «наш», «будем рады». Если из базы знаний понятен пол эксперта, согласуйте окончания с ним. Если пол неясен, выбирайте нейтральную грамматическую конструкцию без родового окончания.
 Цель: установить контакт, бережно выявить потребность, ответить на вопросы и только при уместности один раз сообщить о возможности консультации.
@@ -25,6 +78,20 @@ SYSTEM_RULES = """Вы ведёте диалог от первого лица о
 Не проводите консультацию внутри чата: не интерпретируйте причины состояния, не анализируйте личность и цели, не предлагайте упражнения, техники, способы лечения или последовательность изменений. Задача чата — понять общий запрос, дать информацию о работе эксперта и привести к записи. Содержательный разбор проводит живой эксперт на встрече.
 Календарь подключён. Никогда не говорите, что календаря нет, он недоступен или запись появится позже. Вопросы «зачем бесплатная встреча», «нужно ли потом сразу записываться», «как часто встречаться» и подобные являются информационными: отвечайте на них без кнопок и без призыва записаться. Кнопку показывайте только после явного согласия клиента записаться или прямого вопроса о доступном времени. Если клиент впервые согласился на ознакомительную консультацию, добавьте маркер [[BOOK_FREE]]. Если клиент явно хочет обычную или повторную встречу, добавьте маркер [[BOOK_REGULAR]]. Если клиент просит показать оба варианта, добавьте оба маркера. После подтверждённой записи поздравьте клиента с записью и больше не показывайте кнопки, если он не просит изменить или создать ещё одну встречу. Не упоминайте «наш сайт», раздел сайта, форму или технические адреса.
 Отвечайте кратко и естественно, без служебных комментариев о правилах."""
+
+MARKETER_SYSTEM_RULES = SYSTEM_RULES.replace(
+    "бережно выявить потребность",
+    "выявить потребность",
+).replace(
+    "За 2–3 вопроса выясните суть ситуации, её длительность или влияние на жизнь и желаемое изменение. Как только запрос в целом понятен, прекратите расспросы и один раз спокойно обозначьте возможность консультации без требования немедленно записаться.",
+    "За 2–3 вопроса выясните суть задачи, прежние попытки или текущий способ работы и желаемое изменение. Как только запрос в целом понятен, прекратите расспросы, объясните подходящее реальное направление из базы знаний и проверьте интерес к нему. Только после проявленного интереса один раз спокойно обозначьте возможность консультации без требования немедленно записаться.",
+).replace(
+    "Не проводите консультацию внутри чата: не интерпретируйте причины состояния, не анализируйте личность и цели, не предлагайте упражнения, техники, способы лечения или последовательность изменений. Задача чата — понять общий запрос, дать информацию о работе эксперта и привести к записи. Содержательный разбор проводит живой эксперт на встрече.",
+    "Не выполняйте работу маркетолога внутри чата: не проводите аудит, не разрабатывайте стратегию, позиционирование, контент-план, воронку, тексты или AI-решение. Задача чата — понять общий запрос, объяснить подходящее направление из базы знаний и при явной готовности клиента привести к записи. Содержательный разбор и создание результата происходят после предварительного разговора.",
+)
+
+def active_system_rules():
+    return MARKETER_SYSTEM_RULES if active_expert_slug() == "marketer" else SYSTEM_RULES
 
 CONTROLLER_RESPONSE_FORMAT = {
     "type": "json_schema",
@@ -122,15 +189,46 @@ BOOKING_HTML = BOOKING_HTML.replace(
     "body:JSON.stringify(Object.assign(Object.fromEntries(new FormData(f)),{booking_type:'{{ booking_type }}'}))"
 )
 
+MARKETER_HOME_HTML = HOME_HTML.replace(
+    EXPERT_PROFILES["psychologist"]["greeting"],
+    EXPERT_PROFILES["marketer"]["greeting"],
+).replace("href='/admin'", "href='/marketer/admin'")
+MARKETER_HOME_HTML = MARKETER_HOME_HTML.replace("'/api/chat'", "'/api/marketer/chat'")
+MARKETER_HOME_HTML = MARKETER_HOME_HTML.replace("'/api/history'", "'/api/marketer/history'")
+MARKETER_HOME_HTML = MARKETER_HOME_HTML.replace("'/api/reset'", "'/api/marketer/reset'")
+MARKETER_HOME_HTML = MARKETER_HOME_HTML.replace("'/booking?type=free'", "'/marketer/booking?type=free'")
+MARKETER_HOME_HTML = MARKETER_HOME_HTML.replace("'/booking?type=regular'", "'/marketer/booking?type=regular'")
+
+MARKETER_ADMIN_HTML = ADMIN_HTML.replace("href='/'", "href='/marketer'")
+MARKETER_ADMIN_HTML = MARKETER_ADMIN_HTML.replace("'/api/admin'", "'/api/marketer/admin'")
+MARKETER_ADMIN_HTML = MARKETER_ADMIN_HTML.replace("'/api/admin/upload'", "'/api/marketer/admin/upload'")
+MARKETER_ADMIN_HTML = MARKETER_ADMIN_HTML.replace("'/api/admin/document/", "'/api/marketer/admin/document/")
+
+MARKETER_BOOKING_HTML = BOOKING_HTML.replace("href='/'", "href='/marketer'")
+MARKETER_BOOKING_HTML = MARKETER_BOOKING_HTML.replace("'/api/booking'", "'/api/marketer/booking'")
+MARKETER_BOOKING_HTML = MARKETER_BOOKING_HTML.replace(
+    "Продолжительность — {{ duration }} минут.",
+    "Консультация обычно занимает 30–40 минут. В календаре резервируется {{ duration }} минут.",
+)
+
 def booking_config(booking_type):
+    profile = active_expert_profile()
+    if profile["single_booking_type"]:
+        booking_type = "free"
     regular = booking_type == "regular"
     prefix = "REGULAR" if regular else "FREE"
-    default_title = "Регулярная встреча" if regular else "Бесплатная консультация"
-    default_duration = 60 if regular else 20
-    title = os.getenv(f"BOOKING_{prefix}_TITLE", default_title).strip() or default_title
-    try: duration = max(5, min(480, int(os.getenv(f"BOOKING_{prefix}_DURATION_MINUTES", str(default_duration)))))
+    default_title = "Регулярная встреча" if regular else profile["free_title"]
+    default_duration = 60 if regular else profile["free_duration"]
+    env_prefix = "MARKETER_BOOKING" if active_expert_slug() == "marketer" else "BOOKING"
+    title = os.getenv(f"{env_prefix}_{prefix}_TITLE", default_title).strip() or default_title
+    try: duration = max(5, min(480, int(os.getenv(f"{env_prefix}_{prefix}_DURATION_MINUTES", str(default_duration)))))
     except ValueError: duration = default_duration
     return title, duration
+
+def booking_confirmation(title, start, duration):
+    if active_expert_slug() == "marketer":
+        return f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, в календаре зарезервировано {duration} минут"
+    return f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, {duration} минут"
 
 MONTHS_RU = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
@@ -244,24 +342,24 @@ def create_chat_booking(start, booking_type, name, phone, email):
         "END:VEVENT", "END:VCALENDAR", ""
     ])
     calendar.save_event(event)
-    return f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, {duration} минут", None
+    return booking_confirmation(title, start, duration), None
 
 def chat_booking_answer(text):
     low = text.lower()
-    if session.get("awaiting_booking_type"):
+    if sget("awaiting_booking_type"):
         if re.search(r"(бесплат|первичн|ознакомитель)", low):
-            session.pop("awaiting_booking_type", None)
-            session["requested_booking_type"] = "free"
+            spop("awaiting_booking_type", None)
+            sset("requested_booking_type", "free")
             return "Назовите удобные дату и время — я проверю их в календаре."
         if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
-            session.pop("awaiting_booking_type", None)
-            session["requested_booking_type"] = "regular"
+            spop("awaiting_booking_type", None)
+            sset("requested_booking_type", "regular")
             return "Назовите удобные дату и время — я проверю их в календаре."
 
-    pending = session.get("pending_booking")
+    pending = sget("pending_booking")
     if pending:
         if re.search(r"\b(отменить|отмена|не хочу записываться|передумал(?:а)?)\b", low):
-            session.pop("pending_booking", None)
+            spop("pending_booking", None)
             return "Хорошо, запись не оформляю."
         details = contact_details(text)
         if not details:
@@ -275,32 +373,34 @@ def chat_booking_answer(text):
             app.logger.exception("Chat calendar booking failed")
             return "Сейчас не удалось проверить календарь. Попробуйте ещё раз немного позже."
         if error:
-            session.pop("pending_booking", None)
+            spop("pending_booking", None)
             return error
-        session.pop("pending_booking", None)
-        session["last_booking"] = confirmation
-        session["dialog_closed"] = False
+        spop("pending_booking", None)
+        sset("last_booking", confirmation)
+        sset("dialog_closed", False)
         return f"Запись подтверждена: {confirmation}."
 
-    offered = session.get("offered_slots", [])
+    offered = sget("offered_slots", [])
     time_only = re.search(r"(?<!\d)(\d{1,2})[:.](\d{2})(?!\d)", text)
     if offered and time_only:
         hour, minute = map(int, time_only.groups())
         matches = [datetime.fromisoformat(value) for value in offered if datetime.fromisoformat(value).hour == hour and datetime.fromisoformat(value).minute == minute]
         if len(matches) == 1:
             start = matches[0]
-            booking_type = session.pop("offered_booking_type", "free")
-            session.pop("offered_slots", None)
-            session["pending_booking"] = {"start": start.isoformat(), "type": booking_type}
+            booking_type = spop("offered_booking_type", "free")
+            spop("offered_slots", None)
+            sset("pending_booking", {"start": start.isoformat(), "type": booking_type})
             return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Пришлите одним сообщением имя, телефон и email."
 
     booking_intent = bool(re.search(r"(запис|встреч|консультац|подойд[её]т|удобно|свободно)", low))
-    if not session.get("consultation_offered") and not booking_intent:
+    if not sget("consultation_offered") and not booking_intent:
         return None
     start = parse_requested_slot(text)
     if not start:
         return None
-    booking_type = session.pop("requested_booking_type", None) or ("regular" if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low) else "free")
+    booking_type = spop("requested_booking_type", None) or ("regular" if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low) else "free")
+    if active_expert_profile()["single_booking_type"]:
+        booking_type = "free"
     _, duration = booking_config(booking_type)
     if start < datetime.now(start.tzinfo) + timedelta(minutes=30):
         return "Это время уже прошло или до него осталось меньше 30 минут. Назовите другое время."
@@ -309,24 +409,27 @@ def chat_booking_answer(text):
         if not calendar_slot_is_free(calendar, start, duration):
             alternatives = nearby_free_slots(calendar, start, duration)
             if alternatives:
-                session["offered_slots"] = [value.isoformat() for value in alternatives]
-                session["offered_booking_type"] = booking_type
+                sset("offered_slots", [value.isoformat() for value in alternatives])
+                sset("offered_booking_type", booking_type)
                 variants = ", ".join(value.strftime("%d.%m в %H:%M") for value in alternatives)
                 return f"В {start.strftime('%d.%m в %H:%M')} уже занято. Ближайшие свободные варианты: {variants}. Какой подходит?"
             return "Это время занято. Назовите другой удобный день и время."
     except Exception:
         app.logger.exception("Chat calendar availability check failed")
         return "Сейчас не удалось проверить календарь. Попробуйте ещё раз немного позже."
-    session["pending_booking"] = {"start": start.isoformat(), "type": booking_type}
+    sset("pending_booking", {"start": start.isoformat(), "type": booking_type})
     return f"{start.strftime('%d.%m.%Y в %H:%M')} свободно. Пришлите одним сообщением имя, телефон и email."
 
 def direct_booking_answer(text):
     low = text.lower()
     if re.search(r"(я\s+)?(уже\s+)?записал(ась|ся)|запись\s+(готова|подтверждена|получилась)", low):
-        last = session.get("last_booking")
+        last = sget("last_booking")
         return f"Да, вижу вашу запись: {last}." if last else "Спасибо, запись оформлена."
-    if session.get("consultation_offered") and re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", low):
-        session["awaiting_booking_type"] = True
+    if sget("consultation_offered") and re.fullmatch(r"\s*(да|давайте|хорошо|согласен|согласна|можно|хочу|попробуем)[.!\s]*", low):
+        if active_expert_profile()["single_booking_type"]:
+            sset("requested_booking_type", "free")
+            return "Назовите удобные дату и время — я проверю их в календаре."
+        sset("awaiting_booking_type", True)
         return "На какую встречу хотите записаться: бесплатную первичную или регулярную?"
     explicit_booking_request = bool(re.search(
         r"(?:\b(?:хочу|готов(?:а)?|давайте)\b.{0,25}\bзапис|\bзапишите\b)",
@@ -341,16 +444,19 @@ def direct_booking_answer(text):
     if not asks_time:
         return None
     if re.search(r"(бесплат|ознакомитель|перв(ая|ую).{0,15}консультац)", low):
-        session["requested_booking_type"] = "free"
+        sset("requested_booking_type", "free")
         return "Назовите удобные дату и время — я проверю их в календаре."
     if re.search(r"(регуляр|повторн|платн|полноценн|сесси)", low):
-        session["requested_booking_type"] = "regular"
+        sset("requested_booking_type", "regular")
         return "Назовите удобные дату и время — я проверю их в календаре."
-    session["awaiting_booking_type"] = True
+    if active_expert_profile()["single_booking_type"]:
+        sset("requested_booking_type", "free")
+        return "Назовите удобные дату и время — я проверю их в календаре."
+    sset("awaiting_booking_type", True)
     return "На какую встречу хотите записаться: бесплатную первичную или регулярную?"
 
 def completed_dialog_answer(text):
-    if not session.get("last_booking") or session.get("dialog_closed"):
+    if not sget("last_booking") or sget("dialog_closed"):
         return None
     low = text.lower().strip()
     asks_new_booking = bool(re.search(r"(перенес|отмен|измен|друг(ая|ое|ую).{0,15}(дат|врем)|ещ[её].{0,20}(запис|встреч)|повторн.{0,15}(запис|встреч))", low))
@@ -363,7 +469,7 @@ def completed_dialog_answer(text):
     }
     closing = bool(words) and all(word in closing_words for word in words)
     if closing:
-        session["dialog_closed"] = True
+        sset("dialog_closed", True)
         return "До встречи! Хорошего дня."
     return None
 
@@ -396,7 +502,7 @@ def grounded_in_current_message(evidence, text):
 
 def controller_state(saved=None):
     if saved is None:
-        saved = session.get("dialog_controller_state")
+        saved = sget("dialog_controller_state")
     if not isinstance(saved, dict):
         saved = {}
     return {
@@ -508,7 +614,9 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "check_interest"
     required_complete = state["need"] and state["previous_experience"] and state["desired_result"]
     if required_complete:
-        return "offer_consultation"
+        if active_expert_profile()["consultation_is_service"]:
+            return "offer_consultation"
+        return "explain_solution"
     if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
     return "offer_consultation"
@@ -790,7 +898,21 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
         field for field in ("need", "previous_experience", "desired_result")
         if not state.get(field)
     ]
-    return SYSTEM_RULES + first_turn_rule + f"""
+    profile = active_expert_profile()
+    if profile["consultation_is_service"]:
+        previous_experience_step = "Выяснить релевантный предыдущий опыт. Для психолога — длительность проблемы или её влияние на жизнь."
+        service_transition = "Для психолога после достаточных уточнений кратко связать запрос с работой на встрече и один раз спокойно сообщить о возможности первичной консультации."
+        offer_order = "Для экспертов, продающих отдельный продукт или решение, предлагать консультацию после объяснения решения и проявленного интереса. Для психолога консультация является самой услугой и предлагается сразу после завершённого выявления потребности."
+        service_boundary = "Не выполняйте работу психолога в чате."
+    else:
+        previous_experience_step = "Выяснить релевантный предыдущий опыт: как клиент решает задачу сейчас, что уже пробовал и что его не устраивает."
+        service_transition = "После достаточных уточнений объяснить подходящее направление решения, которое действительно есть в базе знаний. Не выдавать возможное направление за готовый продукт. Проверить интерес именно к этому направлению и только после проявленного интереса один раз сообщить о консультации."
+        offer_order = "Для маркетолога сначала объяснить подходящее направление, затем проверить интерес и только после проявленного интереса предложить консультацию."
+        service_boundary = (
+            "Не проводите аудит, не разрабатывайте стратегию, позиционирование, контент-план, воронку, "
+            "тексты или AI-решение внутри чата."
+        )
+    return active_system_rules() + first_turn_rule + f"""
 
 Вы управляете одной следующей репликой по состояниям, а не по заготовленному скрипту.
 
@@ -801,12 +923,12 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 ПОСЛЕДОВАТЕЛЬНОСТЬ:
 1. Установить контекст клиента.
 2. Понять потребность и желаемое изменение.
-3. Выяснить релевантный предыдущий опыт. Для психолога — длительность проблемы или её влияние на жизнь.
+3. {previous_experience_step}
 4. Если сведений достаточно, прекратить диагностику.
-5. Для психолога после достаточных уточнений кратко связать запрос с работой на встрече и один раз спокойно сообщить о возможности первичной консультации. Не требовать решения или записи и не вставлять рекламную презентацию помощи.
+5. {service_transition} Не требовать немедленного решения или записи и не вставлять рекламную презентацию.
 6. Если консультация уже была предложена, учитывать согласие, вопросы или отказ клиента без повторного предложения.
 7. Сначала отвечать на все прямые вопросы и учитывать явно указанное предпочтение клиента, используя только сведения базы знаний. Если в одной реплике клиент одновременно согласился записаться и задал информационный или организационный вопрос, ответить только на эти вопросы: не начинать запись, не предлагать выбрать время и не направлять к календарю, форме, кнопке или ссылке.
-8. Для экспертов, продающих отдельный продукт или решение, предлагать консультацию после объяснения решения и проявленного интереса. Для психолога консультация является самой услугой и предлагается сразу после завершённого выявления потребности.
+8. {offer_order}
 
 Выберите ровно одно действие:
 explore — получить один недостающий факт;
@@ -823,7 +945,7 @@ end_dialog — попрощаться только при явном завер�
 
 Высказывание опасения, ожидания, предположения или сомнения об условиях, сроках, цене, формате или последствиях работы продолжает информационный цикл, даже если сформулировано без вопросительного знака. Для него используйте concern и ответьте по существу. Не завершайте разговор и не считайте такую реплику отказом. end означает только явно выраженное намерение клиента прекратить текущий разговор, а не паузу, сомнение или отсутствие вопросительного знака.
 
-Не считайте описание состояния отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не выдвигайте неподтверждённых гипотез, не повторяйте уже полученную информацию и заданные вопросы. Не выполняйте работу психолога в чате. Ответ — максимум 45 слов и максимум один смысловой запрос информации. Просьба рассказать, уточнить, описать, объяснить или поделиться считается вопросом даже без вопросительного знака.
+Не считайте описание состояния отказом от разговора. Не считайте простое согласие отвечать на вопросы интересом к решению. Неопределённая реакция без ясного отношения к предложенному направлению не подтверждает интерес и не означает сомнение, отказ или наличие препятствия. Не угадывайте профессию, проблему, чувства и намерения. На этапе уточнения опирайтесь на конкретный смысл слов клиента. Не выдвигайте неподтверждённых гипотез, не повторяйте уже полученную информацию и заданные вопросы. {service_boundary} Ответ — максимум 45 слов и максимум один смысловой запрос информации. Просьба рассказать, уточнить, описать, объяснить или поделиться считается вопросом даже без вопросительного знака.
 
 Для каждого наблюдения укажите точную непрерывную цитату только из ПОСЛЕДНЕГО сообщения клиента. present=true разрешено только при такой цитате.
 contact — понятен контекст жизни или ситуации клиента;
@@ -894,7 +1016,7 @@ def generate_post_booking_reply(history, text, documents):
     retrieval_query = "\n".join([row["content"] for row in history[-4:]] + [text])
     context = relevant(retrieval_query, documents, limit=7000)
     client_name = client_name_from_history(history)
-    prompt = SYSTEM_RULES + f"""
+    prompt = active_system_rules() + f"""
 
 Запись клиента уже подтверждена. Ответьте от имени эксперта только на последнее сообщение клиента.
 Если клиент задаёт организационный или информационный вопрос, дайте прямой краткий ответ по базе знаний.
@@ -1092,7 +1214,7 @@ def generate_stateful_dialog_reply(history, text, context):
             + ", ".join(fallback_missing)
             + ". Не спрашивайте о заполненных элементах."
         )
-    fallback_prompt = SYSTEM_RULES + f"""
+    fallback_prompt = active_system_rules() + f"""
 
 Структурированный контроллер уже определил следующее действие диалога: {fallback_action}.
 {fallback_action_instruction(fallback_action)}
@@ -1277,19 +1399,42 @@ gigachat=GigaChat()
 
 @app.get("/")
 def home(): return HOME_HTML
+@app.get("/marketer")
+def marketer_home(): return MARKETER_HOME_HTML
 @app.get("/health")
 def health(): return jsonify(status="ok", version=APP_VERSION)
 @app.get("/admin")
 def admin(): return ADMIN_HTML
+@app.get("/marketer/admin")
+def marketer_admin(): return MARKETER_ADMIN_HTML
 @app.get("/booking")
 def booking_page():
+    return booking_page_for("psychologist")
+
+@app.get("/marketer/booking")
+def marketer_booking_page():
+    return booking_page_for("marketer")
+
+def booking_page_for(slug):
+    g.expert_slug = slug
     booking_type = "regular" if request.args.get("type") == "regular" else "free"
+    if active_expert_profile()["single_booking_type"]:
+        booking_type = "free"
     title, duration = booking_config(booking_type)
-    return render_template_string(BOOKING_HTML, title=title, duration=duration, booking_type=booking_type)
+    template = MARKETER_BOOKING_HTML if slug == "marketer" else BOOKING_HTML
+    return render_template_string(template, title=title, duration=duration, booking_type=booking_type)
 
 @app.get("/api/history")
 def chat_history():
-    sid = session.get("sid")
+    return chat_history_for("psychologist")
+
+@app.get("/api/marketer/history")
+def marketer_chat_history():
+    return chat_history_for("marketer")
+
+def chat_history_for(slug):
+    g.expert_slug = slug
+    sid = sget("sid")
     if not sid:
         return jsonify(messages=[])
     con = db()
@@ -1298,18 +1443,28 @@ def chat_history():
         (sid,)
     ).fetchall()
     if not rows:
-        session.clear()
+        clear_profile_session()
         return jsonify(messages=[], closed=False)
-    return jsonify(messages=[{"role":x["role"], "content":x["content"]} for x in rows], closed=bool(session.get("dialog_closed")))
+    return jsonify(messages=[{"role":x["role"], "content":x["content"]} for x in rows], closed=bool(sget("dialog_closed")))
 
 @app.post("/api/booking")
 def create_booking():
+    return create_booking_for("psychologist")
+
+@app.post("/api/marketer/booking")
+def marketer_create_booking():
+    return create_booking_for("marketer")
+
+def create_booking_for(slug):
+    g.expert_slug = slug
     data = request.json or {}
     name = str(data.get("name", "")).strip()
     phone = str(data.get("phone", "")).strip()
     email = str(data.get("email", "")).strip()
     raw_start = str(data.get("start", "")).strip()
     booking_type = "regular" if data.get("booking_type") == "regular" else "free"
+    if active_expert_profile()["single_booking_type"]:
+        booking_type = "free"
     if not all((name, phone, email, raw_start)):
         return jsonify(error="Заполните дату, время, имя, телефон и email"), 400
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
@@ -1343,28 +1498,44 @@ def create_booking():
     except Exception as exc:
         app.logger.exception("Calendar booking failed")
         return jsonify(error=f"Не удалось проверить календарь: {exc}"), 502
-    confirmation = f"{title}, {start.strftime('%d.%m.%Y в %H:%M')}, {duration} минут"
-    session["last_booking"] = confirmation
-    session["dialog_closed"] = False
-    sid = session.get("sid")
+    confirmation = booking_confirmation(title, start, duration)
+    sset("last_booking", confirmation)
+    sset("dialog_closed", False)
+    sid = sget("sid")
     if sid:
         con = db()
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",f"Запись подтверждена: {confirmation}.",int(time.time()*1000)))
         con.commit()
-    return jsonify(message=f"Запись подтверждена: {start.strftime('%d.%m.%Y в %H:%M')}. Продолжительность — {duration} минут."), 201
+    if slug == "marketer":
+        message = (
+            f"Запись подтверждена: {start.strftime('%d.%m.%Y в %H:%M')}. "
+            f"Консультация обычно занимает 30–40 минут; в календаре зарезервировано {duration} минут."
+        )
+    else:
+        message = f"Запись подтверждена: {start.strftime('%d.%m.%Y в %H:%M')}. Продолжительность — {duration} минут."
+    return jsonify(message=message), 201
 @app.post("/api/chat")
 def chat():
+    return chat_for("psychologist")
+
+@app.post("/api/marketer/chat")
+def marketer_chat():
+    return chat_for("marketer")
+
+def chat_for(slug):
+    g.expert_slug = slug
     text=str((request.json or {}).get("message", "")).strip()[:3000]
     if not text: return jsonify(error="Введите сообщение"),400
-    sid=session.setdefault("sid",str(uuid.uuid4())); con=db()
-    docs=con.execute("select name,text from documents where expert_slug='psychologist'").fetchall()
+    sid=ssetdefault("sid",str(uuid.uuid4())); con=db()
+    document_slug = active_expert_profile()["document_slug"]
+    docs=con.execute("select name,text from documents where expert_slug=?", (document_slug,)).fetchall()
     if not docs: return jsonify(error="Сначала загрузите базу знаний в разделе «Настройки»"),409
     history=con.execute("select role,content from messages where session_id=? order by created_at desc limit 12",(sid,)).fetchall()[::-1]
     if not history:
-        session.clear()
-        sid=str(uuid.uuid4()); session["sid"]=sid
+        clear_profile_session()
+        sid=str(uuid.uuid4()); sset("sid",sid)
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
-    if session.get("dialog_closed"):
+    if sget("dialog_closed"):
         return jsonify(answer="", closed=True)
     context=relevant(text,docs)
     completed_answer = completed_dialog_answer(text)
@@ -1379,7 +1550,7 @@ def chat():
     if direct_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",direct_answer,int(time.time()*1000))); con.commit()
         return jsonify(answer=direct_answer)
-    if session.get("last_booking"):
+    if sget("last_booking"):
         try:
             answer = generate_post_booking_reply(history, text, docs)
         except Exception:
@@ -1392,41 +1563,70 @@ def chat():
     except Exception as exc:
         app.logger.exception("Stateful dialog generation failed")
         return jsonify(error="Не удалось получить ответ эксперта. Попробуйте отправить сообщение ещё раз."), 502
-    session["dialog_controller_state"] = dialog_state
+    sset("dialog_controller_state", dialog_state)
     if action == "end_dialog":
-        session["dialog_closed"] = True
+        sset("dialog_closed", True)
     if action == "offer_consultation":
-        session["consultation_offered"] = True
+        sset("consultation_offered", True)
     if action == "start_booking":
-        session["requested_booking_type"] = session.pop("offered_booking_type", "free")
+        sset("requested_booking_type", spop("offered_booking_type", "free"))
     con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",answer,int(time.time()*1000))); con.commit()
-    return jsonify(answer=answer, closed=bool(session.get("dialog_closed")))
+    return jsonify(answer=answer, closed=bool(sget("dialog_closed")))
 
 
 def check_admin(): return request.headers.get("X-Admin-Password")==ADMIN_PASSWORD
 @app.get("/api/admin")
 def admin_data():
+    return admin_data_for("psychologist")
+
+@app.get("/api/marketer/admin")
+def marketer_admin_data():
+    return admin_data_for("marketer")
+
+def admin_data_for(slug):
     if not check_admin(): return jsonify(error="Неверный пароль"),401
-    con=db(); return jsonify(documents=[dict(id=x["id"],name=x["name"],characters=len(x["text"])) for x in con.execute("select * from documents where expert_slug='psychologist' order by created_at desc")])
+    con=db(); return jsonify(documents=[dict(id=x["id"],name=x["name"],characters=len(x["text"])) for x in con.execute("select * from documents where expert_slug=? order by created_at desc",(slug,))])
 @app.post("/api/admin/upload")
 def upload():
+    return upload_for("psychologist")
+
+@app.post("/api/marketer/admin/upload")
+def marketer_upload():
+    return upload_for("marketer")
+
+def upload_for(slug):
     if not check_admin(): return jsonify(error="Неверный пароль"),401
     files=request.files.getlist("files"); added=[]; con=db()
     try:
         for file in files:
             text=extract(file).strip()
             if not text: raise ValueError(f"В файле {file.filename} не найден текст")
-            ident=str(uuid.uuid4()); con.execute("insert into documents(id,name,text,created_at,expert_slug) values(?,?,?,?,?)",(ident,file.filename,text,int(time.time()),"psychologist")); added.append(file.filename)
+            ident=str(uuid.uuid4()); con.execute("insert into documents(id,name,text,created_at,expert_slug) values(?,?,?,?,?)",(ident,file.filename,text,int(time.time()),slug)); added.append(file.filename)
         con.commit(); return jsonify(added=added)
     except (ValueError,json.JSONDecodeError) as e: return jsonify(error=str(e)),400
 @app.delete("/api/admin/document/<ident>")
 def delete_document(ident):
+    return delete_document_for("psychologist", ident)
+
+@app.delete("/api/marketer/admin/document/<ident>")
+def marketer_delete_document(ident):
+    return delete_document_for("marketer", ident)
+
+def delete_document_for(slug, ident):
     if not check_admin(): return jsonify(error="Неверный пароль"),401
-    con=db(); con.execute("delete from documents where id=? and expert_slug='psychologist'",(ident,)); con.commit(); return jsonify(ok=True)
+    con=db(); con.execute("delete from documents where id=? and expert_slug=?",(ident,slug)); con.commit(); return jsonify(ok=True)
 @app.post("/api/reset")
 def reset():
-    sid=session.get("sid"); con=db(); con.execute("delete from messages where session_id=?",(sid,)); con.commit()
-    session.clear()
+    return reset_for("psychologist")
+
+@app.post("/api/marketer/reset")
+def marketer_reset():
+    return reset_for("marketer")
+
+def reset_for(slug):
+    g.expert_slug = slug
+    sid=sget("sid"); con=db(); con.execute("delete from messages where session_id=?",(sid,)); con.commit()
+    clear_profile_session()
     return jsonify(ok=True)
 
 if __name__=="__main__": app.run(host="0.0.0.0",port=int(os.getenv("PORT","3000")))
