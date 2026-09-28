@@ -522,6 +522,9 @@ def controller_state(saved=None):
         "declined": bool(saved.get("declined")),
         "diagnostic_questions": max(0, min(3, int(saved.get("diagnostic_questions", 0) or 0))),
         "asked_questions": list(saved.get("asked_questions") or [])[-3:],
+        "pending_question_target": saved.get("pending_question_target")
+        if saved.get("pending_question_target") in {"contact", "need", "previous_experience", "desired_result"}
+        else "none",
     }
 
 def parse_controller_payload(raw):
@@ -575,6 +578,17 @@ def apply_grounded_observations(state, observations, text):
             updated[field] = True
     return updated
 
+def apply_pending_answer(state, text, intent):
+    updated = dict(state)
+    target = updated.get("pending_question_target", "none")
+    if target == "none":
+        return updated
+    words = normalized_words(text)
+    if intent == "continue" and len(words) >= 3 and semantic_information_request_count(text) == 0:
+        updated[target] = True
+    updated["pending_question_target"] = "none"
+    return updated
+
 def is_booking_schedule_request(text):
     low = str(text or "").lower()
     return bool(re.search(
@@ -625,7 +639,7 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "explain_solution"
     if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
-    return "offer_consultation"
+    return "offer_consultation" if active_expert_profile()["consultation_is_service"] else "explain_solution"
 
 def question_from_reply(reply):
     parts = re.findall(r"[^?]*\?", reply)
@@ -868,6 +882,8 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("интерес подменён записью")
     if action == "offer_consultation" and substantially_repeats_client_message(reply, client_text):
         issues.append("дословно пересказан ответ клиента")
+    if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
+        issues.append("вместо предложения консультации продолжена диагностика")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         issues.append("маркер записи появился не на том этапе")
     if re.search(r"\b(психолог|специалист|эксперт) (?:поможет|сможет|проводит)\b", low):
@@ -910,6 +926,7 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
         service_transition = "Для психолога после достаточных уточнений кратко связать запрос с работой на встрече и один раз спокойно сообщить о возможности первичной консультации."
         offer_order = "Для экспертов, продающих отдельный продукт или решение, предлагать консультацию после объяснения решения и проявленного интереса. Для психолога консультация является самой услугой и предлагается сразу после завершённого выявления потребности."
         service_boundary = "Не выполняйте работу психолога в чате."
+        explain_action_description = "объяснить пользу встречи без вопроса и без записи"
     else:
         previous_experience_step = "Выяснить релевантный предыдущий опыт: как клиент решает рабочую задачу сейчас, какие инструменты или нейросети уже пробовал и что его не устраивает. Не исследовать профессиональную методику клиента и не требовать частных примеров, если затруднение уже понятно."
         service_transition = "После достаточных уточнений объяснить подходящее направление решения, которое действительно есть в базе знаний. Не выдавать возможное направление за готовый продукт. Проверить интерес именно к этому направлению и только после проявленного интереса один раз сообщить о консультации."
@@ -918,6 +935,11 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
             "Сохраняйте роль специалиста по нейросетям: профессия клиента не становится профессией эксперта. "
             "Не проводите отраслевую консультацию клиента, не создавайте материалы и не разрабатывайте "
             "AI-решение внутри чата. Направление решения берите только из базы знаний."
+        )
+        explain_action_description = (
+            "назвать подходящий тип ИИ-продукта или услуги, который прямо есть в базе знаний, "
+            "и объяснить связь с задачей клиента без вопроса и без предложения консультации. "
+            "Если база различает готовое решение и разработку под заказ, сохранить это различие"
         )
     return active_system_rules() + first_turn_rule + f"""
 
@@ -939,7 +961,7 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 
 Выберите ровно одно действие:
 explore — получить один недостающий факт;
-explain_solution — объяснить пользу встречи без вопроса и без записи;
+explain_solution — {explain_action_description};
 check_interest — проверить интерес без записи;
 offer_consultation — один раз сообщить о возможности встречи без давления и требования записаться;
 start_booking — после уже сделанного предложения передать явное согласие клиента или его просьбу начать запись календарному механизму;
@@ -1071,6 +1093,12 @@ def generate_post_booking_reply(history, text, documents):
     raise RuntimeError("Models did not return a usable post-booking reply")
 
 def fallback_action_instruction(action):
+    if action == "explain_solution" and not active_expert_profile()["consultation_is_service"]:
+        return (
+            "Без вопроса назовите подходящий реальный ИИ-продукт или услугу из базы знаний и кратко "
+            "объясните связь с уже понятной задачей клиента. Не описывайте пользу встречи, не предлагайте "
+            "консультацию и не придумывайте функции решения."
+        )
     return {
         "explore": "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации. Не завершайте разговор и не предлагайте встречу.",
         "explain_solution": "Без вопроса кратко объясните от первого лица, чем встреча с вами может быть полезна в описанной ситуации. Не проводите консультацию в чате и не предлагайте запись.",
@@ -1158,6 +1186,7 @@ def generate_stateful_dialog_reply(history, text, context):
             )
             continue
         state = apply_grounded_observations(working_state, payload["observations"], text)
+        state = apply_pending_answer(state, text, payload["intent"])
         working_state = state
         expected = expected_dialog_action(
             state,
@@ -1193,6 +1222,7 @@ def generate_stateful_dialog_reply(history, text, context):
                 state,
                 expected,
                 payload["reply"],
+                payload.get("question_target", "none"),
             )
         app.logger.warning(
             "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=validation issues=%s",
@@ -1216,7 +1246,9 @@ def generate_stateful_dialog_reply(history, text, context):
         if not working_state.get(field)
     ]
     fallback_missing_rule = ""
+    fallback_question_target = "none"
     if fallback_action == "explore":
+        fallback_question_target = fallback_missing[0] if fallback_missing else "none"
         fallback_missing_rule = (
             "\nЗадайте вопрос только об одном из этих недостающих элементов: "
             + ", ".join(fallback_missing)
@@ -1271,7 +1303,7 @@ def generate_stateful_dialog_reply(history, text, context):
                 fallback_action,
             )
             return reply, fallback_action, advance_dialog_state(
-                working_state, fallback_action, reply
+                working_state, fallback_action, reply, fallback_question_target
             )
         app.logger.warning(
             "Dynamic dialog fallback rejected model=%s elapsed_ms=%s action=%s",
@@ -1288,13 +1320,14 @@ def generate_stateful_dialog_reply(history, text, context):
         raise last_error
     raise RuntimeError("Models did not return a valid dialog reply")
 
-def advance_dialog_state(state, action, reply):
+def advance_dialog_state(state, action, reply, question_target="none"):
     updated = dict(state)
     if action == "explore":
         question = question_from_reply(reply)
         if question:
             updated["diagnostic_questions"] = min(3, updated["diagnostic_questions"] + 1)
             updated["asked_questions"] = (updated["asked_questions"] + [question])[-3:]
+            updated["pending_question_target"] = question_target
     elif action == "explain_solution":
         updated["solution_explained"] = True
     elif action == "offer_consultation":
@@ -1545,7 +1578,10 @@ def chat_for(slug):
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
     if sget("dialog_closed"):
         return jsonify(answer="", closed=True)
-    context=relevant(text,docs)
+    retrieval_query = "\n".join(
+        [row["content"] for row in history[-6:]] + [text]
+    )
+    context=relevant(retrieval_query,docs)
     completed_answer = completed_dialog_answer(text)
     if completed_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",completed_answer,int(time.time()*1000))); con.commit()

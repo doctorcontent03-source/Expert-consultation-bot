@@ -1139,6 +1139,44 @@ class TestBot(unittest.TestCase):
         self.assertIn("Не запрашивайте частный пример", prompt)
         self.assertNotIn("Для маркетолога сначала объяснить", prompt)
 
+    def test_marketer_stops_diagnosis_after_three_questions_and_explains_solution(self):
+        state = self.state(need=True, diagnostic_questions=3)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            self.assertEqual(
+                target.expected_dialog_action(state, "continue", "", "Хочу быстрее готовиться"),
+                "explain_solution",
+            )
+
+    def test_substantive_answer_completes_pending_dialog_target(self):
+        state = self.state(need=True)
+        state["pending_question_target"] = "previous_experience"
+        updated = target.apply_pending_answer(
+            state,
+            "Пытаюсь создавать упражнения в нейросетях, но результат приходится переделывать.",
+            "continue",
+        )
+        self.assertTrue(updated["previous_experience"])
+        self.assertEqual(updated["pending_question_target"], "none")
+
+    def test_marketer_offer_cannot_be_another_diagnostic_question(self):
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            issues = target.controller_reply_issues(
+                {
+                    "reply": "Насколько глубоко вы изучали этот подход?",
+                    "action": "offer_consultation",
+                    "question_target": "none",
+                    "conversation_effect": "continue",
+                },
+                "offer_consultation",
+                state,
+                [],
+                client_text="Хочу освободить время",
+            )
+        self.assertIn("вместо предложения консультации продолжена диагностика", issues)
+
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
             target.g.expert_slug = "marketer"
