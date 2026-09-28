@@ -27,6 +27,7 @@ EXPERT_PROFILES = {
     },
     "marketer": {
         "document_slug": "marketer",
+        "expert_role": "специалист по нейросетям и ИИ-решениям",
         "greeting": "Здравствуйте! Расскажите немного о себе: чем вы занимаетесь и с кем работаете?",
         "previous_experience": "как клиент решает задачу сейчас, что уже пробовал и что его не устраивает",
         "consultation_is_service": False,
@@ -87,8 +88,13 @@ MARKETER_SYSTEM_RULES = SYSTEM_RULES.replace(
     "За 2–3 вопроса выясните суть задачи, прежние попытки или текущий способ работы и желаемое изменение. Как только запрос в целом понятен, прекратите расспросы, объясните подходящее реальное направление из базы знаний и проверьте интерес к нему. Только после проявленного интереса один раз спокойно обозначьте возможность консультации без требования немедленно записаться.",
 ).replace(
     "Не проводите консультацию внутри чата: не интерпретируйте причины состояния, не анализируйте личность и цели, не предлагайте упражнения, техники, способы лечения или последовательность изменений. Задача чата — понять общий запрос, дать информацию о работе эксперта и привести к записи. Содержательный разбор проводит живой эксперт на встрече.",
-    "Не выполняйте работу маркетолога внутри чата: не проводите аудит, не разрабатывайте стратегию, позиционирование, контент-план, воронку, тексты или AI-решение. Задача чата — понять общий запрос, объяснить подходящее направление из базы знаний и при явной готовности клиента привести к записи. Содержательный разбор и создание результата происходят после предварительного разговора.",
-)
+    "Не выполняйте предметную работу клиента внутри чата и не изображайте специалиста из его профессиональной сферы. Не проводите аудит, не разрабатывайте стратегию, позиционирование, контент-план, воронку, тексты, учебные материалы или AI-решение. Задача чата — понять общий рабочий запрос, объяснить подходящее направление из базы знаний и при явной готовности клиента привести к записи. Содержательный разбор и создание результата происходят после предварительного разговора.",
+) + """
+Вы говорите от имени специалиста по нейросетям и ИИ-решениям. Профессия клиента описывает только контекст его задачи и никогда не меняет вашу роль. Не называйте себя методистом, преподавателем, психологом или другим отраслевым специалистом клиента и не приписывайте себе его профессиональные услуги.
+Выясняйте только те сведения, которые нужны, чтобы связать рабочую задачу с реальным ИИ-продуктом или услугой из базы знаний. Не углубляйтесь в методику, содержание работы клиента или отдельные примеры, если общий рабочий процесс и затруднение уже понятны.
+Не придумывайте продукты, методики, материалы, функции и способы работы. Объясняя направление решения, отделяйте готовый продукт от услуги разработки или настройки и опирайтесь только на то, что прямо подтверждено базой знаний.
+Если клиент спрашивает о вашей профессии, специализации или о том, какое именно решение вы предлагаете, сначала прямо ответьте на этот вопрос в пределах сведений базы. Не защищайте ошибочную роль и не расширяйте свою специализацию вслед за вопросом клиента.
+"""
 
 def active_system_rules():
     return MARKETER_SYSTEM_RULES if active_expert_slug() == "marketer" else SYSTEM_RULES
@@ -113,6 +119,18 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "none", "contact", "need", "previous_experience", "desired_result",
             ]},
             "conversation_effect": {"type": "string", "enum": ["continue", "close"]},
+            "proposed_solution": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": [
+                        "none", "ready_product", "adaptation", "custom_development", "consultation"
+                    ]},
+                    "name": {"type": "string"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["type", "name", "evidence"],
+                "additionalProperties": False,
+            },
             "observations": {
                 "type": "object",
                 "properties": {
@@ -131,7 +149,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "additionalProperties": False,
             },
         },
-        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "conversation_effect", "observations"],
+        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "conversation_effect", "proposed_solution", "observations"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -516,6 +534,11 @@ def controller_state(saved=None):
         "declined": bool(saved.get("declined")),
         "diagnostic_questions": max(0, min(3, int(saved.get("diagnostic_questions", 0) or 0))),
         "asked_questions": list(saved.get("asked_questions") or [])[-3:],
+        "pending_question_target": saved.get("pending_question_target")
+        if saved.get("pending_question_target") in {"contact", "need", "previous_experience", "desired_result"}
+        else "none",
+        "solution_type": saved.get("solution_type", "none"),
+        "solution_name": str(saved.get("solution_name", "") or ""),
     }
 
 def parse_controller_payload(raw):
@@ -532,6 +555,7 @@ def parse_controller_payload(raw):
     evidence = data.get("intent_evidence", "")
     question_target = data.get("question_target", "none")
     conversation_effect = data.get("conversation_effect", "continue")
+    proposed_solution = data.get("proposed_solution")
     observations = data.get("observations")
     assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
@@ -544,6 +568,12 @@ def parse_controller_payload(raw):
         return None
     if conversation_effect not in {"continue", "close"}:
         return None
+    if not isinstance(proposed_solution, dict):
+        return None
+    if proposed_solution.get("type") not in {"none", "ready_product", "adaptation", "custom_development", "consultation"}:
+        return None
+    if not isinstance(proposed_solution.get("name"), str) or not isinstance(proposed_solution.get("evidence"), str):
+        return None
     if not isinstance(observations, dict):
         return None
     if not isinstance(assessment, dict):
@@ -555,6 +585,7 @@ def parse_controller_payload(raw):
         "intent_evidence": str(evidence or "").strip(),
         "question_target": question_target,
         "conversation_effect": conversation_effect,
+        "proposed_solution": proposed_solution,
         "observations": observations,
         "reply_assessment": assessment,
     }
@@ -567,6 +598,17 @@ def apply_grounded_observations(state, observations, text):
             continue
         if item.get("present") is True and grounded_in_current_message(item.get("evidence", ""), text):
             updated[field] = True
+    return updated
+
+def apply_pending_answer(state, text, intent):
+    updated = dict(state)
+    target = updated.get("pending_question_target", "none")
+    if target == "none":
+        return updated
+    words = normalized_words(text)
+    if intent == "continue" and len(words) >= 3 and semantic_information_request_count(text) == 0:
+        updated[target] = True
+    updated["pending_question_target"] = "none"
     return updated
 
 def is_booking_schedule_request(text):
@@ -619,7 +661,7 @@ def expected_dialog_action(state, intent, intent_evidence, text, first_client_tu
         return "explain_solution"
     if not required_complete and state["diagnostic_questions"] < 3:
         return "explore"
-    return "offer_consultation"
+    return "offer_consultation" if active_expert_profile()["consultation_is_service"] else "explain_solution"
 
 def question_from_reply(reply):
     parts = re.findall(r"[^?]*\?", reply)
@@ -808,7 +850,7 @@ def normalize_reply_for_action(reply, action):
     cleaned = cleaned.replace("[[BOOK_FREE]]", "").replace("[[BOOK_REGULAR]]", "")
     return re.sub(r"\s+", " ", cleaned).strip()
 
-def controller_reply_issues(payload, expected_action, state, history, first_client_turn=False, client_text=""):
+def controller_reply_issues(payload, expected_action, state, history, first_client_turn=False, client_text="", context=""):
     reply = payload["reply"]
     low = reply.lower()
     action = payload["action"]
@@ -862,6 +904,24 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         issues.append("интерес подменён записью")
     if action == "offer_consultation" and substantially_repeats_client_message(reply, client_text):
         issues.append("дословно пересказан ответ клиента")
+    if action == "offer_consultation" and not re.search(r"(консультац|встреч)", low):
+        issues.append("вместо предложения консультации продолжена диагностика")
+    if active_expert_slug() == "marketer" and action == "explain_solution":
+        solution = payload.get("proposed_solution") or {}
+        solution_type = solution.get("type")
+        solution_name = str(solution.get("name") or "").strip()
+        solution_evidence = str(solution.get("evidence") or "").strip()
+        if solution_type not in {"ready_product", "adaptation", "custom_development"}:
+            issues.append("не выбран продукт или услуга специалиста по нейросетям")
+        if not solution_name:
+            issues.append("не названо предлагаемое ИИ-решение")
+        if not grounded_in_current_message(solution_evidence, context):
+            issues.append("предлагаемое решение не подтверждено базой знаний")
+        name_words = set(normalized_words(solution_name))
+        reply_words = set(normalized_words(reply))
+        meaningful_name_words = {word for word in name_words if len(word) >= 4}
+        if meaningful_name_words and not meaningful_name_words.intersection(reply_words):
+            issues.append("в реплике не названо выбранное ИИ-решение")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         issues.append("маркер записи появился не на том этапе")
     if re.search(r"\b(психолог|специалист|эксперт) (?:поможет|сможет|проводит)\b", low):
@@ -904,13 +964,20 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
         service_transition = "Для психолога после достаточных уточнений кратко связать запрос с работой на встрече и один раз спокойно сообщить о возможности первичной консультации."
         offer_order = "Для экспертов, продающих отдельный продукт или решение, предлагать консультацию после объяснения решения и проявленного интереса. Для психолога консультация является самой услугой и предлагается сразу после завершённого выявления потребности."
         service_boundary = "Не выполняйте работу психолога в чате."
+        explain_action_description = "объяснить пользу встречи без вопроса и без записи"
     else:
-        previous_experience_step = "Выяснить релевантный предыдущий опыт: как клиент решает задачу сейчас, что уже пробовал и что его не устраивает."
+        previous_experience_step = "Выяснить релевантный предыдущий опыт: как клиент решает рабочую задачу сейчас, какие инструменты или нейросети уже пробовал и что его не устраивает. Не исследовать профессиональную методику клиента и не требовать частных примеров, если затруднение уже понятно."
         service_transition = "После достаточных уточнений объяснить подходящее направление решения, которое действительно есть в базе знаний. Не выдавать возможное направление за готовый продукт. Проверить интерес именно к этому направлению и только после проявленного интереса один раз сообщить о консультации."
-        offer_order = "Для маркетолога сначала объяснить подходящее направление, затем проверить интерес и только после проявленного интереса предложить консультацию."
+        offer_order = "Для специалиста по нейросетям сначала объяснить подтверждённое базой направление ИИ-решения, затем проверить интерес и только после проявленного интереса предложить консультацию."
         service_boundary = (
-            "Не проводите аудит, не разрабатывайте стратегию, позиционирование, контент-план, воронку, "
-            "тексты или AI-решение внутри чата."
+            "Сохраняйте роль специалиста по нейросетям: профессия клиента не становится профессией эксперта. "
+            "Не проводите отраслевую консультацию клиента, не создавайте материалы и не разрабатывайте "
+            "AI-решение внутри чата. Направление решения берите только из базы знаний."
+        )
+        explain_action_description = (
+            "назвать подходящий тип ИИ-продукта или услуги, который прямо есть в базе знаний, "
+            "и объяснить связь с задачей клиента без вопроса и без предложения консультации. "
+            "Если база различает готовое решение и разработку под заказ, сохранить это различие"
         )
     return active_system_rules() + first_turn_rule + f"""
 
@@ -930,9 +997,14 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 7. Сначала отвечать на все прямые вопросы и учитывать явно указанное предпочтение клиента, используя только сведения базы знаний. Если в одной реплике клиент одновременно согласился записаться и задал информационный или организационный вопрос, ответить только на эти вопросы: не начинать запись, не предлагать выбрать время и не направлять к календарю, форме, кнопке или ссылке.
 8. {offer_order}
 
+Разделяйте две сущности:
+- желаемый результат клиента — то, что клиент хочет получить в своей работе;
+- предложение эксперта — конкретный ИИ-продукт или услуга из базы знаний, с помощью которых клиент сможет работать над этим результатом.
+Никогда не превращайте желаемый результат клиента в специализацию или услугу эксперта. Если клиент хочет курс, книгу, материалы, стратегию или иной конечный результат, это не означает, что эксперт сам разрабатывает этот результат. Эксперт предлагает только подтверждённый базой ИИ-инструмент, его адаптацию или разработку ИИ-решения.
+
 Выберите ровно одно действие:
 explore — получить один недостающий факт;
-explain_solution — объяснить пользу встречи без вопроса и без записи;
+explain_solution — {explain_action_description};
 check_interest — проверить интерес без записи;
 offer_consultation — один раз сообщить о возможности встречи без давления и требования записаться;
 start_booking — после уже сделанного предложения передать явное согласие клиента или его просьбу начать запись календарному механизму;
@@ -953,6 +1025,8 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 question_target — элемент состояния, который выясняет вопрос в reply. Для explore выберите ровно один элемент из НЕДОСТАЮЩИХ ЭЛЕМЕНТОВ. Для остальных действий укажите none. Нельзя снова выяснять элемент, который уже отмечен true.
+Для профиля специалиста по нейросетям previous_experience относится к способу выполнения задачи и уже опробованным инструментам, а не к профессиональной методике клиента. desired_result относится к изменению рабочего процесса или результата. Не запрашивайте частный пример, если из сообщения уже понятна общая проблема.
+proposed_solution — предложение эксперта, а не желаемый результат клиента. Для explain_solution в профиле специалиста по нейросетям выберите ready_product, adaptation или custom_development, назовите решение и приведите в evidence точную непрерывную цитату из базы знаний, которая подтверждает его существование. Для остальных действий используйте none, кроме психолога, где consultation допустима. Не утверждайте, что эксперт сам создаёт конечный профессиональный результат клиента.
 conversation_effect — фактическая функция готовой реплики: continue, если она оставляет текущий разговор открытым; close, если прощается или завершает его. Для explore, explain_solution, check_interest, offer_consultation, start_booking, answer_information, repair_interpretation и repair_contact допустимо только continue.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
 concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
@@ -961,7 +1035,7 @@ decline означает, что клиент отклоняет последн�
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","conversation_effect":"continue|close","observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","conversation_effect":"continue|close","proposed_solution":{{"type":"none|ready_product|adaptation|custom_development|consultation","name":"","evidence":""}},"observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -1063,6 +1137,12 @@ def generate_post_booking_reply(history, text, documents):
     raise RuntimeError("Models did not return a usable post-booking reply")
 
 def fallback_action_instruction(action):
+    if action == "explain_solution" and not active_expert_profile()["consultation_is_service"]:
+        return (
+            "Без вопроса назовите подходящий реальный ИИ-продукт или услугу из базы знаний и кратко "
+            "объясните связь с уже понятной задачей клиента. Не описывайте пользу встречи, не предлагайте "
+            "консультацию и не придумывайте функции решения."
+        )
     return {
         "explore": "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации. Не завершайте разговор и не предлагайте встречу.",
         "explain_solution": "Без вопроса кратко объясните от первого лица, чем встреча с вами может быть полезна в описанной ситуации. Не проводите консультацию в чате и не предлагайте запись.",
@@ -1150,6 +1230,7 @@ def generate_stateful_dialog_reply(history, text, context):
             )
             continue
         state = apply_grounded_observations(working_state, payload["observations"], text)
+        state = apply_pending_answer(state, text, payload["intent"])
         working_state = state
         expected = expected_dialog_action(
             state,
@@ -1170,6 +1251,7 @@ def generate_stateful_dialog_reply(history, text, context):
             history,
             first_client_turn,
             text,
+            context,
         )
         if not issues:
             app.logger.warning(
@@ -1185,6 +1267,8 @@ def generate_stateful_dialog_reply(history, text, context):
                 state,
                 expected,
                 payload["reply"],
+                payload.get("question_target", "none"),
+                payload.get("proposed_solution"),
             )
         app.logger.warning(
             "Dialog model attempt rejected model=%s attempt=%s elapsed_ms=%s prompt_chars=%s reason=validation issues=%s",
@@ -1208,7 +1292,9 @@ def generate_stateful_dialog_reply(history, text, context):
         if not working_state.get(field)
     ]
     fallback_missing_rule = ""
+    fallback_question_target = "none"
     if fallback_action == "explore":
+        fallback_question_target = fallback_missing[0] if fallback_missing else "none"
         fallback_missing_rule = (
             "\nЗадайте вопрос только об одном из этих недостающих элементов: "
             + ", ".join(fallback_missing)
@@ -1263,7 +1349,7 @@ def generate_stateful_dialog_reply(history, text, context):
                 fallback_action,
             )
             return reply, fallback_action, advance_dialog_state(
-                working_state, fallback_action, reply
+                working_state, fallback_action, reply, fallback_question_target
             )
         app.logger.warning(
             "Dynamic dialog fallback rejected model=%s elapsed_ms=%s action=%s",
@@ -1280,15 +1366,19 @@ def generate_stateful_dialog_reply(history, text, context):
         raise last_error
     raise RuntimeError("Models did not return a valid dialog reply")
 
-def advance_dialog_state(state, action, reply):
+def advance_dialog_state(state, action, reply, question_target="none", proposed_solution=None):
     updated = dict(state)
     if action == "explore":
         question = question_from_reply(reply)
         if question:
             updated["diagnostic_questions"] = min(3, updated["diagnostic_questions"] + 1)
             updated["asked_questions"] = (updated["asked_questions"] + [question])[-3:]
+            updated["pending_question_target"] = question_target
     elif action == "explain_solution":
         updated["solution_explained"] = True
+        solution = proposed_solution or {}
+        updated["solution_type"] = solution.get("type", "none")
+        updated["solution_name"] = str(solution.get("name", "") or "")
     elif action == "offer_consultation":
         updated["consultation_offered"] = True
     elif action == "respect_decline":
@@ -1537,7 +1627,10 @@ def chat_for(slug):
     con.execute("insert into messages values(?,?,?,?)",(sid,"user",text,int(time.time()*1000))); con.commit()
     if sget("dialog_closed"):
         return jsonify(answer="", closed=True)
-    context=relevant(text,docs)
+    retrieval_query = "\n".join(
+        [row["content"] for row in history[-6:]] + [text]
+    )
+    context=relevant(retrieval_query,docs)
     completed_answer = completed_dialog_answer(text)
     if completed_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",completed_answer,int(time.time()*1000))); con.commit()

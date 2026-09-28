@@ -52,6 +52,11 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
         "intent_evidence": evidence,
         "question_target": question_target or ("need" if action == "explore" else "none"),
         "conversation_effect": conversation_effect,
+        "proposed_solution": {
+            "type": "consultation" if action == "offer_consultation" else "none",
+            "name": "консультация" if action == "offer_consultation" else "",
+            "evidence": "",
+        },
         "observations": fields,
         "reply_assessment": {
             "based_on_client_meaning": True,
@@ -1119,6 +1124,96 @@ class TestBot(unittest.TestCase):
                 target.expected_dialog_action(state, "interest", text, text),
                 "offer_consultation",
             )
+
+    def test_marketer_prompt_keeps_ai_expert_role(self):
+        state = self.state(need=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            prompt = target.controller_prompt(
+                state,
+                "Екатерина создаёт персональных AI-ассистентов и готовые решения для экспертов.",
+                [
+                    {"role": "user", "content": "Я репетитор английского."},
+                    {"role": "assistant", "content": "Что в работе хотелось бы изменить?"},
+                ],
+                "Долго готовлю материалы к урокам.",
+            )
+        self.assertIn("специалиста по нейросетям и ИИ-решениям", prompt)
+        self.assertIn("Профессия клиента описывает только контекст", prompt)
+        self.assertIn("не становится профессией эксперта", prompt)
+        self.assertIn("Не запрашивайте частный пример", prompt)
+        self.assertNotIn("Для маркетолога сначала объяснить", prompt)
+
+    def test_marketer_stops_diagnosis_after_three_questions_and_explains_solution(self):
+        state = self.state(need=True, diagnostic_questions=3)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            self.assertEqual(
+                target.expected_dialog_action(state, "continue", "", "Хочу быстрее готовиться"),
+                "explain_solution",
+            )
+
+    def test_substantive_answer_completes_pending_dialog_target(self):
+        state = self.state(need=True)
+        state["pending_question_target"] = "previous_experience"
+        updated = target.apply_pending_answer(
+            state,
+            "Пытаюсь создавать упражнения в нейросетях, но результат приходится переделывать.",
+            "continue",
+        )
+        self.assertTrue(updated["previous_experience"])
+        self.assertEqual(updated["pending_question_target"], "none")
+
+    def test_marketer_offer_cannot_be_another_diagnostic_question(self):
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            issues = target.controller_reply_issues(
+                {
+                    "reply": "Насколько глубоко вы изучали этот подход?",
+                    "action": "offer_consultation",
+                    "question_target": "none",
+                    "conversation_effect": "continue",
+                },
+                "offer_consultation",
+                state,
+                [],
+                client_text="Хочу освободить время",
+            )
+        self.assertIn("вместо предложения консультации продолжена диагностика", issues)
+
+    def test_marketer_solution_must_be_kb_grounded_ai_offer(self):
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        context = "Готовый ассистент-методист помогает создавать нестандартные курсы. Возможна разработка персонального AI-ассистента под задачу клиента."
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            valid = {
+                "reply": "Для вашей задачи подойдёт готовый ассистент-методист для нестандартных курсов.",
+                "action": "explain_solution",
+                "question_target": "none",
+                "conversation_effect": "continue",
+                "proposed_solution": {
+                    "type": "ready_product",
+                    "name": "ассистент-методист для нестандартных курсов",
+                    "evidence": "Готовый ассистент-методист помогает создавать нестандартные курсы",
+                },
+            }
+            self.assertEqual(
+                target.controller_reply_issues(valid, "explain_solution", state, [], context=context),
+                [],
+            )
+            invalid = dict(valid)
+            invalid["reply"] = "Я специализируюсь на разработке учебных курсов."
+            invalid["proposed_solution"] = {
+                "type": "none",
+                "name": "",
+                "evidence": "",
+            }
+            issues = target.controller_reply_issues(
+                invalid, "explain_solution", state, [], context=context
+            )
+        self.assertIn("не выбран продукт или услуга специалиста по нейросетям", issues)
+        self.assertIn("предлагаемое решение не подтверждено базой знаний", issues)
 
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
