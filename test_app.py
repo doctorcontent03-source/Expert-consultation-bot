@@ -1120,6 +1120,25 @@ class TestBot(unittest.TestCase):
                 "offer_consultation",
             )
 
+    def test_marketer_prompt_keeps_ai_expert_role(self):
+        state = self.state(need=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            prompt = target.controller_prompt(
+                state,
+                "Екатерина создаёт персональных AI-ассистентов и готовые решения для экспертов.",
+                [
+                    {"role": "user", "content": "Я репетитор английского."},
+                    {"role": "assistant", "content": "Что в работе хотелось бы изменить?"},
+                ],
+                "Долго готовлю материалы к урокам.",
+            )
+        self.assertIn("специалиста по нейросетям и ИИ-решениям", prompt)
+        self.assertIn("Профессия клиента описывает только контекст", prompt)
+        self.assertIn("не становится профессией эксперта", prompt)
+        self.assertIn("Не запрашивайте частный пример", prompt)
+        self.assertNotIn("Для маркетолога сначала объяснить", prompt)
+
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
             target.g.expert_slug = "marketer"
