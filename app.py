@@ -134,6 +134,17 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "required": ["type", "name", "evidence"],
                 "additionalProperties": False,
             },
+            "answer_grounding": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "enum": [
+                        "none", "knowledge_base", "dialogue", "unavailable"
+                    ]},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["source", "evidence"],
+                "additionalProperties": False,
+            },
             "observations": {
                 "type": "object",
                 "properties": {
@@ -152,7 +163,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "additionalProperties": False,
             },
         },
-        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "question_scope", "conversation_effect", "proposed_solution", "observations"],
+        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "question_scope", "conversation_effect", "proposed_solution", "answer_grounding", "observations"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -560,6 +571,7 @@ def parse_controller_payload(raw):
     question_scope = data.get("question_scope", "none")
     conversation_effect = data.get("conversation_effect", "continue")
     proposed_solution = data.get("proposed_solution")
+    answer_grounding = data.get("answer_grounding")
     observations = data.get("observations")
     assessment = data.get("reply_assessment")
     if not isinstance(reply, str) or not reply.strip():
@@ -580,6 +592,12 @@ def parse_controller_payload(raw):
         return None
     if not isinstance(proposed_solution.get("name"), str) or not isinstance(proposed_solution.get("evidence"), str):
         return None
+    if not isinstance(answer_grounding, dict):
+        return None
+    if answer_grounding.get("source") not in {"none", "knowledge_base", "dialogue", "unavailable"}:
+        return None
+    if not isinstance(answer_grounding.get("evidence"), str):
+        return None
     if not isinstance(observations, dict):
         return None
     if not isinstance(assessment, dict):
@@ -593,6 +611,7 @@ def parse_controller_payload(raw):
         "question_scope": question_scope,
         "conversation_effect": conversation_effect,
         "proposed_solution": proposed_solution,
+        "answer_grounding": answer_grounding,
         "observations": observations,
         "reply_assessment": assessment,
     }
@@ -934,6 +953,22 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         meaningful_name_words = {word for word in name_words if len(word) >= 4}
         if meaningful_name_words and not meaningful_name_words.intersection(reply_words):
             issues.append("в реплике не названо выбранное ИИ-решение")
+    if active_expert_slug() == "marketer" and action == "answer_information":
+        grounding = payload.get("answer_grounding") or {}
+        source = grounding.get("source", "none")
+        evidence = str(grounding.get("evidence") or "").strip()
+        dialogue_source = "\n".join(
+            [str(row.get("content", "")) for row in history if row.get("role") == "user"]
+            + [client_text]
+        )
+        if source == "none":
+            issues.append("информационный ответ не имеет указанного источника")
+        elif source == "knowledge_base" and not grounded_in_current_message(evidence, context):
+            issues.append("информационный ответ не подтверждён базой знаний")
+        elif source == "dialogue" and not grounded_in_current_message(evidence, dialogue_source):
+            issues.append("информационный ответ не подтверждён словами клиента")
+        elif source == "unavailable" and evidence:
+            issues.append("для отсутствующих сведений указано несуществующее доказательство")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
         issues.append("маркер записи появился не на том этапе")
     if re.search(r"\b(психолог|специалист|эксперт) (?:поможет|сможет|проводит)\b", low):
@@ -1044,6 +1079,7 @@ question_target — элемент состояния, который выясн
 question_scope — смысловая область вопроса. work_process означает организацию работы клиента, затраты времени, повторяющиеся операции, используемые инструменты и желаемое изменение процесса. client_domain означает содержание профессии клиента: обучение его учеников, лечение пациентов, методику, предметные материалы и профессиональные решения. Для любого explore в профиле специалиста по нейросетям допустим только work_process. Для действий без вопроса используйте none.
 Для профиля специалиста по нейросетям previous_experience относится к способу выполнения задачи и уже опробованным инструментам, а не к профессиональной методике клиента. desired_result относится к изменению рабочего процесса или результата. Не запрашивайте частный пример, если из сообщения уже понятна общая проблема.
 proposed_solution — предложение эксперта, а не желаемый результат клиента. Для explain_solution в профиле специалиста по нейросетям выберите ready_product, adaptation или custom_development, назовите решение и приведите в evidence точную непрерывную цитату из базы знаний, которая подтверждает его существование. Для остальных действий используйте none, кроме психолога, где consultation допустима. Не утверждайте, что эксперт сам создаёт конечный профессиональный результат клиента.
+answer_grounding — источник информационного ответа. Для answer_information укажите knowledge_base и точную непрерывную цитату из базы либо dialogue и точную цитату из слов клиента. Если нужного факта нет, используйте unavailable, оставьте evidence пустым и прямо скажите, что в базе это не указано. Не делайте выводов о платформе, подписке, цене, составе, функциях, формате или условиях продукта без прямого подтверждения. Для остальных действий используйте none.
 conversation_effect — фактическая функция готовой реплики: continue, если она оставляет текущий разговор открытым; close, если прощается или завершает его. Для explore, explain_solution, check_interest, offer_consultation, start_booking, answer_information, repair_interpretation и repair_contact допустимо только continue.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
 concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
@@ -1053,7 +1089,7 @@ rupture означает, что клиент сообщает не новый �
 Если клиент сообщает, что не понял заданный вопрос, считает его странным или сомневается, относится ли он к специализации эксперта, это обратная связь о ходе беседы, а не ответ по существу. Используйте rupture и repair_contact; не переформулируйте тот же диагностический вопрос и не задавайте новый в этой реплике.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","question_scope":"none|work_process|client_domain|personal_situation","conversation_effect":"continue|close","proposed_solution":{{"type":"none|ready_product|adaptation|custom_development|consultation","name":"","evidence":""}},"observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","question_scope":"none|work_process|client_domain|personal_situation","conversation_effect":"continue|close","proposed_solution":{{"type":"none|ready_product|adaptation|custom_development|consultation","name":"","evidence":""}},"answer_grounding":{{"source":"none|knowledge_base|dialogue|unavailable","evidence":""}},"observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -1207,6 +1243,49 @@ def fallback_reply_is_usable(reply, action, state, history, first_client_turn=Fa
         return False
     return True
 
+def grounded_information_fallback(history, text, context, models):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    prompt = active_system_rules() + f"""
+
+Ответьте только на последний информационный вопрос клиента от имени эксперта.
+Каждый факт о продукте, платформе, подписке, цене, составе, функциях, формате или условиях должен прямо подтверждаться базой знаний.
+Если ответ есть в базе, source=knowledge_base и evidence — точная непрерывная цитата из базы.
+Если ответа нет, source=unavailable, evidence пустая строка, а reply честно сообщает, что точных сведений в базе нет. Не додумывайте.
+Не задавайте встречный вопрос и не предлагайте консультацию или запись.
+
+Верните только JSON:
+{{"reply":"краткий ответ","source":"knowledge_base|unavailable","evidence":"точная цитата или пустая строка"}}
+
+БАЗА ЗНАНИЙ:
+{context}
+
+ДИАЛОГ:
+{transcript}
+Клиент: {text}
+"""
+    for model in models:
+        try:
+            raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
+        except Exception:
+            app.logger.exception("Grounded information fallback failed model=%s", model)
+            continue
+        data = parse_json_object(raw)
+        if not isinstance(data, dict):
+            continue
+        reply = normalize_reply_for_action(str(data.get("reply") or ""), "answer_information")
+        source = data.get("source")
+        evidence = str(data.get("evidence") or "").strip()
+        if not reply or len(re.findall(r"\S+", reply)) > 55:
+            continue
+        if source == "knowledge_base" and grounded_in_current_message(evidence, context):
+            return reply
+        if source == "unavailable" and not evidence:
+            return reply
+    return "В моей базе знаний нет точных сведений об этом, поэтому не буду додумывать."
+
 def generate_stateful_dialog_reply(history, text, context):
     generation_started = time.perf_counter()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
@@ -1305,6 +1384,16 @@ def generate_stateful_dialog_reply(history, text, context):
     )
     if fallback_action == "start_booking":
         reply = "Назовите удобные дату и время — я проверю их в календаре."
+        return reply, fallback_action, advance_dialog_state(
+            working_state, fallback_action, reply
+        )
+    if active_expert_slug() == "marketer" and fallback_action == "answer_information":
+        reply = grounded_information_fallback(
+            history,
+            text,
+            context,
+            (backup_model, preferred_model),
+        )
         return reply, fallback_action, advance_dialog_state(
             working_state, fallback_action, reply
         )
