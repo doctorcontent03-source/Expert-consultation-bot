@@ -58,6 +58,10 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
             "name": "консультация" if action == "offer_consultation" else "",
             "evidence": "",
         },
+        "answer_grounding": {
+            "source": "dialogue" if action == "answer_information" else "none",
+            "evidence": evidence if action == "answer_information" else "",
+        },
         "observations": fields,
         "reply_assessment": {
             "based_on_client_meaning": True,
@@ -1268,6 +1272,65 @@ class TestBot(unittest.TestCase):
             )
         self.assertIn("это обратная связь о ходе беседы", prompt)
         self.assertIn("используйте rupture и repair_contact".lower(), prompt.lower())
+
+    def test_marketer_product_answer_requires_knowledge_base_evidence(self):
+        context = "Ассистенты живут в ChatGPT. Пользоваться ассистентами можно в любой версии."
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            valid = {
+                "reply": "Ассистенты работают в ChatGPT; пользоваться ими можно и в бесплатной версии.",
+                "action": "answer_information",
+                "question_target": "none",
+                "question_scope": "none",
+                "conversation_effect": "continue",
+                "answer_grounding": {
+                    "source": "knowledge_base",
+                    "evidence": "Ассистенты живут в ChatGPT",
+                },
+            }
+            self.assertEqual(
+                target.controller_reply_issues(
+                    valid,
+                    "answer_information",
+                    state,
+                    [],
+                    client_text="В какой нейросети он работает?",
+                    context=context,
+                ),
+                [],
+            )
+            invented = dict(valid)
+            invented["reply"] = "Это самостоятельный продукт, не связанный с ChatGPT."
+            invented["answer_grounding"] = {
+                "source": "knowledge_base",
+                "evidence": "самостоятельный продукт, не связанный с ChatGPT",
+            }
+            issues = target.controller_reply_issues(
+                invented,
+                "answer_information",
+                state,
+                [],
+                client_text="Он создан в ChatGPT?",
+                context=context,
+            )
+        self.assertIn("информационный ответ не подтверждён базой знаний", issues)
+
+    def test_marketer_information_fallback_rejects_invented_platform(self):
+        target.gigachat = ScriptedGigaChat([
+            '{"reply":"Это отдельный продукт вне ChatGPT.","source":"knowledge_base","evidence":"отдельный продукт вне ChatGPT"}',
+            '{"reply":"Ассистенты работают в ChatGPT; достаточно бесплатной версии.","source":"knowledge_base","evidence":"Ассистенты живут в ChatGPT"}',
+        ])
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            answer = target.grounded_information_fallback(
+                [],
+                "Он работает в ChatGPT?",
+                "Ассистенты живут в ChatGPT. Пользоваться ассистентами можно в любой версии.",
+                ("GigaChat", "GigaChat-2-Max"),
+            )
+        self.assertIn("ChatGPT", answer)
+        self.assertNotIn("отдельный продукт", answer)
 
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
