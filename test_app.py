@@ -1346,14 +1346,14 @@ class TestBot(unittest.TestCase):
         with target.app.test_request_context("/marketer"):
             target.g.expert_slug = "marketer"
             valid = {
-                "reply": "Ассистенты работают в ChatGPT; пользоваться ими можно и в бесплатной версии.",
+                "reply": "Ассистенты живут в ChatGPT. Пользоваться ассистентами можно в любой версии.",
                 "action": "answer_information",
                 "question_target": "none",
                 "question_scope": "none",
                 "conversation_effect": "continue",
                 "answer_grounding": {
                     "source": "knowledge_base",
-                    "evidence": "Ассистенты живут в ChatGPT",
+                    "evidence": "Ассистенты живут в ChatGPT. Пользоваться ассистентами можно в любой версии.",
                 },
             }
             self.assertEqual(
@@ -1382,6 +1382,33 @@ class TestBot(unittest.TestCase):
                 context=context,
             )
         self.assertIn("информационный ответ не подтверждён базой знаний", issues)
+
+    def test_marketer_rejects_claim_not_entailed_by_correct_evidence(self):
+        context = "Ассистенты живут в ChatGPT. Пользоваться ассистентами можно в любой версии."
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            issues = target.controller_reply_issues(
+                {
+                    "reply": "Ассистенты используют платформу, аналогичную ChatGPT. Достаточно бесплатной версии ChatGPT.",
+                    "action": "answer_information",
+                    "question_target": "none",
+                    "question_scope": "none",
+                    "conversation_effect": "continue",
+                    "answer_grounding": {
+                        "source": "knowledge_base",
+                        "evidence": context,
+                    },
+                },
+                "answer_information",
+                self.state(),
+                [],
+                client_text="Они работают в ChatGPT?",
+                context=context,
+            )
+        self.assertIn(
+            "информационный ответ добавляет сведения, которых нет в подтверждающей цитате",
+            issues,
+        )
 
     def test_marketer_information_fallback_rejects_invented_platform(self):
         target.gigachat = ScriptedGigaChat([
