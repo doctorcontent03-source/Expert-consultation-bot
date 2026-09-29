@@ -541,6 +541,14 @@ def grounding_overlap(left, right):
         return 0.0
     return len(expected & grounding_roots(right)) / len(expected)
 
+def factual_roots(text):
+    return grounding_roots(text)
+
+def reply_is_entailed_by_evidence(reply, evidence):
+    claimed = factual_roots(reply)
+    supported = factual_roots(evidence)
+    return bool(supported) and not (claimed - supported)
+
 def controller_state(saved=None):
     if saved is None:
         saved = sget("dialog_controller_state")
@@ -979,8 +987,12 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
             issues.append("информационный ответ не имеет указанного источника")
         elif source == "knowledge_base" and not grounded_in_current_message(evidence, context):
             issues.append("информационный ответ не подтверждён базой знаний")
+        elif source == "knowledge_base" and not reply_is_entailed_by_evidence(reply, evidence):
+            issues.append("информационный ответ добавляет сведения, которых нет в подтверждающей цитате")
         elif source == "dialogue" and not grounded_in_current_message(evidence, dialogue_source):
             issues.append("информационный ответ не подтверждён словами клиента")
+        elif source == "dialogue" and not reply_is_entailed_by_evidence(reply, evidence):
+            issues.append("информационный ответ добавляет сведения, которых нет в словах клиента")
         elif source == "unavailable" and evidence:
             issues.append("для отсутствующих сведений указано несуществующее доказательство")
     if action != "offer_consultation" and ("[[book_free]]" in low or "[[book_regular]]" in low):
@@ -1280,6 +1292,7 @@ def grounded_information_fallback(history, text, context, models):
 {transcript}
 Клиент: {text}
 """
+    unavailable_replies = []
     for model in models:
         try:
             raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
@@ -1295,9 +1308,15 @@ def grounded_information_fallback(history, text, context, models):
         if not reply or len(re.findall(r"\S+", reply)) > 55:
             continue
         if source == "knowledge_base" and grounded_in_current_message(evidence, context):
-            return reply
+            if reply_is_entailed_by_evidence(reply, evidence):
+                return reply
+            evidence_reply = normalize_reply_for_action(evidence, "answer_information")
+            if evidence_reply and len(re.findall(r"\S+", evidence_reply)) <= 55:
+                return evidence_reply
         if source == "unavailable" and not evidence:
-            return reply
+            unavailable_replies.append(reply)
+    if unavailable_replies:
+        return unavailable_replies[-1]
     return "В моей базе знаний нет точных сведений об этом, поэтому не буду додумывать."
 
 def grounded_solution_fallback(history, text, context, models):
