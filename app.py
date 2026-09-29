@@ -1153,7 +1153,7 @@ question_target — элемент состояния, который выясн
 question_scope — смысловая область вопроса. work_process означает организацию работы клиента, затраты времени, повторяющиеся операции, используемые инструменты и желаемое изменение процесса. client_domain означает содержание профессии клиента: обучение его учеников, лечение пациентов, методику, предметные материалы и профессиональные решения. Для любого explore в профиле специалиста по нейросетям допустим только work_process. Для действий без вопроса используйте none.
 Для профиля специалиста по нейросетям previous_experience относится к способу выполнения задачи и уже опробованным инструментам, а не к профессиональной методике клиента. desired_result относится к изменению рабочего процесса или результата. Не запрашивайте частный пример, если из сообщения уже понятна общая проблема.
 proposed_solution — предложение эксперта, а не желаемый результат клиента. Для explain_solution в профиле специалиста по нейросетям выберите ready_product, adaptation или custom_development. name должно называть именно ИИ-продукт или услугу по созданию ИИ-решения и прямо содержаться в evidence; evidence — точная непрерывная цитата из базы знаний, которая подтверждает его существование. Начните reply с выбранного ИИ-решения как предмета предложения, а затем объясните его связь с задачей клиента. Не начинайте с обещания создать желаемый клиентом курс, книгу, материалы, стратегию или другой конечный профессиональный результат. Для остальных действий используйте none, кроме психолога, где consultation допустима.
-answer_grounding — источник информационного ответа. Для answer_information укажите knowledge_base и точную непрерывную цитату из базы либо dialogue и точную цитату из слов клиента. Если нужного факта нет, используйте unavailable, оставьте evidence пустым и прямо скажите, что в базе это не указано. Не делайте выводов о платформе, подписке, цене, составе, функциях, формате или условиях продукта без прямого подтверждения. Для остальных действий используйте none.
+answer_grounding — источник информационного ответа. Для answer_information укажите knowledge_base и точную непрерывную цитату из базы либо dialogue и точную цитату из слов клиента. Если нужного факта нет, используйте unavailable, оставьте evidence пустым и от первого лица эксперта честно скажите, что не можете ответить точно. Не упоминайте базу знаний, документы, систему, модель или чат-бота. Не делайте выводов о платформе, подписке, цене, составе, функциях, формате или условиях продукта без прямого подтверждения. Для остальных действий используйте none.
 conversation_effect — фактическая функция готовой реплики: continue, если она оставляет текущий разговор открытым; close, если прощается или завершает его. Для explore, explain_solution, check_interest, offer_consultation, start_booking, answer_information, repair_interpretation и repair_contact допустимо только continue.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
 concern означает высказанное опасение, ожидание, предположение или сомнение об условиях, сроках, цене, формате или последствиях работы, на которое клиент ожидает содержательной реакции, даже без вопросительного знака.
@@ -1327,7 +1327,7 @@ def grounded_information_fallback(history, text, context, models):
 Ответьте только на последний информационный вопрос клиента от имени эксперта.
 Каждый факт о продукте, платформе, подписке, цене, составе, функциях, формате или условиях должен прямо подтверждаться базой знаний.
 Если ответ есть в базе, source=knowledge_base и evidence — точная непрерывная цитата из базы.
-Если ответа нет, source=unavailable, evidence пустая строка, а reply честно сообщает, что точных сведений в базе нет. Не додумывайте.
+Если ответа нет, source=unavailable, evidence пустая строка, а reply от первого лица эксперта честно сообщает, что вы не можете ответить точно. Не упоминайте базу знаний, документы, систему, модель или чат-бота. Не додумывайте.
 Не задавайте встречный вопрос и не предлагайте консультацию или запись.
 
 Верните только JSON:
@@ -1367,7 +1367,7 @@ def grounded_information_fallback(history, text, context, models):
             unavailable_replies.append(reply)
     if unavailable_replies:
         return unavailable_replies[-1]
-    return "В моей базе знаний нет точных сведений об этом, поэтому не буду додумывать."
+    return "Не могу ответить на это точно, поэтому не буду вводить вас в заблуждение."
 
 def grounded_solution_fallback(history, text, context, models):
     transcript = "\n".join(
@@ -1767,16 +1767,29 @@ def extract(file):
     if suffix == ".pdf": return "\n".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages)
     raise ValueError("Поддерживаются PDF, DOCX, TXT, MD, CSV и JSON")
 
-def relevant(query, documents, limit=12000):
+def retrieval_features(value):
+    low = str(value or "").lower().replace("ё", "е")
+    words = set(re.findall(r"[а-яa-z0-9]{3,}", low))
+    latin = re.findall(r"[a-z0-9]+", low)
+    joined = {
+        "".join(latin[index:index + width])
+        for width in (2, 3)
+        for index in range(max(0, len(latin) - width + 1))
+        if len("".join(latin[index:index + width])) >= 5
+    }
+    return words | joined
+
+def relevant(query, documents, limit=12000, primary_query=None):
     full = "\n\n".join(f"[{doc['name']}]\n{doc['text']}" for doc in documents)
     if len(full) <= limit:
         return full
-    words = set(re.findall(r"[а-яёa-z0-9]{3,}", query.lower()))
+    words = retrieval_features(query)
+    primary_words = retrieval_features(primary_query or query)
     chunks = []
     for doc in documents:
         for chunk in re.split(r"\n\s*\n|(?<=[.!?])\s+(?=[А-ЯA-Z])", doc["text"]):
-            cwords = set(re.findall(r"[а-яёa-z0-9]{3,}", chunk.lower()))
-            score = len(words & cwords)
+            cwords = retrieval_features(chunk)
+            score = len(words & cwords) + 4 * len(primary_words & cwords)
             if score or len(chunks) < 8: chunks.append((score, doc["name"], chunk.strip()))
     chunks.sort(key=lambda x: (x[0], len(x[2])), reverse=True)
     out=[]; size=0
@@ -1950,7 +1963,7 @@ def chat_for(slug):
     retrieval_query = "\n".join(
         [row["content"] for row in history[-6:]] + [text]
     )
-    context=relevant(retrieval_query,docs)
+    context=relevant(retrieval_query,docs,primary_query=text)
     completed_answer = completed_dialog_answer(text)
     if completed_answer:
         con.execute("insert into messages values(?,?,?,?)",(sid,"assistant",completed_answer,int(time.time()*1000))); con.commit()

@@ -1470,6 +1470,45 @@ class TestBot(unittest.TestCase):
             )
         self.assertTrue(supported)
 
+    def test_retrieval_matches_spaced_and_unspaced_product_names(self):
+        documents = [
+            {
+                "name": "Условия.txt",
+                "text": "Ассистенты живут в ChatGPT. Для готовых ассистентов достаточно бесплатной версии ChatGPT.",
+            },
+            {
+                "name": "Прочее.txt",
+                "text": "\n\n".join(
+                    f"Раздел {index}. " + "Общие сведения о работе и консультациях. " * 15
+                    for index in range(40)
+                ),
+            },
+        ]
+        result = target.relevant(
+            "Ранее обсуждали методистов и учебные программы. На какой платформе они работают? В Chat GPT?",
+            documents,
+            limit=1200,
+            primary_query="На какой платформе они работают? В Chat GPT?",
+        )
+        self.assertIn("Ассистенты живут в ChatGPT", result)
+        self.assertIn("бесплатной версии ChatGPT", result)
+
+    def test_unavailable_information_prompt_keeps_expert_voice(self):
+        target.gigachat = ScriptedGigaChat([
+            '{"reply":"Не могу ответить на это точно.","source":"unavailable","evidence":""}',
+        ])
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            answer = target.grounded_information_fallback(
+                [],
+                "Есть ли такой формат?",
+                "Другие сведения.",
+                ("GigaChat",),
+            )
+        self.assertEqual(answer, "Не могу ответить на это точно.")
+        self.assertIn("от первого лица эксперта", target.gigachat.prompts[0])
+        self.assertIn("Не упоминайте базу знаний", target.gigachat.prompts[0])
+
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
             target.g.expert_slug = "marketer"
