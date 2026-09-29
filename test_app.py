@@ -51,6 +51,7 @@ def payload(reply, action="explore", intent="continue", evidence="", observation
         "intent": intent,
         "intent_evidence": evidence,
         "question_target": question_target or ("need" if action == "explore" else "none"),
+        "question_scope": "personal_situation" if action == "explore" else "none",
         "conversation_effect": conversation_effect,
         "proposed_solution": {
             "type": "consultation" if action == "offer_consultation" else "none",
@@ -1214,6 +1215,59 @@ class TestBot(unittest.TestCase):
             )
         self.assertIn("не выбран продукт или услуга специалиста по нейросетям", issues)
         self.assertIn("предлагаемое решение не подтверждено базой знаний", issues)
+
+    def test_marketer_rejects_questions_about_clients_professional_domain(self):
+        state = self.state(contact=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            issues = target.controller_reply_issues(
+                {
+                    "reply": "Какие задачи по обучению сейчас перед вами стоят?",
+                    "action": "explore",
+                    "question_target": "need",
+                    "question_scope": "client_domain",
+                    "conversation_effect": "continue",
+                },
+                "explore",
+                state,
+                [],
+                client_text="Я репетитор английского.",
+            )
+        self.assertIn(
+            "диагностический вопрос вышел за пределы рабочего процесса клиента",
+            issues,
+        )
+
+    def test_marketer_accepts_work_process_question(self):
+        state = self.state(contact=True)
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            issues = target.controller_reply_issues(
+                {
+                    "reply": "Какую часть вашей работы хотелось бы упростить или ускорить?",
+                    "action": "explore",
+                    "question_target": "need",
+                    "question_scope": "work_process",
+                    "conversation_effect": "continue",
+                },
+                "explore",
+                state,
+                [],
+                client_text="Я репетитор английского.",
+            )
+        self.assertEqual(issues, [])
+
+    def test_marketer_prompt_treats_confusion_about_question_as_rupture(self):
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            prompt = target.controller_prompt(
+                self.state(contact=True),
+                "Екатерина — специалист по нейросетям.",
+                [{"role": "assistant", "content": "Какие задачи по обучению перед вами стоят?"}],
+                "Не поняла вопрос. Вы же не методист.",
+            )
+        self.assertIn("это обратная связь о ходе беседы", prompt)
+        self.assertIn("используйте rupture и repair_contact".lower(), prompt.lower())
 
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):

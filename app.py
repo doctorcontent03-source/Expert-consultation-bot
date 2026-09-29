@@ -118,6 +118,9 @@ CONTROLLER_RESPONSE_FORMAT = {
             "question_target": {"type": "string", "enum": [
                 "none", "contact", "need", "previous_experience", "desired_result",
             ]},
+            "question_scope": {"type": "string", "enum": [
+                "none", "work_process", "client_domain", "personal_situation",
+            ]},
             "conversation_effect": {"type": "string", "enum": ["continue", "close"]},
             "proposed_solution": {
                 "type": "object",
@@ -149,7 +152,7 @@ CONTROLLER_RESPONSE_FORMAT = {
                 "additionalProperties": False,
             },
         },
-        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "conversation_effect", "proposed_solution", "observations"],
+        "required": ["reply", "action", "intent", "intent_evidence", "question_target", "question_scope", "conversation_effect", "proposed_solution", "observations"],
         "additionalProperties": False,
     },
     "strict": True,
@@ -554,6 +557,7 @@ def parse_controller_payload(raw):
     intent = data.get("intent")
     evidence = data.get("intent_evidence", "")
     question_target = data.get("question_target", "none")
+    question_scope = data.get("question_scope", "none")
     conversation_effect = data.get("conversation_effect", "continue")
     proposed_solution = data.get("proposed_solution")
     observations = data.get("observations")
@@ -565,6 +569,8 @@ def parse_controller_payload(raw):
     if intent not in {"continue", "interest", "booking", "booking_question", "decline", "question", "concern", "boundary", "end", "correction", "rupture"}:
         return None
     if question_target not in {"none", "contact", "need", "previous_experience", "desired_result"}:
+        return None
+    if question_scope not in {"none", "work_process", "client_domain", "personal_situation"}:
         return None
     if conversation_effect not in {"continue", "close"}:
         return None
@@ -584,6 +590,7 @@ def parse_controller_payload(raw):
         "intent": intent,
         "intent_evidence": str(evidence or "").strip(),
         "question_target": question_target,
+        "question_scope": question_scope,
         "conversation_effect": conversation_effect,
         "proposed_solution": proposed_solution,
         "observations": observations,
@@ -890,6 +897,11 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
             issues.append("не указан недостающий элемент для вопроса")
         elif question_target not in missing_targets:
             issues.append("вопрос относится к уже полученной информации")
+        question_scope = payload.get("question_scope", "none")
+        if active_expert_slug() == "marketer" and question_scope != "work_process":
+            issues.append("диагностический вопрос вышел за пределы рабочего процесса клиента")
+        if active_expert_slug() == "psychologist" and question_scope == "client_domain":
+            issues.append("диагностический вопрос не соответствует профилю эксперта")
         if re.search(r"(запис|консультац|встреч)", low):
             issues.append("преждевременно предложена встреча")
         if any(questions_are_similar(question, old) for old in state["asked_questions"]):
@@ -947,6 +959,8 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
         )
         if required_action == "explore":
             correction += " Недостающие элементы состояния: " + ", ".join(missing) + ". Получите только один недостающий элемент."
+            if active_expert_slug() == "marketer":
+                correction += " Вопрос должен относиться только к рабочему процессу клиента и использованию инструментов, а не к содержанию его профессии."
     first_turn_rule = ""
     if first_client_turn:
         first_turn_rule = """
@@ -997,6 +1011,8 @@ def controller_prompt(state, context, history, text, retry_issues=None, first_cl
 7. Сначала отвечать на все прямые вопросы и учитывать явно указанное предпочтение клиента, используя только сведения базы знаний. Если в одной реплике клиент одновременно согласился записаться и задал информационный или организационный вопрос, ответить только на эти вопросы: не начинать запись, не предлагать выбрать время и не направлять к календарю, форме, кнопке или ссылке.
 8. {offer_order}
 
+Для специалиста по нейросетям диагностические вопросы остаются на уровне рабочего процесса: что клиент хочет упростить или изменить, как выполняет задачу сейчас, какие инструменты уже пробовал и какого изменения ожидает. Не выясняйте профессиональные задачи его учеников, пациентов, покупателей или других подопечных; не спрашивайте о методике, содержании занятий, лечения, консультирования или иной отраслевой работе.
+
 Разделяйте две сущности:
 - желаемый результат клиента — то, что клиент хочет получить в своей работе;
 - предложение эксперта — конкретный ИИ-продукт или услуга из базы знаний, с помощью которых клиент сможет работать над этим результатом.
@@ -1025,6 +1041,7 @@ need — понятно, что не устраивает или причиня�
 previous_experience — понятны длительность, влияние или прежние попытки;
 desired_result — понятно желаемое изменение.
 question_target — элемент состояния, который выясняет вопрос в reply. Для explore выберите ровно один элемент из НЕДОСТАЮЩИХ ЭЛЕМЕНТОВ. Для остальных действий укажите none. Нельзя снова выяснять элемент, который уже отмечен true.
+question_scope — смысловая область вопроса. work_process означает организацию работы клиента, затраты времени, повторяющиеся операции, используемые инструменты и желаемое изменение процесса. client_domain означает содержание профессии клиента: обучение его учеников, лечение пациентов, методику, предметные материалы и профессиональные решения. Для любого explore в профиле специалиста по нейросетям допустим только work_process. Для действий без вопроса используйте none.
 Для профиля специалиста по нейросетям previous_experience относится к способу выполнения задачи и уже опробованным инструментам, а не к профессиональной методике клиента. desired_result относится к изменению рабочего процесса или результата. Не запрашивайте частный пример, если из сообщения уже понятна общая проблема.
 proposed_solution — предложение эксперта, а не желаемый результат клиента. Для explain_solution в профиле специалиста по нейросетям выберите ready_product, adaptation или custom_development, назовите решение и приведите в evidence точную непрерывную цитату из базы знаний, которая подтверждает его существование. Для остальных действий используйте none, кроме психолога, где consultation допустима. Не утверждайте, что эксперт сам создаёт конечный профессиональный результат клиента.
 conversation_effect — фактическая функция готовой реплики: continue, если она оставляет текущий разговор открытым; close, если прощается или завершает его. Для explore, explain_solution, check_interest, offer_consultation, start_booking, answer_information, repair_interpretation и repair_contact допустимо только continue.
@@ -1033,9 +1050,10 @@ concern означает высказанное опасение, ожидани
 booking означает явное согласие начать запись, просьбу записать, выбрать время или сообщить доступное время. Вопрос о выборе даты или времени является частью booking. Простого интереса к консультации недостаточно. booking_question означает, что клиент согласился записаться, но в той же реплике задал вопрос об условиях встречи — формате, платформе, продолжительности, стоимости, подготовке или дальнейшей работе. Для booking_question сначала ответьте на вопрос; к записи можно перейти после следующей реплики клиента. Если консультация ещё не предложена, не используйте booking или booking_question.
 decline означает, что клиент отклоняет последнее предложение или приглашение, но не обязательно завершает весь разговор.
 rupture означает, что клиент сообщает не новый факт о своей ситуации, а указывает на неуместность, бессмысленность, непонятность или неприятность самого хода беседы. Определяйте намерения по смыслу сообщения в контексте, а не по отдельным словам.
+Если клиент сообщает, что не понял заданный вопрос, считает его странным или сомневается, относится ли он к специализации эксперта, это обратная связь о ходе беседы, а не ответ по существу. Используйте rupture и repair_contact; не переформулируйте тот же диагностический вопрос и не задавайте новый в этой реплике.
 
 Верните только JSON:
-{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","conversation_effect":"continue|close","proposed_solution":{{"type":"none|ready_product|adaptation|custom_development|consultation","name":"","evidence":""}},"observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
+{{"reply":"реплика эксперта","action":"explore|explain_solution|check_interest|offer_consultation|start_booking|answer_information|respect_boundary|respect_decline|repair_interpretation|repair_contact|end_dialog","intent":"continue|interest|booking|booking_question|decline|question|concern|boundary|end|correction|rupture","intent_evidence":"","question_target":"none|contact|need|previous_experience|desired_result","question_scope":"none|work_process|client_domain|personal_situation","conversation_effect":"continue|close","proposed_solution":{{"type":"none|ready_product|adaptation|custom_development|consultation","name":"","evidence":""}},"observations":{{"contact":{{"present":false,"evidence":""}},"need":{{"present":false,"evidence":""}},"previous_experience":{{"present":false,"evidence":""}},"desired_result":{{"present":false,"evidence":""}}}}}}
 
 БАЗА ЗНАНИЙ:
 {context[-10000:]}
@@ -1137,6 +1155,13 @@ def generate_post_booking_reply(history, text, documents):
     raise RuntimeError("Models did not return a usable post-booking reply")
 
 def fallback_action_instruction(action):
+    if action == "explore" and active_expert_slug() == "marketer":
+        return (
+            "Кратко отразите услышанное и задайте один открытый вопрос только о недостающей информации "
+            "на уровне рабочего процесса: что клиент хочет упростить, как выполняет задачу сейчас, какие "
+            "инструменты пробовал или какого изменения ожидает. Не спрашивайте о содержании его профессии, "
+            "методике или задачах его учеников, пациентов и клиентов."
+        )
     if action == "explain_solution" and not active_expert_profile()["consultation_is_service"]:
         return (
             "Без вопроса назовите подходящий реальный ИИ-продукт или услугу из базы знаний и кратко "
