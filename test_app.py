@@ -1199,7 +1199,7 @@ class TestBot(unittest.TestCase):
                 "conversation_effect": "continue",
                 "proposed_solution": {
                     "type": "ready_product",
-                    "name": "ассистент-методист для нестандартных курсов",
+                    "name": "Готовый ассистент-методист",
                     "evidence": "Готовый ассистент-методист помогает создавать нестандартные курсы",
                 },
             }
@@ -1219,6 +1219,51 @@ class TestBot(unittest.TestCase):
             )
         self.assertIn("не выбран продукт или услуга специалиста по нейросетям", issues)
         self.assertIn("предлагаемое решение не подтверждено базой знаний", issues)
+
+    def test_marketer_solution_cannot_lead_with_clients_course_as_the_offer(self):
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        context = "Методисты по английскому языку — готовые ассистенты для разработки нестандартных учебных программ."
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            issues = target.controller_reply_issues(
+                {
+                    "reply": "Вам подойдёт разработка индивидуального курса с использованием нейросетей. Методисты по английскому языку помогут организовать эту работу.",
+                    "action": "explain_solution",
+                    "question_target": "none",
+                    "conversation_effect": "continue",
+                    "proposed_solution": {
+                        "type": "ready_product",
+                        "name": "Методисты по английскому языку",
+                        "evidence": "Методисты по английскому языку — готовые ассистенты для разработки нестандартных учебных программ",
+                    },
+                },
+                "explain_solution",
+                state,
+                [],
+                context=context,
+            )
+        self.assertIn(
+            "объяснение начинается с результата клиента, а не с предлагаемого ИИ-решения",
+            issues,
+        )
+
+    def test_marketer_rupture_after_solution_reopens_solution_selection(self):
+        state = self.state(need=True, previous_experience=True, desired_result=True)
+        state.update({
+            "solution_explained": True,
+            "solution_type": "ready_product",
+            "solution_name": "неверно понятый продукт",
+        })
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            repaired = target.advance_dialog_state(
+                state,
+                "repair_contact",
+                "Да, предыдущее объяснение получилось нелогичным.",
+            )
+        self.assertFalse(repaired["solution_explained"])
+        self.assertEqual(repaired["solution_type"], "none")
+        self.assertEqual(repaired["solution_name"], "")
 
     def test_marketer_rejects_questions_about_clients_professional_domain(self):
         state = self.state(contact=True)

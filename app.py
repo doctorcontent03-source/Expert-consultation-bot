@@ -948,11 +948,17 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
             issues.append("не названо предлагаемое ИИ-решение")
         if not grounded_in_current_message(solution_evidence, context):
             issues.append("предлагаемое решение не подтверждено базой знаний")
+        if solution_name and not grounded_in_current_message(solution_name, solution_evidence):
+            issues.append("название ИИ-решения не подтверждено приведённой цитатой")
         name_words = set(normalized_words(solution_name))
         reply_words = set(normalized_words(reply))
         meaningful_name_words = {word for word in name_words if len(word) >= 4}
         if meaningful_name_words and not meaningful_name_words.intersection(reply_words):
             issues.append("в реплике не названо выбранное ИИ-решение")
+        opening = re.split(r"(?<=[.!?])\s+", reply, maxsplit=1)[0]
+        opening_words = set(normalized_words(opening))
+        if meaningful_name_words and len(meaningful_name_words & opening_words) / len(meaningful_name_words) < 0.6:
+            issues.append("объяснение начинается с результата клиента, а не с предлагаемого ИИ-решения")
     if active_expert_slug() == "marketer" and action == "answer_information":
         grounding = payload.get("answer_grounding") or {}
         source = grounding.get("source", "none")
@@ -1078,7 +1084,7 @@ desired_result — понятно желаемое изменение.
 question_target — элемент состояния, который выясняет вопрос в reply. Для explore выберите ровно один элемент из НЕДОСТАЮЩИХ ЭЛЕМЕНТОВ. Для остальных действий укажите none. Нельзя снова выяснять элемент, который уже отмечен true.
 question_scope — смысловая область вопроса. work_process означает организацию работы клиента, затраты времени, повторяющиеся операции, используемые инструменты и желаемое изменение процесса. client_domain означает содержание профессии клиента: обучение его учеников, лечение пациентов, методику, предметные материалы и профессиональные решения. Для любого explore в профиле специалиста по нейросетям допустим только work_process. Для действий без вопроса используйте none.
 Для профиля специалиста по нейросетям previous_experience относится к способу выполнения задачи и уже опробованным инструментам, а не к профессиональной методике клиента. desired_result относится к изменению рабочего процесса или результата. Не запрашивайте частный пример, если из сообщения уже понятна общая проблема.
-proposed_solution — предложение эксперта, а не желаемый результат клиента. Для explain_solution в профиле специалиста по нейросетям выберите ready_product, adaptation или custom_development, назовите решение и приведите в evidence точную непрерывную цитату из базы знаний, которая подтверждает его существование. Для остальных действий используйте none, кроме психолога, где consultation допустима. Не утверждайте, что эксперт сам создаёт конечный профессиональный результат клиента.
+proposed_solution — предложение эксперта, а не желаемый результат клиента. Для explain_solution в профиле специалиста по нейросетям выберите ready_product, adaptation или custom_development. name должно называть именно ИИ-продукт или услугу по созданию ИИ-решения и прямо содержаться в evidence; evidence — точная непрерывная цитата из базы знаний, которая подтверждает его существование. Начните reply с выбранного ИИ-решения как предмета предложения, а затем объясните его связь с задачей клиента. Не начинайте с обещания создать желаемый клиентом курс, книгу, материалы, стратегию или другой конечный профессиональный результат. Для остальных действий используйте none, кроме психолога, где consultation допустима.
 answer_grounding — источник информационного ответа. Для answer_information укажите knowledge_base и точную непрерывную цитату из базы либо dialogue и точную цитату из слов клиента. Если нужного факта нет, используйте unavailable, оставьте evidence пустым и прямо скажите, что в базе это не указано. Не делайте выводов о платформе, подписке, цене, составе, функциях, формате или условиях продукта без прямого подтверждения. Для остальных действий используйте none.
 conversation_effect — фактическая функция готовой реплики: continue, если она оставляет текущий разговор открытым; close, если прощается или завершает его. Для explore, explain_solution, check_interest, offer_consultation, start_booking, answer_information, repair_interpretation и repair_contact допустимо только continue.
 intent_evidence — точная цитата из последнего сообщения, подтверждающая intent. Для continue она может быть пустой.
@@ -1286,6 +1292,56 @@ def grounded_information_fallback(history, text, context, models):
             return reply
     return "В моей базе знаний нет точных сведений об этом, поэтому не буду додумывать."
 
+def grounded_solution_fallback(history, text, context, models):
+    transcript = "\n".join(
+        ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+        for row in history[-8:]
+    )
+    prompt = active_system_rules() + f"""
+
+Выберите из базы знаний подходящий реальный ИИ-продукт либо услугу по созданию ИИ-решения.
+Не предлагайте эксперту создавать конечный профессиональный результат клиента: курс, учебник, материалы, стратегию или иной результат его отраслевой работы.
+Начните reply с названия выбранного ИИ-решения и кратко объясните, как оно связано с уже понятной задачей клиента. Не задавайте вопрос и не предлагайте консультацию.
+name должно прямо содержаться в evidence. evidence — точная непрерывная цитата из базы знаний.
+
+Верните только JSON:
+{{"reply":"краткое объяснение","type":"ready_product|adaptation|custom_development","name":"название ИИ-решения","evidence":"точная цитата из базы"}}
+
+БАЗА ЗНАНИЙ:
+{context}
+
+ДИАЛОГ:
+{transcript}
+Клиент: {text}
+"""
+    for model in models:
+        try:
+            raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
+        except Exception:
+            app.logger.exception("Grounded solution fallback failed model=%s", model)
+            continue
+        data = parse_json_object(raw)
+        if not isinstance(data, dict):
+            continue
+        reply = normalize_reply_for_action(str(data.get("reply") or ""), "explain_solution")
+        solution = {
+            "type": data.get("type"),
+            "name": str(data.get("name") or "").strip(),
+            "evidence": str(data.get("evidence") or "").strip(),
+        }
+        candidate = {
+            "reply": reply,
+            "action": "explain_solution",
+            "conversation_effect": "continue",
+            "proposed_solution": solution,
+        }
+        if not controller_reply_issues(
+            candidate, "explain_solution", default_dialog_state(), history,
+            client_text=text, context=context,
+        ):
+            return reply, solution
+    raise RuntimeError("Models did not return a grounded AI solution")
+
 def generate_stateful_dialog_reply(history, text, context):
     generation_started = time.perf_counter()
     first_client_turn = not any(row["role"] == "assistant" for row in history)
@@ -1397,6 +1453,16 @@ def generate_stateful_dialog_reply(history, text, context):
         return reply, fallback_action, advance_dialog_state(
             working_state, fallback_action, reply
         )
+    if active_expert_slug() == "marketer" and fallback_action == "explain_solution":
+        reply, solution = grounded_solution_fallback(
+            history,
+            text,
+            context,
+            (backup_model, preferred_model),
+        )
+        return reply, fallback_action, advance_dialog_state(
+            working_state, fallback_action, reply, proposed_solution=solution
+        )
     transcript = "\n".join(
         ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
         for row in history[-8:]
@@ -1497,6 +1563,10 @@ def advance_dialog_state(state, action, reply, question_target="none", proposed_
         updated["consultation_offered"] = True
     elif action == "respect_decline":
         updated["declined"] = True
+    elif action == "repair_contact" and active_expert_slug() == "marketer" and updated.get("solution_explained"):
+        updated["solution_explained"] = False
+        updated["solution_type"] = "none"
+        updated["solution_name"] = ""
     return updated
 
 def yandex_calendar():
