@@ -1447,6 +1447,29 @@ class TestBot(unittest.TestCase):
         self.assertFalse(adult_answered)
         self.assertTrue(platform_answered)
 
+    def test_evidence_verifier_uses_dialogue_for_elliptical_question(self):
+        target.gigachat = ScriptedGigaChat(['{"answers":true}'])
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            answered = target.evidence_answers_question(
+                "Что методисты?",
+                "Методисты по английскому языку — готовые AI-ассистенты для разработки учебных программ.",
+                "GigaChat-2-Max",
+                "Эксперт: Для вашей задачи подойдут методисты по английскому языку.",
+            )
+        self.assertTrue(answered)
+
+    def test_natural_solution_reply_can_be_verified_against_evidence(self):
+        target.gigachat = ScriptedGigaChat(['{"supports":true}'])
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            supported = target.evidence_supports_reply(
+                "Для вашей задачи подойдут методисты по английскому языку — AI-ассистенты для разработки учебных программ.",
+                "Методисты по английскому языку — готовые AI-ассистенты для разработки учебных программ.",
+                "GigaChat-2-Max",
+            )
+        self.assertTrue(supported)
+
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
             target.g.expert_slug = "marketer"
