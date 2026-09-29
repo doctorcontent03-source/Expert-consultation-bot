@@ -549,7 +549,7 @@ def reply_is_entailed_by_evidence(reply, evidence):
     supported = factual_roots(evidence)
     return bool(supported) and not (claimed - supported)
 
-def evidence_answers_question(question, evidence, model):
+def evidence_answers_question(question, evidence, model, dialogue_context=""):
     prompt = f"""
 Определите, достаточно ли приведённого источника, чтобы прямо ответить именно на вопрос клиента.
 Смысловая близость к теме недостаточна. answers=true допустимо только тогда, когда ответ следует из источника без предположений, расширений и переноса свойств одной категории на другую.
@@ -561,6 +561,9 @@ def evidence_answers_question(question, evidence, model):
 ВОПРОС КЛИЕНТА:
 {question}
 
+КОНТЕКСТ ДИАЛОГА, НУЖНЫЙ ДЛЯ ПОНИМАНИЯ СОКРАЩЕНИЙ И ССЫЛОК:
+{dialogue_context}
+
 ИСТОЧНИК:
 {evidence}
 """
@@ -571,6 +574,28 @@ def evidence_answers_question(question, evidence, model):
         return False
     data = parse_json_object(raw)
     return isinstance(data, dict) and data.get("answers") is True
+
+def evidence_supports_reply(reply, evidence, model):
+    prompt = f"""
+Проверьте, полностью ли реплика эксперта следует из источника.
+supports=true допустимо, только если реплика не добавляет новых функций, условий, обещаний, аудиторий, форматов или свойств и не меняет смысл источника.
+
+Верните только JSON:
+{{"supports":true|false}}
+
+ИСТОЧНИК:
+{evidence}
+
+РЕПЛИКА:
+{reply}
+"""
+    try:
+        raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
+    except Exception:
+        app.logger.exception("Grounded reply verification failed model=%s", model)
+        return False
+    data = parse_json_object(raw)
+    return isinstance(data, dict) and data.get("supports") is True
 
 def controller_state(saved=None):
     if saved is None:
@@ -1331,7 +1356,7 @@ def grounded_information_fallback(history, text, context, models):
         if not reply or len(re.findall(r"\S+", reply)) > 55:
             continue
         if source == "knowledge_base" and grounded_in_current_message(evidence, context):
-            if not evidence_answers_question(text, evidence, models[-1]):
+            if not evidence_answers_question(text, evidence, models[-1], transcript):
                 continue
             if reply_is_entailed_by_evidence(reply, evidence):
                 return reply
@@ -1393,13 +1418,20 @@ name должно прямо содержаться в evidence. evidence — т
             and grounded_in_current_message(solution["evidence"], context)
             and grounding_overlap(solution["name"], solution["evidence"]) >= 0.6
         ):
-            grounded_candidates.append(solution)
+            grounded_candidates.append((solution, reply))
         if not controller_reply_issues(
             candidate, "explain_solution", controller_state({}), history,
             client_text=text, context=context,
         ):
             return reply, solution
-    for solution in grounded_candidates:
+    for solution, candidate_reply in grounded_candidates:
+        if (
+            candidate_reply
+            and len(re.findall(r"\S+", candidate_reply)) <= 55
+            and "?" not in candidate_reply
+            and evidence_supports_reply(candidate_reply, solution["evidence"], models[-1])
+        ):
+            return candidate_reply, solution
         sentences = re.split(r"(?<=[.!?])\s+|\n+", solution["evidence"])
         for sentence in sentences:
             sentence = sentence.strip(" •-–—\t")
@@ -1508,8 +1540,12 @@ def generate_stateful_dialog_reply(history, text, context):
             evidence = str((payload.get("answer_grounding") or {}).get("evidence") or "").strip()
             cache_key = (" ".join(normalized_words(text)), " ".join(normalized_words(evidence)))
             if cache_key not in answerability_cache:
+                transcript_for_verification = "\n".join(
+                    ("Клиент: " if row["role"] == "user" else "Эксперт: ") + row["content"]
+                    for row in history[-8:]
+                )
                 answerability_cache[cache_key] = evidence_answers_question(
-                    text, evidence, backup_model
+                    text, evidence, backup_model, transcript_for_verification
                 )
             if not answerability_cache[cache_key]:
                 issues.append("подтверждающий фрагмент относится к теме, но не отвечает на вопрос клиента")
