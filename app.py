@@ -549,6 +549,29 @@ def reply_is_entailed_by_evidence(reply, evidence):
     supported = factual_roots(evidence)
     return bool(supported) and not (claimed - supported)
 
+def evidence_answers_question(question, evidence, model):
+    prompt = f"""
+Определите, достаточно ли приведённого источника, чтобы прямо ответить именно на вопрос клиента.
+Смысловая близость к теме недостаточна. answers=true допустимо только тогда, когда ответ следует из источника без предположений, расширений и переноса свойств одной категории на другую.
+Если источник сообщает о других категориях, вариантах или случаях, но не о том, о чём спросил клиент, answers=false.
+
+Верните только JSON:
+{{"answers":true|false}}
+
+ВОПРОС КЛИЕНТА:
+{question}
+
+ИСТОЧНИК:
+{evidence}
+"""
+    try:
+        raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
+    except Exception:
+        app.logger.exception("Information evidence verification failed model=%s", model)
+        return False
+    data = parse_json_object(raw)
+    return isinstance(data, dict) and data.get("answers") is True
+
 def controller_state(saved=None):
     if saved is None:
         saved = sget("dialog_controller_state")
@@ -1308,6 +1331,8 @@ def grounded_information_fallback(history, text, context, models):
         if not reply or len(re.findall(r"\S+", reply)) > 55:
             continue
         if source == "knowledge_base" and grounded_in_current_message(evidence, context):
+            if not evidence_answers_question(text, evidence, models[-1]):
+                continue
             if reply_is_entailed_by_evidence(reply, evidence):
                 return reply
             evidence_reply = normalize_reply_for_action(evidence, "answer_information")
@@ -1413,6 +1438,7 @@ def generate_stateful_dialog_reply(history, text, context):
     last_error = None
     required_action = None
     attempts = 0
+    answerability_cache = {}
     for model in (preferred_model, backup_model, preferred_model, backup_model):
         attempts += 1
         prompt = controller_prompt(
@@ -1473,6 +1499,20 @@ def generate_stateful_dialog_reply(history, text, context):
             text,
             context,
         )
+        if (
+            not issues
+            and active_expert_slug() == "marketer"
+            and expected == "answer_information"
+            and (payload.get("answer_grounding") or {}).get("source") == "knowledge_base"
+        ):
+            evidence = str((payload.get("answer_grounding") or {}).get("evidence") or "").strip()
+            cache_key = (" ".join(normalized_words(text)), " ".join(normalized_words(evidence)))
+            if cache_key not in answerability_cache:
+                answerability_cache[cache_key] = evidence_answers_question(
+                    text, evidence, backup_model
+                )
+            if not answerability_cache[cache_key]:
+                issues.append("подтверждающий фрагмент относится к теме, но не отвечает на вопрос клиента")
         if not issues:
             app.logger.warning(
                 "Dialog generation completed model=%s attempts=%s model_attempt_ms=%s total_ms=%s prompt_chars=%s context_chars=%s history_chars=%s action=%s",

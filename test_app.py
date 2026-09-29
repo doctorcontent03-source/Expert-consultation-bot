@@ -1414,6 +1414,7 @@ class TestBot(unittest.TestCase):
         target.gigachat = ScriptedGigaChat([
             '{"reply":"Это отдельный продукт вне ChatGPT.","source":"knowledge_base","evidence":"отдельный продукт вне ChatGPT"}',
             '{"reply":"Ассистенты работают в ChatGPT; достаточно бесплатной версии.","source":"knowledge_base","evidence":"Ассистенты живут в ChatGPT"}',
+            '{"answers":true}',
         ])
         with target.app.test_request_context("/marketer"):
             target.g.expert_slug = "marketer"
@@ -1425,6 +1426,26 @@ class TestBot(unittest.TestCase):
             )
         self.assertIn("ChatGPT", answer)
         self.assertNotIn("отдельный продукт", answer)
+
+    def test_evidence_must_answer_the_clients_exact_question(self):
+        target.gigachat = ScriptedGigaChat([
+            '{"answers":false}',
+            '{"answers":true}',
+        ])
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            adult_answered = target.evidence_answers_question(
+                "Ассистент разрабатывает программы для взрослых?",
+                "Методисты по английскому языку — готовые ассистенты для детских курсов и подготовки к экзаменам.",
+                "GigaChat-2-Max",
+            )
+            platform_answered = target.evidence_answers_question(
+                "Ассистенты работают в ChatGPT?",
+                "Ассистенты живут в ChatGPT.",
+                "GigaChat-2-Max",
+            )
+        self.assertFalse(adult_answered)
+        self.assertTrue(platform_answered)
 
     def test_marketer_has_one_booking_type_and_reserves_sixty_minutes(self):
         with target.app.test_request_context("/marketer"):
