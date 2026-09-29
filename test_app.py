@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -1264,6 +1265,27 @@ class TestBot(unittest.TestCase):
         self.assertFalse(repaired["solution_explained"])
         self.assertEqual(repaired["solution_type"], "none")
         self.assertEqual(repaired["solution_name"], "")
+
+    def test_grounded_solution_fallback_uses_verified_evidence_instead_of_failing(self):
+        raw = json.dumps({
+            "reply": "Курс можно разработать с помощью нейросетей.",
+            "type": "ready_product",
+            "name": "Методист по английскому языку",
+            "evidence": "Методисты по английскому языку — готовые ассистенты для разработки нестандартных учебных программ.",
+        }, ensure_ascii=False)
+        target.gigachat = ScriptedGigaChat([raw, raw])
+        context = "Методисты по английскому языку — готовые ассистенты для разработки нестандартных учебных программ."
+        with target.app.test_request_context("/marketer"):
+            target.g.expert_slug = "marketer"
+            reply, solution = target.grounded_solution_fallback(
+                [],
+                "Мне нужен курс, но нет времени его разрабатывать.",
+                context,
+                ("GigaChat", "GigaChat-2-Max"),
+            )
+        self.assertEqual(reply, context)
+        self.assertEqual(solution["type"], "ready_product")
+        self.assertIn("Методист", solution["name"])
 
     def test_marketer_rejects_questions_about_clients_professional_domain(self):
         state = self.state(contact=True)

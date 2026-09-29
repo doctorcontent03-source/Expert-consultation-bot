@@ -532,6 +532,15 @@ def grounded_in_current_message(evidence, text):
     source = " ".join(normalized_words(text))
     return bool(evidence) and evidence in source
 
+def grounding_roots(text):
+    return {word[:5] for word in normalized_words(text) if len(word) >= 5}
+
+def grounding_overlap(left, right):
+    expected = grounding_roots(left)
+    if not expected:
+        return 0.0
+    return len(expected & grounding_roots(right)) / len(expected)
+
 def controller_state(saved=None):
     if saved is None:
         saved = sget("dialog_controller_state")
@@ -948,7 +957,7 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
             issues.append("не названо предлагаемое ИИ-решение")
         if not grounded_in_current_message(solution_evidence, context):
             issues.append("предлагаемое решение не подтверждено базой знаний")
-        if solution_name and not grounded_in_current_message(solution_name, solution_evidence):
+        if solution_name and grounding_overlap(solution_name, solution_evidence) < 0.6:
             issues.append("название ИИ-решения не подтверждено приведённой цитатой")
         name_words = set(normalized_words(solution_name))
         reply_words = set(normalized_words(reply))
@@ -956,8 +965,7 @@ def controller_reply_issues(payload, expected_action, state, history, first_clie
         if meaningful_name_words and not meaningful_name_words.intersection(reply_words):
             issues.append("в реплике не названо выбранное ИИ-решение")
         opening = re.split(r"(?<=[.!?])\s+", reply, maxsplit=1)[0]
-        opening_words = set(normalized_words(opening))
-        if meaningful_name_words and len(meaningful_name_words & opening_words) / len(meaningful_name_words) < 0.6:
+        if meaningful_name_words and grounding_overlap(solution_name, opening) < 0.6:
             issues.append("объяснение начинается с результата клиента, а не с предлагаемого ИИ-решения")
     if active_expert_slug() == "marketer" and action == "answer_information":
         grounding = payload.get("answer_grounding") or {}
@@ -1314,6 +1322,7 @@ name должно прямо содержаться в evidence. evidence — т
 {transcript}
 Клиент: {text}
 """
+    grounded_candidates = []
     for model in models:
         try:
             raw = gigachat.reply([{"role": "system", "content": prompt}], model=model)
@@ -1335,12 +1344,44 @@ name должно прямо содержаться в evidence. evidence — т
             "conversation_effect": "continue",
             "proposed_solution": solution,
         }
+        if (
+            solution["type"] in {"ready_product", "adaptation", "custom_development"}
+            and grounded_in_current_message(solution["evidence"], context)
+            and grounding_overlap(solution["name"], solution["evidence"]) >= 0.6
+        ):
+            grounded_candidates.append(solution)
         if not controller_reply_issues(
-            candidate, "explain_solution", default_dialog_state(), history,
+            candidate, "explain_solution", controller_state({}), history,
             client_text=text, context=context,
         ):
             return reply, solution
-    raise RuntimeError("Models did not return a grounded AI solution")
+    for solution in grounded_candidates:
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", solution["evidence"])
+        for sentence in sentences:
+            sentence = sentence.strip(" •-–—\t")
+            if (
+                sentence
+                and len(re.findall(r"\S+", sentence)) <= 55
+                and grounding_overlap(solution["name"], sentence) >= 0.6
+            ):
+                return sentence, solution
+    dialogue_roots = grounding_roots(transcript + "\n" + text)
+    ranked = []
+    for position, sentence in enumerate(re.split(r"(?<=[.!?])\s+|\n+", context)):
+        sentence = sentence.strip(" •-–—\t")
+        roots = grounding_roots(sentence)
+        if not sentence or len(re.findall(r"\S+", sentence)) > 55:
+            continue
+        ranked.append((len(roots & dialogue_roots), -position, sentence))
+    best_match = max(ranked) if ranked else None
+    if best_match and best_match[0] > 0:
+        evidence = best_match[2]
+        return evidence, {
+            "type": "ready_product",
+            "name": evidence,
+            "evidence": evidence,
+        }
+    raise RuntimeError("Knowledge base does not contain a grounded AI solution")
 
 def generate_stateful_dialog_reply(history, text, context):
     generation_started = time.perf_counter()
